@@ -1,0 +1,11 @@
+# Banned-words patterns (one ERE per line; '#' and blank lines ignored).
+# Adding a name/string here makes the pre-commit hook reject any commit
+# that introduces it anywhere in the tracked tree. Used to keep private
+# household details (IPs, hostnames, family member names) out of the public repo.
+#
+# Personal additions belong in `.banned-words.local` (gitignored) so the
+# patterns themselves don't leak through the public repo.
+
+192\.168\.
+10\.0\.
+homeassistant\.local

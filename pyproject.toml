@@ -1,0 +1,40 @@
+[project]
+name = "comfort_band"
+version = "0.0.1"
+description = "Per-room HVAC band-control as a Home Assistant custom integration"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [{ name = "David Pretty" }]
+
+[project.optional-dependencies]
+dev = [
+  "homeassistant>=2024.12.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "pytest-homeassistant-custom-component>=0.13",
+  "mypy>=1.13",
+  "ruff>=0.7",
+  "pre-commit>=3.8",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["custom_components/comfort_band/translations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = "homeassistant.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
