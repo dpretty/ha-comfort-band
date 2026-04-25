@@ -1,0 +1,207 @@
+set_schedule:
+  name: Set schedule
+  description: Replace the schedule for a profile in a zone with the given transitions.
+  fields:
+    zone:
+      name: Zone
+      description: Zone slug (e.g. "office")
+      required: true
+      example: office
+      selector:
+        text:
+    profile:
+      name: Profile
+      description: Profile name (e.g. "home", "away", "sleep")
+      required: true
+      example: home
+      selector:
+        text:
+    transitions:
+      name: Transitions
+      description: List of {at, low, high} dicts. `at` is HH:MM; `low` and `high` are temperatures in degrees Celsius.
+      required: true
+      example: '[{"at": "06:00", "low": 20, "high": 23}, {"at": "22:00", "low": 18, "high": 21}]'
+      selector:
+        object:
+
+add_transition:
+  name: Add transition
+  description: Add a single transition to a profile schedule.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      example: office
+      selector:
+        text:
+    profile:
+      name: Profile
+      required: true
+      example: home
+      selector:
+        text:
+    at:
+      name: At
+      description: Time of day in HH:MM format.
+      required: true
+      example: "06:00"
+      selector:
+        time:
+    low:
+      name: Low
+      description: Lower bound of the comfort band (°C).
+      required: true
+      example: 20
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    high:
+      name: High
+      description: Upper bound of the comfort band (°C).
+      required: true
+      example: 23
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+
+update_transition:
+  name: Update transition
+  description: Update the band of an existing transition (matched by `at` time).
+  fields:
+    zone:
+      name: Zone
+      required: true
+      selector:
+        text:
+    profile:
+      name: Profile
+      required: true
+      selector:
+        text:
+    at:
+      name: At
+      required: true
+      selector:
+        time:
+    low:
+      name: Low
+      required: true
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    high:
+      name: High
+      required: true
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+
+remove_transition:
+  name: Remove transition
+  description: Remove the transition with the given `at` time from a profile.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      selector:
+        text:
+    profile:
+      name: Profile
+      required: true
+      selector:
+        text:
+    at:
+      name: At
+      required: true
+      selector:
+        time:
+
+start_override:
+  name: Start override
+  description: Manually override the comfort band for a zone. Optionally adjust the manual low/high band; otherwise the existing manual band is used.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      selector:
+        text:
+    low:
+      name: Manual low
+      required: false
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    high:
+      name: Manual high
+      required: false
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    hours:
+      name: Override hours
+      description: Duration of the override. Defaults to the zone's `override_hours` number entity.
+      required: false
+      selector:
+        number:
+          min: 0.25
+          max: 24
+          step: 0.25
+          unit_of_measurement: "h"
+
+cancel_override:
+  name: Cancel override
+  description: Immediately end the active override for a zone.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      selector:
+        text:
+
+set_profile:
+  name: Set active profile
+  description: Switch the global active profile. All zones react via the dispatcher signal.
+  fields:
+    profile:
+      name: Profile
+      required: true
+      example: away
+      selector:
+        text:
+
+import_legacy:
+  name: Import legacy schedule
+  description: Read input_number.{source_zone_name}_hour_HH_low/high for HH 00..23 and seed the zone's `home` profile schedule.
+  fields:
+    zone:
+      name: Zone
+      description: Comfort Band zone slug (where the schedule will be written).
+      required: true
+      example: office
+      selector:
+        text:
+    source_zone_name:
+      name: Source zone name
+      description: Slug of the zone in the legacy YAML (often the same as `zone`).
+      required: true
+      example: office
+      selector:
+        text:

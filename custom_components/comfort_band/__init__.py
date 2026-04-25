@@ -33,6 +33,7 @@ from .const import (
 )
 from .coordinator import ZoneCoordinator
 from .profiles import ProfileRegistry
+from .services import async_register_services
 from .storage import ComfortBandStore
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -55,6 +56,7 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
             LOGGER.info("Removing Session A placeholder config entry %s", entry.entry_id)
             hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
     await _ensure_shared_data(hass)
+    await async_register_services(hass)
     return True
 
 
