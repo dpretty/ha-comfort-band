@@ -28,7 +28,7 @@ Zones are configured one at a time via the UI. Sample zone names: `office`, `bed
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -r requirements-dev.txt
 ruff check .
 ruff format --check .
 mypy --strict custom_components/comfort_band
