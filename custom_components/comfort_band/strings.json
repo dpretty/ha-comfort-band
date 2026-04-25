@@ -30,5 +30,70 @@
     "error": {
       "invalid_slug": "Use lowercase letters, digits, and underscores only (2-32 characters; must start with a letter)."
     }
+  },
+  "entity": {
+    "binary_sensor": {
+      "override_active": {
+        "name": "Override active"
+      }
+    },
+    "button": {
+      "cancel_override": {
+        "name": "Cancel override"
+      }
+    },
+    "number": {
+      "manual_low": {
+        "name": "Manual low"
+      },
+      "manual_high": {
+        "name": "Manual high"
+      },
+      "override_hours": {
+        "name": "Override hours"
+      },
+      "deadband_below": {
+        "name": "Deadband below"
+      },
+      "deadband_above": {
+        "name": "Deadband above"
+      },
+      "min_cycle_minutes": {
+        "name": "Minimum cycle minutes"
+      }
+    },
+    "select": {
+      "active_profile": {
+        "name": "Active profile"
+      }
+    },
+    "sensor": {
+      "effective_low": {
+        "name": "Effective low"
+      },
+      "effective_high": {
+        "name": "Effective high"
+      },
+      "room_temperature": {
+        "name": "Room temperature"
+      },
+      "override_ends": {
+        "name": "Override ends"
+      },
+      "current_action": {
+        "name": "Current action",
+        "state": {
+          "heating": "Heating",
+          "cooling": "Cooling",
+          "idle": "Idle",
+          "unknown": "Unknown"
+        }
+      }
+    },
+    "switch": {
+      "enabled": {
+        "name": "Enabled"
+      }
+    }
   }
 }

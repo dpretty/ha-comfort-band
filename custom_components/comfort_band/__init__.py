@@ -28,6 +28,8 @@ from .const import (
     ENTRY_KIND_PROFILE_MANAGER,
     ENTRY_KIND_ZONE,
     LOGGER,
+    PLATFORMS_PROFILE_MANAGER,
+    PLATFORMS_ZONE,
 )
 from .coordinator import ZoneCoordinator
 from .profiles import ProfileRegistry
@@ -67,7 +69,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = await _ensure_shared_data(hass)
 
     if kind == ENTRY_KIND_PROFILE_MANAGER:
-        # Platform forwarding lands in commit 6.
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS_PROFILE_MANAGER)
         return True
 
     if kind == ENTRY_KIND_ZONE:
@@ -85,6 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_setup()
         data.zone_coordinators[entry.entry_id] = coordinator
         data.zone_slug_to_entry_id[zone_name] = entry.entry_id
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS_ZONE)
         return True
 
     LOGGER.error("Unknown ConfigEntry kind %r on %s", kind, entry.entry_id)
@@ -95,14 +98,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Tear down a ConfigEntry. Mirror of async_setup_entry."""
     kind = entry.data.get(CONF_KIND)
     if kind == ENTRY_KIND_PROFILE_MANAGER:
-        return True
+        return await hass.config_entries.async_unload_platforms(entry, PLATFORMS_PROFILE_MANAGER)
     if kind == ENTRY_KIND_ZONE:
-        data: ComfortBandData = hass.data[DOMAIN]
-        coordinator = data.zone_coordinators.pop(entry.entry_id, None)
-        if coordinator is not None:
-            await coordinator.async_unload()
-            data.zone_slug_to_entry_id.pop(coordinator.zone_name, None)
-        return True
+        unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS_ZONE)
+        if unloaded:
+            data: ComfortBandData = hass.data[DOMAIN]
+            coordinator = data.zone_coordinators.pop(entry.entry_id, None)
+            if coordinator is not None:
+                await coordinator.async_unload()
+                data.zone_slug_to_entry_id.pop(coordinator.zone_name, None)
+        return unloaded
     return True
 
 

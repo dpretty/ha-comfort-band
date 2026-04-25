@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import (
@@ -42,7 +42,7 @@ from .hysteresis import HysteresisDecision, HysteresisInputs
 from .schedule import Transition, normalize_schedule, schedule_from_dict
 
 if TYPE_CHECKING:
-    from .storage import ComfortBandStore, StoredProfileSchedule
+    from .storage import ComfortBandStore, StoredProfileSchedule, StoredZone
 
 
 _DEBOUNCE_SECS = 2.0
@@ -51,8 +51,14 @@ _MAX_NEXT_TRANSITION_SECS = 3600.0  # cap re-scheduling at 1 h
 
 @dataclass(frozen=True)
 class ZoneState:
-    """Snapshot returned by `_async_update_data`. Drives every per-zone entity."""
+    """Snapshot returned by `_async_update_data`. Drives every per-zone entity.
 
+    `zone` is the full StoredZone (deep-copied) so entities can read tunables
+    (manual_low/high, deadband_*, override_hours, enabled, ...) without
+    poking the store directly.
+    """
+
+    zone: StoredZone
     room: float | None
     sensor_available: bool
     effective_low: float
@@ -62,8 +68,14 @@ class ZoneState:
     override_active: bool
     override_until: datetime | None
     decision: HysteresisDecision
-    enabled: bool
-    last_action: str | None
+
+    @property
+    def enabled(self) -> bool:
+        return self.zone["enabled"]
+
+    @property
+    def last_action(self) -> str | None:
+        return self.zone["last_action"]
 
 
 class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
@@ -121,6 +133,61 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_debounce = None
         self._unsub_override_timer = None
         self._unsub_transition_timer = None
+
+    # ----- mutators (called from entities + services) -----
+
+    def get_zone_data(self) -> StoredZone:
+        """Snapshot of the persisted zone (deep copy). Cheap; KB-sized."""
+        return self._store.get_zone(self.zone_name)
+
+    async def async_set_param(self, field: str, value: Any) -> None:
+        """Update a tunable (deadband_*, override_hours, min_cycle_minutes)
+        without triggering an override.
+        """
+        await self._store.async_update_zone(self.zone_name, **{field: value})
+        await self.async_request_refresh()
+
+    async def async_set_manual_low(self, value: float) -> None:
+        """Set manual_low and start an override (matches legacy from-user trigger)."""
+        await self._set_manual_and_override(manual_low=value)
+
+    async def async_set_manual_high(self, value: float) -> None:
+        """Set manual_high and start an override."""
+        await self._set_manual_and_override(manual_high=value)
+
+    async def async_start_override(
+        self,
+        *,
+        low: float | None = None,
+        high: float | None = None,
+        hours: float | None = None,
+    ) -> None:
+        """Bump override_until = now + hours. Optionally update the manual band."""
+        zone = self._store.get_zone(self.zone_name)
+        use_hours = hours if hours is not None else zone["override_hours"]
+        update: dict[str, Any] = {
+            "override_until": (dt_util.utcnow() + timedelta(hours=use_hours)).isoformat()
+        }
+        if low is not None:
+            update["manual_low"] = low
+        if high is not None:
+            update["manual_high"] = high
+        await self._store.async_update_zone(self.zone_name, **update)
+        await self.async_request_refresh()
+
+    async def async_cancel_override(self) -> None:
+        await self._store.async_update_zone(self.zone_name, override_until=None)
+        await self.async_request_refresh()
+
+    async def async_set_enabled(self, enabled: bool) -> None:
+        await self._store.async_update_zone(self.zone_name, enabled=enabled)
+        await self.async_request_refresh()
+
+    async def _set_manual_and_override(self, **manual_fields: float) -> None:
+        zone = self._store.get_zone(self.zone_name)
+        until = (dt_util.utcnow() + timedelta(hours=zone["override_hours"])).isoformat()
+        await self._store.async_update_zone(self.zone_name, override_until=until, **manual_fields)
+        await self.async_request_refresh()
 
     # ----- triggers -----
 
@@ -204,6 +271,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._schedule_override_expiry(override_until - now_utc)
 
         state = ZoneState(
+            zone=zone,
             room=room,
             sensor_available=sensor_available,
             effective_low=eff_low,
@@ -213,8 +281,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             override_active=override_active,
             override_until=override_until,
             decision=decision,
-            enabled=zone["enabled"],
-            last_action=zone["last_action"],
         )
 
         # Apply in a follow-up task so this refresh returns immediately --
