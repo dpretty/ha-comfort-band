@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -31,6 +32,8 @@ from .const import (
 from .coordinator import ZoneCoordinator
 from .profiles import ProfileRegistry
 from .storage import ComfortBandStore
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 @dataclass

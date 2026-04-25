@@ -3,6 +3,7 @@
     "step": {
       "user": {
         "title": "Comfort Band setup",
+        "description": "Add a zone or set up the profile manager (only one is needed).",
         "menu_options": {
           "zone": "Add a zone",
           "profile_manager": "Set up profile manager"
