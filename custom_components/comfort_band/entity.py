@@ -13,6 +13,7 @@ re-renders when the user (or a service) flips profiles.
 
 from __future__ import annotations
 
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
@@ -67,5 +68,6 @@ class ComfortBandProfileEntity(Entity):
             )
         )
 
+    @callback
     def _handle_active_changed(self, _new_active: str) -> None:
         self.async_write_ha_state()

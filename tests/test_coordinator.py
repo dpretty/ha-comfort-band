@@ -1,10 +1,17 @@
-"""Smoke tests for ZoneCoordinator -- full action-application coverage in commit 6."""
+"""ZoneCoordinator behaviour tests.
+
+Smoke tests cover the pure read pipeline (no live triggers); behaviour tests
+exercise the full action-application path (`_maybe_apply_action`) with the
+pytest-freezer `freezer` fixture for time travel.
+"""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 
 from custom_components.comfort_band.const import (
@@ -12,11 +19,13 @@ from custom_components.comfort_band.const import (
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    HVAC_MODE_FAN_ONLY,
+    HVAC_MODE_HEAT,
 )
 from custom_components.comfort_band.coordinator import ZoneCoordinator, ZoneState
 from custom_components.comfort_band.storage import ComfortBandStore
 
-TEMP_ENTITY = "sensor.office_room_temperature"
+TEMP_ENTITY = "sensor.office_temp"  # external sensor; non-colliding with comfort_band's mirror
 CLIMATE_ENTITY = "climate.office_hvac"
 
 
@@ -103,3 +112,137 @@ async def test_shadow_mode_does_not_call_climate(
     assert state.decision.action == ACTION_HEAT
     assert state.enabled is False
     assert calls == []
+
+
+# ----- behaviour: full action application -----
+
+
+def _calls_for(
+    climate_calls: list[tuple[str, dict[str, Any]]], service: str
+) -> list[dict[str, Any]]:
+    return [data for srv, data in climate_calls if srv == service]
+
+
+async def _setup_enabled_zone(
+    hass: HomeAssistant, climate_calls: list[tuple[str, dict[str, Any]]]
+) -> ZoneCoordinator:
+    """Add an `office` zone, enable it (non-shadow), return its coordinator."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    # Force enabled before any refresh fires.
+    await store.async_update_zone("office", enabled=True)
+    return coordinator
+
+
+async def test_active_heat_then_release_to_idle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # Drop temp well below manual_low (=19.5 by default) to enter heat.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_HEAT
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    assert any(c["hvac_mode"] == HVAC_MODE_HEAT for c in set_modes), set_modes
+    assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
+
+    # Raise temp to band edge -> release to idle (fan_only).
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_IDLE
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == HVAC_MODE_FAN_ONLY for c in set_modes), set_modes
+
+
+async def test_min_cycle_suppresses_same_action_re_issue(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    initial_set_mode_calls = len(_calls_for(climate_calls, "set_hvac_mode"))
+    assert initial_set_mode_calls >= 1  # the initial heat fire
+
+    # 5 min later (still heating, same action, within 8 min default) -> no re-fire.
+    freezer.tick(timedelta(minutes=5))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(_calls_for(climate_calls, "set_hvac_mode")) == initial_set_mode_calls
+
+    # Different action (idle) fires immediately even within the min-cycle window.
+    # Raise temp above low to release heat -> idle/fan_only.
+    hass.states.async_set(TEMP_ENTITY, "20.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    final_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == HVAC_MODE_FAN_ONLY for c in final_modes), final_modes
+    await coordinator.async_unload()
+
+
+async def test_override_starts_then_expires(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()  # baseline
+
+    # Start a 1-hour override at a different band; this also overwrites the
+    # manual band, since async_start_override(low=, high=) is the user-driven
+    # "I want this temperature for the next N hours" path.
+    await coordinator.async_start_override(low=22.0, high=24.0, hours=1)
+    assert coordinator.data.override_active
+    assert coordinator.data.effective_low == 22.0
+    assert coordinator.data.effective_high == 24.0
+
+    # 90 min later -> override has expired. With no schedule, effective falls
+    # back to the (now updated) manual band.
+    freezer.tick(timedelta(minutes=90))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert not coordinator.data.override_active
+    assert coordinator.data.override_until is None
+    assert coordinator.data.effective_low == 22.0  # manual_low after start_override
+    assert coordinator.data.effective_high == 24.0  # manual_high after start_override
+    await coordinator.async_unload()
+
+
+async def test_cancel_override_immediately_clears_it(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+
+    await coordinator.async_start_override(low=22.0, high=24.0, hours=4)
+    assert coordinator.data.override_active
+
+    await coordinator.async_cancel_override()
+    assert not coordinator.data.override_active
+    assert coordinator.data.override_until is None
+    await coordinator.async_unload()

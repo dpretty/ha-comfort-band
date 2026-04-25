@@ -173,21 +173,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if high is not None:
             update["manual_high"] = high
         await self._store.async_update_zone(self.zone_name, **update)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def async_cancel_override(self) -> None:
         await self._store.async_update_zone(self.zone_name, override_until=None)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def async_set_enabled(self, enabled: bool) -> None:
         await self._store.async_update_zone(self.zone_name, enabled=enabled)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     async def _set_manual_and_override(self, **manual_fields: float) -> None:
         zone = self._store.get_zone(self.zone_name)
         until = (dt_util.utcnow() + timedelta(hours=zone["override_hours"])).isoformat()
         await self._store.async_update_zone(self.zone_name, override_until=until, **manual_fields)
-        await self.async_request_refresh()
+        await self.async_refresh()
 
     # ----- triggers -----
 
