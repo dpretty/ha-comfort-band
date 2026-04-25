@@ -46,6 +46,13 @@ ACTION_COOL: Final = "cooling"
 ACTION_IDLE: Final = "idle"
 ACTION_UNKNOWN: Final = "unknown"
 
+# HVAC mode strings the coordinator passes to climate.set_hvac_mode.
+# Kept here (rather than importing HVACMode from HA) so hysteresis.py stays
+# pure-Python with stdlib-only imports.
+HVAC_MODE_HEAT: Final = "heat"
+HVAC_MODE_COOL: Final = "cool"
+HVAC_MODE_FAN_ONLY: Final = "fan_only"
+
 # Storage.
 STORAGE_VERSION: Final = 1
 STORAGE_KEY: Final = "comfort_band.data"
