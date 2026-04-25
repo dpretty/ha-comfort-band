@@ -2,12 +2,32 @@
   "config": {
     "step": {
       "user": {
-        "title": "Set up Comfort Band",
-        "description": "Comfort Band is in early scaffolding. Confirm to create a placeholder entry; zone configuration will arrive in a later release."
+        "title": "Comfort Band setup",
+        "menu_options": {
+          "zone": "Add a zone",
+          "profile_manager": "Set up profile manager"
+        }
+      },
+      "zone": {
+        "title": "Add a zone",
+        "description": "Each zone watches one room-temperature sensor and (when enabled) drives one climate entity. The slug becomes part of every entity_id, so use lowercase letters, digits, and underscores only.",
+        "data": {
+          "zone_name": "Zone name (slug)",
+          "climate_entity": "Climate entity",
+          "temp_sensor": "Room-temperature sensor"
+        }
+      },
+      "profile_manager": {
+        "title": "Set up profile manager",
+        "description": "Creates the global active-profile selector with built-in profiles (home, away, sleep). Only one is allowed."
       }
     },
     "abort": {
-      "single_instance_allowed": "Only one Comfort Band entry is allowed."
+      "already_configured": "A zone with this name already exists.",
+      "single_instance_allowed": "A profile manager is already configured."
+    },
+    "error": {
+      "invalid_slug": "Use lowercase letters, digits, and underscores only (2-32 characters; must start with a letter)."
     }
   }
 }
