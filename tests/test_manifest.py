@@ -20,10 +20,10 @@ def test_manifest_shape() -> None:
     manifest = json.loads(MANIFEST_PATH.read_text())
     assert manifest["domain"] == DOMAIN
     assert manifest["config_flow"] is True
-    assert manifest["integration_type"] == "service"
+    assert manifest["integration_type"] == "helper"
     assert manifest["iot_class"] == "local_push"
     assert manifest["codeowners"] == ["@dpretty"]
-    assert manifest["version"]
+    assert manifest["version"] == "0.0.2"
     assert manifest["documentation"].startswith("https://")
     assert manifest["issue_tracker"].startswith("https://")
     assert manifest["requirements"] == []
