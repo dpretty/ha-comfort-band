@@ -11,6 +11,7 @@ import { LitElement, html, css } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import './tile.js';
 import './modal.js';
+import './card-editor.js';
 import type { ComfortBandModal } from './modal.js';
 import type { ComfortBandCardConfig, HassEntity, HomeAssistant } from './types.js';
 import type { ZoneEntities } from './helpers.js';
@@ -33,6 +34,31 @@ export class ComfortBandCard extends LitElement {
   /** HA's panel/grid uses this to size the card. ~1 row per ~50 px of content. */
   public getCardSize(): number {
     return 2;
+  }
+
+  /** HA dashboard editor: tells HA which custom element to render as the
+   *  visual config UI. Returning the element directly (not a string) is
+   *  the modern API. */
+  public static getConfigElement(): HTMLElement {
+    return document.createElement('comfort-band-card-editor');
+  }
+
+  /** Default config seed when the user adds the card via "Add card" in the
+   *  dashboard editor. Picks the first registered Comfort Band zone, if any. */
+  public static getStubConfig(hass: HomeAssistant | undefined): ComfortBandCardConfig {
+    let zone = '';
+    if (hass) {
+      for (const device of Object.values(hass.devices)) {
+        for (const [domain, key] of device.identifiers) {
+          if (domain === 'comfort_band' && key.startsWith('zone:')) {
+            zone = key.slice('zone:'.length);
+            break;
+          }
+        }
+        if (zone) break;
+      }
+    }
+    return { type: 'custom:comfort-band-card', zone };
   }
 
   public static override styles = [

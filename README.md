@@ -10,16 +10,40 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.0.2 — headless preview.** The integration is fully functional via Developer Tools and the standard entity UI. There is no Lovelace card yet (Session C).
+**v0.1.0 — first end-to-end release.** Integration + Lovelace card. The integration logic is the same as v0.0.2 — full coordinator, per-zone entities, profile schedules, override timers, legacy importer. New in v0.1.0: a custom Lovelace card with a compact tile and an expanded modal (Now / Schedule / Profiles / Insights tabs).
 
-Every zone defaults to **shadow mode** (`switch.{zone}_enabled = off`): the integration computes the heat/cool/idle decision and updates the `current_action` sensor, but does **not** call `climate.set_hvac_mode`. Flip the switch on per zone when you're ready to cut over.
+Every zone still defaults to **shadow mode** (`switch.{zone}_enabled = off`): the integration computes the heat/cool/idle decision and updates the `current_action` sensor, but does **not** call `climate.set_hvac_mode`. Flip the switch on per zone when you're ready to cut over.
 
 ## Installation
 
-1. In HACS: **Integrations → ⋮ → Custom repositories**.
-2. URL: `https://github.com/dpretty/ha-comfort-band`. Category: **Integration**.
-3. Install. Restart Home Assistant.
-4. **Settings → Devices & Services → Add Integration → Comfort Band**.
+This repo publishes **two HACS items** from one source:
+
+1. **Integration** — the Python side. Adds the `comfort_band` entities and services.
+2. **Lovelace plugin** — the `comfort-band-card` dashboard card.
+
+HACS doesn't auto-detect dual-content repos, so you add the URL **twice** as a Custom Repository:
+
+1. In HACS: **Integrations → ⋮ → Custom repositories** → add `https://github.com/dpretty/ha-comfort-band`, category **Integration** → install → restart HA.
+2. **HACS → Frontend → ⋮ → Custom repositories** → add the same URL, category **Dashboard** → install. The bundle lands at `/hacsfiles/ha-comfort-band/comfort-band-card.js`; HACS adds the resource automatically.
+3. **Settings → Devices & Services → Add Integration → Comfort Band**.
+4. Add `type: custom:comfort-band-card` cards to your dashboard, one per zone.
+
+## The card
+
+```yaml
+type: custom:comfort-band-card
+zone: gym         # required — the zone slug from step 3
+compact: false    # optional — set true for a tile that doesn't expand on tap
+```
+
+Tap the tile → modal with four tabs:
+
+- **Now** — big band gauge, current room temp + action chip, dual-handle slider for manual low/high (drag = start an override), Cancel-override button, 1h/3h/6h duration presets.
+- **Schedule** — 24-hour timeline of the active profile's transitions. Tap empty → add. Tap a point → edit (precise time/low/high + delete). Long-press → delete. All edits persist via `comfort_band.set_schedule` (atomic full-schedule replacement).
+- **Profiles** — list every profile, switch with one tap (fires `comfort_band.set_profile`). Profile create / rename / delete is deferred to v0.2 (needs new services).
+- **Insights** — wraps HA's built-in `history-graph` for the last 24 h of `room_temperature`. v0.2 will replace this with a custom uPlot chart shaded by `current_action`.
+
+Card config can also be edited via the dashboard's visual editor (zone dropdown + compact-mode toggle).
 
 ## Setup walkthrough
 

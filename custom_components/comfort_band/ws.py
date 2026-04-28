@@ -47,8 +47,6 @@ def ws_get_schedule(
     try:
         schedule = data.store.get_zone_schedule(zone, profile)
     except KeyError:
-        connection.send_error(
-            msg["id"], "zone_not_found", f"Zone {zone!r} does not exist"
-        )
+        connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
         return
     connection.send_result(msg["id"], schedule)
