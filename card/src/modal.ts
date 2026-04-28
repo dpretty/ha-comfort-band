@@ -18,6 +18,7 @@ import { LitElement, html, css, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import './tabs/now-tab.js';
 import './tabs/profiles-tab.js';
+import './tabs/insights-tab.js';
 import type { ZoneEntities } from './helpers.js';
 import type { HomeAssistant } from './types.js';
 import { tokens } from './styles.js';
@@ -191,7 +192,10 @@ export class ComfortBandModal extends LitElement {
       case 'profiles':
         return html`<comfort-band-profiles-tab .hass=${this.hass}></comfort-band-profiles-tab>`;
       case 'insights':
-        return html`<div class="placeholder">Insights — landing in commit 6.</div>`;
+        return html`<comfort-band-insights-tab
+          .hass=${this.hass}
+          .entities=${this.entities}
+        ></comfort-band-insights-tab>`;
     }
   }
 }
