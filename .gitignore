@@ -5,17 +5,16 @@ __pycache__/
 *.so
 .Python
 build/
+dist/
 *.egg-info/
 *.egg
 .eggs/
 
-# Node / card build
+# Belt-and-braces — no Node code lives here, but if someone runs npm
+# (e.g. accidentally checking out an older branch with the card), don't
+# accidentally commit node_modules.
 node_modules/
-coverage/
-*.tsbuildinfo
-
-# Note: `dist/` is INTENTIONALLY tracked — it holds the built
-# `dist/comfort-band-card.js` bundle that HACS plugin install reads.
+package-lock.json
 
 # Virtual environments
 .venv/

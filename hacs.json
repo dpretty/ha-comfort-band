@@ -1,6 +1,5 @@
 {
   "name": "Comfort Band",
   "render_readme": true,
-  "homeassistant": "2024.12.0",
-  "filename": "comfort-band-card.js"
+  "homeassistant": "2024.12.0"
 }
