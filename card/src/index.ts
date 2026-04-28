@@ -1,15 +1,10 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-
-interface ComfortBandCardConfig {
-  type: string;
-  zone: string;
-  compact?: boolean;
-}
+import type { ComfortBandCardConfig, HomeAssistant } from './types.js';
 
 @customElement('comfort-band-card')
 export class ComfortBandCard extends LitElement {
-  @property({ attribute: false }) public hass?: unknown;
+  @property({ attribute: false }) public hass?: HomeAssistant;
   @state() private _config?: ComfortBandCardConfig;
 
   public setConfig(config: ComfortBandCardConfig): void {
