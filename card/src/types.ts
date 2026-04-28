@@ -53,6 +53,7 @@ export interface HomeAssistant {
     service: string,
     serviceData?: Record<string, unknown>,
   ): Promise<unknown>;
+  callWS<T = unknown>(msg: { type: string } & Record<string, unknown>): Promise<T>;
 }
 
 // ---------- Comfort Band domain ----------

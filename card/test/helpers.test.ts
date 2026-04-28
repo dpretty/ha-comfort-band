@@ -31,6 +31,7 @@ function makeHass(devices: DeviceRegistryEntry[], entities: EntityRegistryEntry[
     devices: Object.fromEntries(devices.map((d) => [d.id, d])),
     entities: Object.fromEntries(entities.map((e) => [e.entity_id, e])),
     callService: () => Promise.resolve(),
+    callWS: () => Promise.resolve() as Promise<never>,
   };
 }
 

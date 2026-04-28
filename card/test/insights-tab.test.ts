@@ -10,7 +10,9 @@ afterEach(() => {
   delete (window as { loadCardHelpers?: unknown }).loadCardHelpers;
 });
 
-function makeEntities(roomTemperature: string | null = 'sensor.gym_room_temperature'): ZoneEntities {
+function makeEntities(
+  roomTemperature: string | null = 'sensor.gym_room_temperature',
+): ZoneEntities {
   return {
     effectiveLow: null,
     effectiveHigh: null,
@@ -37,6 +39,7 @@ function makeHass(): HomeAssistant {
     devices: {},
     entities: {},
     callService: vi.fn(),
+    callWS: vi.fn(),
   };
 }
 

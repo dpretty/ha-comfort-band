@@ -64,6 +64,7 @@ function makeHass(zone: string): HomeAssistant {
     devices: { [device.id]: device },
     entities: Object.fromEntries(entities.map((e) => [e.entity_id, e])),
     callService: vi.fn().mockResolvedValue(undefined),
+    callWS: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -110,6 +111,7 @@ describe('comfort-band-card', () => {
       devices: {},
       entities: {},
       callService: vi.fn(),
+      callWS: vi.fn(),
     };
     const el = await card('office', hass);
     expect(el.shadowRoot!.innerHTML).toContain('not found');

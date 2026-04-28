@@ -45,6 +45,7 @@ function makeHass(opts: {
     entities: entities as HomeAssistant['entities'],
     devices: devices as HomeAssistant['devices'],
     callService: vi.fn().mockResolvedValue(undefined),
+    callWS: vi.fn().mockResolvedValue(undefined),
   };
 }
 

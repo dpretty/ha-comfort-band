@@ -57,6 +57,7 @@ function makeHass(overrides: Partial<Record<string, string>> = {}): HomeAssistan
     devices: {},
     entities: {},
     callService: vi.fn().mockResolvedValue(undefined),
+    callWS: vi.fn().mockResolvedValue(undefined),
   };
 }
 

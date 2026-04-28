@@ -1,0 +1,107 @@
+"""Tests for the `comfort_band/*` websocket commands.
+
+We invoke the handler directly with a fake `ActiveConnection` instead of
+spinning up the full websocket server — that path triggers a teardown
+timing flake in `pytest_homeassistant_custom_component` on macOS, and
+adds nothing testable beyond what the framework already guarantees
+(schema validation + dispatch). The handler itself is plain Python.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from homeassistant.core import HomeAssistant
+
+from custom_components.comfort_band.ws import ws_get_schedule
+
+
+class _FakeConnection:
+    """Minimal stand-in for `websocket_api.ActiveConnection`."""
+
+    def __init__(self) -> None:
+        self.results: list[tuple[int, Any]] = []
+        self.errors: list[tuple[int, str, str]] = []
+
+    def send_result(self, msg_id: int, data: Any) -> None:
+        self.results.append((msg_id, data))
+
+    def send_error(self, msg_id: int, code: str, message: str) -> None:
+        self.errors.append((msg_id, code, message))
+
+
+@pytest.fixture
+async def setup_zone(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    entry = make_zone_entry(temp_sensor="sensor.office_temp")
+    entry.add_to_hass(hass)
+    hass.states.async_set("sensor.office_temp", "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_get_schedule_returns_null_for_unset_profile(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Newly created zones have no schedules — read returns None (=> null)."""
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 1, "type": "comfort_band/get_schedule", "zone": "office", "profile": "home"},
+    )
+    assert conn.errors == []
+    assert conn.results == [(1, None)]
+
+
+async def test_get_schedule_returns_baseline_and_current_after_set(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """After comfort_band.set_schedule, the WS read sees the persisted data."""
+    transitions = [
+        {"at": "06:00", "low": 20.0, "high": 23.0},
+        {"at": "22:00", "low": 18.0, "high": 21.0},
+    ]
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {"zone": "office", "profile": "home", "transitions": transitions},
+        blocking=True,
+    )
+
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 7, "type": "comfort_band/get_schedule", "zone": "office", "profile": "home"},
+    )
+    assert conn.errors == []
+    msg_id, schedule = conn.results[0]
+    assert msg_id == 7
+    assert schedule is not None
+    assert schedule["baseline"] == transitions
+    assert schedule["current"] == transitions
+
+
+async def test_get_schedule_errors_for_unknown_zone(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """An unknown zone surfaces a typed error rather than a result."""
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 3, "type": "comfort_band/get_schedule", "zone": "ghost", "profile": "home"},
+    )
+    assert conn.results == []
+    assert conn.errors == [(3, "zone_not_found", "Zone 'ghost' does not exist")]
+
+
+async def test_command_is_registered_at_setup(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Sanity: async_register_ws_commands() runs and the command is wired."""
+    handlers = hass.data.get("websocket_api", {})
+    assert "comfort_band/get_schedule" in handlers

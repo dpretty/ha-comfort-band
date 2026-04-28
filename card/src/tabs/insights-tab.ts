@@ -116,16 +116,14 @@ export class ComfortBandInsightsTab extends LitElement {
 
     return html`
       <div class="graph-container"></div>
-      ${
-        this._graphAvailable === false
-          ? html`<div class="fallback">
-              Inline graph unavailable.
-              <a href="/history?entity_id=${entityId}" target="_blank" rel="noopener"
-                >Open in HA history →</a
-              >
-            </div>`
-          : nothing
-      }
+      ${this._graphAvailable === false
+        ? html`<div class="fallback">
+            Inline graph unavailable.
+            <a href="/history?entity_id=${entityId}" target="_blank" rel="noopener"
+              >Open in HA history →</a
+            >
+          </div>`
+        : nothing}
     `;
   }
 }

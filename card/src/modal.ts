@@ -19,6 +19,7 @@ import { customElement, property, query, state } from 'lit/decorators.js';
 import './tabs/now-tab.js';
 import './tabs/profiles-tab.js';
 import './tabs/insights-tab.js';
+import './tabs/schedule-tab.js';
 import type { ZoneEntities } from './helpers.js';
 import type { HomeAssistant } from './types.js';
 import { tokens } from './styles.js';
@@ -188,7 +189,10 @@ export class ComfortBandModal extends LitElement {
           .entities=${this.entities}
         ></comfort-band-now-tab>`;
       case 'schedule':
-        return html`<div class="placeholder">Schedule editor — landing in commit 7.</div>`;
+        return html`<comfort-band-schedule-tab
+          .hass=${this.hass}
+          .zone=${this.zone}
+        ></comfort-band-schedule-tab>`;
       case 'profiles':
         return html`<comfort-band-profiles-tab .hass=${this.hass}></comfort-band-profiles-tab>`;
       case 'insights':

@@ -17,6 +17,7 @@ function makeMockHass() {
     entities: {},
     devices: {},
     callService,
+    callWS: vi.fn().mockResolvedValue(undefined),
   };
   return { hass, callService };
 }
