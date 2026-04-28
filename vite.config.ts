@@ -20,7 +20,7 @@ export default defineConfig({
     legalComments: 'none',
   },
   test: {
-    environment: 'happy-dom',
+    environment: 'jsdom',
     globals: true,
     include: ['card/test/**/*.test.ts'],
   },
