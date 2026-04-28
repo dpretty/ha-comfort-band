@@ -33,10 +33,8 @@ fi
 # Combine patterns into a single ERE alternation.
 COMBINED="$(echo "$PATTERNS" | paste -sd '|' -)"
 
-# Files to scan: everything tracked except this script, the pattern files, and
-# generated lockfiles (`10.0.0` semver versions and registry URLs trigger false
-# positives, and the file is regenerated wholesale by npm/yarn anyway).
-EXCLUDE_RE='^(scripts/check-banned-words\.sh|\.banned-words(\.local)?|package-lock\.json)$'
+# Files to scan: everything tracked except this script and the pattern files.
+EXCLUDE_RE='^(scripts/check-banned-words\.sh|\.banned-words(\.local)?)$'
 FILES="$(git ls-files | grep -vE "$EXCLUDE_RE" || true)"
 
 if [[ -z "$FILES" ]]; then
