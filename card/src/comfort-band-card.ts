@@ -8,8 +8,10 @@
  */
 
 import { LitElement, html, css } from 'lit';
-import { customElement, property, state } from 'lit/decorators.js';
+import { customElement, property, query, state } from 'lit/decorators.js';
 import './tile.js';
+import './modal.js';
+import type { ComfortBandModal } from './modal.js';
 import type { ComfortBandCardConfig, HassEntity, HomeAssistant } from './types.js';
 import type { ZoneEntities } from './helpers.js';
 import { findZoneEntities } from './helpers.js';
@@ -19,6 +21,7 @@ import { tokens } from './styles.js';
 export class ComfortBandCard extends LitElement {
   @property({ attribute: false }) public hass?: HomeAssistant;
   @state() private _config?: ComfortBandCardConfig;
+  @query('comfort-band-modal') private _modal?: ComfortBandModal;
 
   public setConfig(config: ComfortBandCardConfig): void {
     if (!config?.zone) {
@@ -77,13 +80,19 @@ export class ComfortBandCard extends LitElement {
         .noExpand=${compact}
         @comfort-band-tile-tap=${this._onTileTap}
       ></comfort-band-tile>
+      ${compact
+        ? null
+        : html`<comfort-band-modal
+            .hass=${this.hass}
+            zone=${zoneSlug}
+            zoneName=${view.zoneName}
+            .entities=${entities}
+          ></comfort-band-modal>`}
     `;
   }
 
   private _onTileTap = () => {
-    // Commit 4 wires this to fire_dom_event for the modal. For now: log-only,
-    // so the click path is observable in dev tools.
-    console.debug('comfort-band-card: tile tap (modal lands in commit 4)');
+    this._modal?.open();
   };
 
   private _buildView(hass: HomeAssistant, entities: ZoneEntities) {
