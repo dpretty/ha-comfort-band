@@ -1,0 +1,32 @@
+{
+  "name": "comfort-band-card",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lovelace card for the Comfort Band Home Assistant integration",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "lint": "eslint card",
+    "lint:fix": "eslint card --fix",
+    "format": "prettier --write 'card/**/*.{ts,js,json}' '*.json'",
+    "format:check": "prettier --check 'card/**/*.{ts,js,json}' '*.json'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lit": "^3.2.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.14.0",
+    "@open-wc/testing-helpers": "^3.0.1",
+    "eslint": "^9.14.0",
+    "jsdom": "^25.0.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.13.0",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.4"
+  }
+}

@@ -35,6 +35,7 @@ from .coordinator import ZoneCoordinator
 from .profiles import ProfileRegistry
 from .services import async_register_services
 from .storage import ComfortBandStore
+from .ws import async_register_ws_commands
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -57,6 +58,7 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
             hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
     await _ensure_shared_data(hass)
     await async_register_services(hass)
+    async_register_ws_commands(hass)
     return True
 
 

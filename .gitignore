@@ -5,10 +5,17 @@ __pycache__/
 *.so
 .Python
 build/
-dist/
 *.egg-info/
 *.egg
 .eggs/
+
+# Node / card build
+node_modules/
+coverage/
+*.tsbuildinfo
+
+# Note: `dist/` is INTENTIONALLY tracked — it holds the built
+# `dist/comfort-band-card.js` bundle that HACS plugin install reads.
 
 # Virtual environments
 .venv/

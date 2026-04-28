@@ -16,8 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
 
-  hacs:
-    name: HACS
+  hacs-integration:
+    name: HACS (integration)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,3 +25,19 @@ jobs:
         with:
           category: integration
           ignore: brands
+
+  hacs-plugin:
+    name: HACS (plugin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: plugin
+          # `images` ignored until v0.2 ships with screenshots/GIFs of the
+          # card running on a real dashboard (tracked in a v0.2 issue).
+          # The check is a HACS public-listing requirement; custom-repo
+          # installs ignore it. NB: hacs/action's ignore list is
+          # space-separated (their action.yaml says so verbatim), not
+          # comma-separated like most CI fields.
+          ignore: brands images
