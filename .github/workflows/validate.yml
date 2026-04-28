@@ -16,12 +16,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: home-assistant/actions/hassfest@master
 
-  hacs:
-    name: HACS
+  hacs-integration:
+    name: HACS (integration)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: hacs/action@main
         with:
           category: integration
+          ignore: brands
+
+  hacs-plugin:
+    name: HACS (plugin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: plugin
           ignore: brands
