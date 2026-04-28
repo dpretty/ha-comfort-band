@@ -34,4 +34,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: plugin
-          ignore: brands
+          # `images` ignored until v0.2 ships with screenshots/GIFs of the
+          # card running on a real dashboard (tracked in a v0.2 issue).
+          # The check is a HACS public-listing requirement; custom-repo
+          # installs ignore it.
+          ignore: brands,images
