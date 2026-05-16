@@ -363,3 +363,47 @@ async def test_delete_default_profile_raises(
         await hass.services.async_call(
             DOMAIN, "delete_profile", {"name": "home"}, blocking=True
         )
+
+
+async def test_delete_unknown_profile_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="does not exist"):
+        await hass.services.async_call(
+            DOMAIN, "delete_profile", {"name": "ghost"}, blocking=True
+        )
+
+
+async def test_create_profile_name_length_capped(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # voluptuous Length validator raises MultipleInvalid before our handler
+    # ever sees the value; HA wraps that into ServiceValidationError.
+    from voluptuous import MultipleInvalid
+
+    with pytest.raises((MultipleInvalid, ServiceValidationError)):
+        await hass.services.async_call(
+            DOMAIN, "create_profile", {"name": "x" * 65}, blocking=True
+        )
+
+
+async def test_import_legacy_writes_to_default_after_home_rename(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Importer should follow the renamed `home` (default_profile), not the
+    literal "home" string. Regression guard for the rename-aware fallback."""
+    _seed_legacy(hass, "office", 20.0, 23.0)
+    # Rename home → weekday before importing.
+    await hass.services.async_call(
+        DOMAIN, "rename_profile", {"old": "home", "new": "weekday"}, blocking=True
+    )
+    await hass.services.async_call(
+        DOMAIN,
+        "import_legacy",
+        {"zone": "office", "source_zone_name": "office"},
+        blocking=True,
+    )
+    store = hass.data[DOMAIN].store
+    # Schedule landed on the renamed default, not on the now-absent "home".
+    assert store.get_zone_schedule("office", "weekday") is not None
+    assert store.get_zone_schedule("office", "home") is None

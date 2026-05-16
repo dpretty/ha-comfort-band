@@ -390,6 +390,60 @@ async def test_load_legacy_data_without_default_profile_migrates(
     assert "sleep" not in store.list_profiles()
 
 
+async def test_load_legacy_data_without_home_uses_first_alphabetical(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """If `home` doesn't exist on legacy load, fall back to the first
+    alphabetical profile as the new default."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {},
+            "profiles": {
+                "zulu": {"name": "zulu", "description": ""},
+                "alpha": {"name": "alpha", "description": ""},
+            },
+            "active_profile": "zulu",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.default_profile == "alpha"
+
+
+async def test_load_legacy_data_with_empty_profiles_reseeds_builtins(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """If the legacy payload has an empty profiles dict (corruption case),
+    reseed the built-ins and set default_profile to home."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {},
+            "profiles": {},
+            "active_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.default_profile == "home"
+    assert set(store.list_profiles()) == {"home", "away"}
+
+
+async def test_clone_profile_without_source_schedule_creates_empty_target(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Cloning a profile when the source has no schedule for a zone leaves
+    the zone with no schedule for the target either — not an error."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    # No schedule seeded on "home" for office.
+    await store.async_clone_profile("home", "weekend")
+    assert "weekend" in store.list_profiles()
+    assert store.get_zone_schedule("office", "weekend") is None
+
+
 async def test_set_zone_schedule_fires_signal(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:

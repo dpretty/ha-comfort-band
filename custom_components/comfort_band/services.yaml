@@ -256,12 +256,14 @@ rename_profile:
   fields:
     old:
       name: Old name
+      description: Current name of the profile to rename.
       required: true
       example: home
       selector:
         text:
     new:
       name: New name
+      description: New name for the profile. Must not already exist.
       required: true
       example: weekday
       selector:
@@ -273,6 +275,7 @@ delete_profile:
   fields:
     name:
       name: Name
+      description: Profile to delete. Cannot be the default profile.
       required: true
       example: trip
       selector:
