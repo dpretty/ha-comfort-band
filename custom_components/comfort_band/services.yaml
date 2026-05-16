@@ -208,7 +208,7 @@ import_legacy:
 
 create_profile:
   name: Create profile
-  description: Create a new (empty) profile. Zone schedules can be added afterward.
+  description: Create a new (empty) profile. Zone schedules can be added afterward. Limit: 50 profiles per install.
   fields:
     name:
       name: Name
@@ -227,7 +227,7 @@ create_profile:
 
 clone_profile:
   name: Clone profile
-  description: Create a new profile by copying all per-zone schedules from an existing one.
+  description: Create a new profile by copying all per-zone schedules from an existing one. Limit: 50 profiles per install.
   fields:
     source:
       name: Source
