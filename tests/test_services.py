@@ -409,6 +409,26 @@ async def test_create_profile_at_cap_raises_via_service_layer(
         )
 
 
+async def test_clone_profile_at_cap_raises_via_service_layer(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Symmetric to test_create_profile_at_cap — clone hits the same
+    storage-level cap and must surface ServiceValidationError."""
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    for i in range(MAX_PROFILES - 2):
+        await hass.services.async_call(
+            DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True
+        )
+    with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "home", "target": "extra"},
+            blocking=True,
+        )
+
+
 async def test_clone_profile_empty_source_raises_clear_error(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:

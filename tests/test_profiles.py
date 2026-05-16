@@ -28,7 +28,7 @@ async def test_active_starts_at_default(hass: HomeAssistant, hass_storage: dict[
     assert registry.default == "home"
     assert "home" in registry.names
     assert "away" in registry.names
-    assert "sleep" not in registry.names  # dropped from built-ins in v0.2
+    assert "sleep" not in registry.names  # dropped from built-ins in v0.3
 
 
 async def test_set_active_dispatches_signal(
