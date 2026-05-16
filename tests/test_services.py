@@ -40,6 +40,10 @@ async def test_all_services_registered(
         "cancel_override",
         "set_profile",
         "import_legacy",
+        "create_profile",
+        "clone_profile",
+        "rename_profile",
+        "delete_profile",
     }
     for service in expected:
         assert hass.services.has_service(DOMAIN, service), f"missing service: {service}"
@@ -214,3 +218,237 @@ async def test_import_legacy_missing_source_helpers_raises(
             {"zone": "office", "source_zone_name": "office"},
             blocking=True,
         )
+
+
+# ----- profile CRUD services -----
+
+
+async def test_create_profile_service(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "create_profile",
+        {"name": "weekend", "description": "Saturdays + Sundays"},
+        blocking=True,
+    )
+    registry = hass.data[DOMAIN].profile_registry
+    assert "weekend" in registry.names
+    assert registry.description("weekend") == "Saturdays + Sundays"
+
+
+async def test_create_profile_blank_name_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="cannot be empty"):
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "   "}, blocking=True)
+
+
+async def test_create_profile_duplicate_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="already exists"):
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "home"}, blocking=True)
+
+
+async def test_clone_profile_service(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Seed a schedule on home so the clone has something to copy.
+    await hass.services.async_call(
+        DOMAIN,
+        "set_schedule",
+        {
+            "zone": "office",
+            "profile": "home",
+            "transitions": [{"at": "06:00", "low": 20.0, "high": 23.0}],
+        },
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN,
+        "clone_profile",
+        {"source": "home", "target": "weekend"},
+        blocking=True,
+    )
+    store = hass.data[DOMAIN].store
+    cloned = store.get_zone_schedule("office", "weekend")
+    assert cloned is not None
+    assert cloned["baseline"][0]["at"] == "06:00"
+
+
+async def test_clone_profile_unknown_source_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "ghost", "target": "new"},
+            blocking=True,
+        )
+
+
+async def test_clone_profile_duplicate_target_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="already exists"):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "home", "target": "away"},
+            blocking=True,
+        )
+
+
+async def test_rename_profile_service(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "rename_profile",
+        {"old": "away", "new": "trip"},
+        blocking=True,
+    )
+    registry = hass.data[DOMAIN].profile_registry
+    assert "trip" in registry.names
+    assert "away" not in registry.names
+
+
+async def test_rename_profile_blank_new_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="cannot be empty"):
+        await hass.services.async_call(
+            DOMAIN,
+            "rename_profile",
+            {"old": "away", "new": "   "},
+            blocking=True,
+        )
+
+
+async def test_rename_profile_unknown_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "rename_profile",
+            {"old": "ghost", "new": "new"},
+            blocking=True,
+        )
+
+
+async def test_delete_profile_service(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(DOMAIN, "create_profile", {"name": "vacation"}, blocking=True)
+    await hass.services.async_call(DOMAIN, "delete_profile", {"name": "vacation"}, blocking=True)
+    registry = hass.data[DOMAIN].profile_registry
+    assert "vacation" not in registry.names
+
+
+async def test_delete_default_profile_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Cannot delete the default profile"):
+        await hass.services.async_call(DOMAIN, "delete_profile", {"name": "home"}, blocking=True)
+
+
+async def test_delete_unknown_profile_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Storage raises KeyError(name) consistent with the clone/rename
+    # mutators; the service catches (KeyError, ValueError) and wraps as
+    # ServiceValidationError. The name is echoed in the wrapped message.
+    with pytest.raises(ServiceValidationError, match="ghost"):
+        await hass.services.async_call(DOMAIN, "delete_profile", {"name": "ghost"}, blocking=True)
+
+
+async def test_create_profile_name_length_capped(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # voluptuous Length validator raises MultipleInvalid before our handler
+    # ever sees the value; HA wraps that into ServiceValidationError.
+    from voluptuous import MultipleInvalid
+
+    with pytest.raises((MultipleInvalid, ServiceValidationError)):
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "x" * 65}, blocking=True)
+
+
+async def test_create_profile_at_cap_raises_via_service_layer(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """The cap is enforced at the storage layer; verify the error
+    propagates through the service handler as ServiceValidationError so
+    the card surfaces it via the existing error-handling path."""
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    # Fill up to cap (2 builtins already exist).
+    for i in range(MAX_PROFILES - 2):
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True)
+    with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
+        await hass.services.async_call(
+            DOMAIN, "create_profile", {"name": "one_too_many"}, blocking=True
+        )
+
+
+async def test_clone_profile_at_cap_raises_via_service_layer(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Symmetric to test_create_profile_at_cap — clone hits the same
+    storage-level cap and must surface ServiceValidationError."""
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    for i in range(MAX_PROFILES - 2):
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True)
+    with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "home", "target": "extra"},
+            blocking=True,
+        )
+
+
+async def test_clone_profile_empty_source_raises_clear_error(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Source profile name cannot be empty"):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "   ", "target": "weekend"},
+            blocking=True,
+        )
+
+
+async def test_rename_profile_empty_old_raises_clear_error(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Old profile name cannot be empty"):
+        await hass.services.async_call(
+            DOMAIN, "rename_profile", {"old": "  ", "new": "trip"}, blocking=True
+        )
+
+
+async def test_import_legacy_writes_to_default_after_home_rename(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Importer should follow the renamed `home` (default_profile), not the
+    literal "home" string. Regression guard for the rename-aware fallback."""
+    _seed_legacy(hass, "office", 20.0, 23.0)
+    # Rename home → weekday before importing.
+    await hass.services.async_call(
+        DOMAIN, "rename_profile", {"old": "home", "new": "weekday"}, blocking=True
+    )
+    await hass.services.async_call(
+        DOMAIN,
+        "import_legacy",
+        {"zone": "office", "source_zone_name": "office"},
+        blocking=True,
+    )
+    store = hass.data[DOMAIN].store
+    # Schedule landed on the renamed default, not on the now-absent "home".
+    assert store.get_zone_schedule("office", "weekday") is not None
+    assert store.get_zone_schedule("office", "home") is None

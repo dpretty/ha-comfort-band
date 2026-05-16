@@ -38,6 +38,7 @@ from .const import (
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PROFILE,
+    MAX_PROFILES,
     SIGNAL_ZONE_SCHEDULE_CHANGED,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -81,12 +82,16 @@ class StoredData(TypedDict):
     zones: dict[str, StoredZone]
     profiles: dict[str, StoredProfile]
     active_profile: str
+    # Rename-aware fallback target. Initialised to DEFAULT_PROFILE on first
+    # load; updated when that profile is renamed. Used by `async_remove_profile`
+    # to refuse deletion and by `ProfileRegistry.async_delete` to fall back to
+    # when the active profile is removed.
+    default_profile: str
 
 
 _BUILTIN_DESCRIPTIONS: dict[str, str] = {
     "home": "Default schedule when the house is occupied.",
     "away": "Cooler heating / warmer cooling for an empty house.",
-    "sleep": "Overnight schedule.",
 }
 
 
@@ -98,6 +103,7 @@ def _default_data() -> StoredData:
             for name in BUILTIN_PROFILES
         },
         "active_profile": DEFAULT_PROFILE,
+        "default_profile": DEFAULT_PROFILE,
     }
 
 
@@ -129,12 +135,44 @@ class ComfortBandStore:
         self._loaded = False
 
     async def async_load(self) -> None:
-        """Read from disk; default skeleton on first run. Idempotent."""
+        """Read from disk; default skeleton on first run. Idempotent.
+
+        Old payloads (v0.1) didn't have `default_profile`. If it's missing we
+        seed it from DEFAULT_PROFILE if that profile still exists; otherwise
+        fall back to the alphabetically-first profile and persist.
+        """
         if self._loaded:
             return
         loaded = await self._store.async_load()
         if loaded is not None:
             self._data = loaded
+        # `loaded` may be a v0.1 payload that doesn't have all fields of
+        # StoredData yet — cast to a plain dict to check + patch.
+        raw = cast(dict[str, Any], self._data)
+        migrated = False
+        if "default_profile" not in raw:
+            profiles = raw.get("profiles") or {}
+            if DEFAULT_PROFILE in profiles:
+                raw["default_profile"] = DEFAULT_PROFILE
+            elif profiles:
+                raw["default_profile"] = sorted(profiles.keys())[0]
+            else:
+                # Empty profile list is a corrupted store; reseed builtins.
+                raw["profiles"] = {
+                    name: {"name": name, "description": _BUILTIN_DESCRIPTIONS.get(name, "")}
+                    for name in BUILTIN_PROFILES
+                }
+                raw["default_profile"] = DEFAULT_PROFILE
+            migrated = True
+        # Defensive: if active_profile points at a profile that no longer
+        # exists (corruption, hand-edited .storage), fall back to the default
+        # so subsequent `extra_state_attributes` / coordinator reads don't
+        # raise KeyError on every state push.
+        if raw.get("active_profile") not in raw.get("profiles", {}):
+            raw["active_profile"] = raw["default_profile"]
+            migrated = True
+        if migrated:
+            await self._store.async_save(self._data)
         self._loaded = True
 
     async def async_save(self) -> None:
@@ -227,9 +265,18 @@ class ComfortBandStore:
     def list_profiles(self) -> list[str]:
         return sorted(self._data["profiles"].keys())
 
+    def get_profile(self, name: str) -> StoredProfile:
+        if name not in self._data["profiles"]:
+            raise KeyError(name)
+        return copy.deepcopy(self._data["profiles"][name])
+
     @property
     def active_profile(self) -> str:
         return self._data["active_profile"]
+
+    @property
+    def default_profile(self) -> str:
+        return self._data["default_profile"]
 
     async def async_set_active_profile(self, name: str) -> None:
         if name not in self._data["profiles"]:
@@ -240,13 +287,64 @@ class ComfortBandStore:
     async def async_add_profile(self, name: str, description: str = "") -> None:
         if name in self._data["profiles"]:
             raise ValueError(f"Profile {name!r} already exists")
+        if len(self._data["profiles"]) >= MAX_PROFILES:
+            raise ValueError(
+                f"Cannot create more than {MAX_PROFILES} profiles "
+                f"(currently {len(self._data['profiles'])})"
+            )
         self._data["profiles"][name] = {"name": name, "description": description}
         await self.async_save()
 
+    async def async_clone_profile(self, source: str, target: str, description: str = "") -> None:
+        if source not in self._data["profiles"]:
+            raise KeyError(source)
+        if target in self._data["profiles"]:
+            raise ValueError(f"Profile {target!r} already exists")
+        if len(self._data["profiles"]) >= MAX_PROFILES:
+            raise ValueError(
+                f"Cannot create more than {MAX_PROFILES} profiles "
+                f"(currently {len(self._data['profiles'])})"
+            )
+        self._data["profiles"][target] = {"name": target, "description": description}
+        for zone in self._data["zones"].values():
+            src_schedule = zone["schedules"].get(source)
+            if src_schedule is not None:
+                zone["schedules"][target] = copy.deepcopy(src_schedule)
+        await self.async_save()
+
+    async def async_rename_profile(self, old: str, new: str) -> None:
+        if old not in self._data["profiles"]:
+            raise KeyError(old)
+        if old == new:
+            return
+        if new in self._data["profiles"]:
+            raise ValueError(f"Profile {new!r} already exists")
+        profile = self._data["profiles"].pop(old)
+        profile["name"] = new
+        self._data["profiles"][new] = profile
+        for zone in self._data["zones"].values():
+            if old in zone["schedules"]:
+                zone["schedules"][new] = zone["schedules"].pop(old)
+        if self._data["active_profile"] == old:
+            self._data["active_profile"] = new
+        if self._data["default_profile"] == old:
+            self._data["default_profile"] = new
+        await self.async_save()
+
     async def async_remove_profile(self, name: str) -> None:
-        if name == DEFAULT_PROFILE:
-            raise ValueError(f"Cannot delete the default profile {DEFAULT_PROFILE!r}")
-        self._data["profiles"].pop(name, None)
+        # `default_profile` is the rename-aware fallback target. It moves with
+        # renames, so this check works whether or not "home" still exists.
+        if name == self._data["default_profile"]:
+            raise ValueError(f"Cannot delete the default profile {name!r}")
+        if name not in self._data["profiles"]:
+            # Consistent with the sibling mutators (clone/rename) which both
+            # raise KeyError on unknown names. ProfileRegistry catches and
+            # re-raises as ServiceValidationError for the service layer.
+            raise KeyError(name)
+        del self._data["profiles"][name]
+        # Clean up orphan per-zone schedules — otherwise dead-weight on disk.
+        for zone in self._data["zones"].values():
+            zone["schedules"].pop(name, None)
         if self._data["active_profile"] == name:
-            self._data["active_profile"] = DEFAULT_PROFILE
+            self._data["active_profile"] = self._data["default_profile"]
         await self.async_save()

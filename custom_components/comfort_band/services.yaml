@@ -11,7 +11,7 @@ set_schedule:
         text:
     profile:
       name: Profile
-      description: Profile name (e.g. "home", "away", "sleep")
+      description: Profile name (e.g. "home", "away")
       required: true
       example: home
       selector:
@@ -203,5 +203,80 @@ import_legacy:
       description: Slug of the zone in the legacy YAML (often the same as `zone`).
       required: true
       example: office
+      selector:
+        text:
+
+create_profile:
+  name: Create profile
+  description: "Create a new (empty) profile. Zone schedules can be added afterward. Limit: 50 profiles per install."
+  fields:
+    name:
+      name: Name
+      description: Profile name (unique).
+      required: true
+      example: weekend
+      selector:
+        text:
+    description:
+      name: Description
+      description: Optional human-readable description.
+      required: false
+      example: Relaxed band for weekend mornings.
+      selector:
+        text:
+
+clone_profile:
+  name: Clone profile
+  description: "Create a new profile by copying all per-zone schedules from an existing one. Limit: 50 profiles per install."
+  fields:
+    source:
+      name: Source
+      description: Existing profile to copy from.
+      required: true
+      example: home
+      selector:
+        text:
+    target:
+      name: Target
+      description: New profile name.
+      required: true
+      example: weekend
+      selector:
+        text:
+    description:
+      name: Description
+      description: Optional description for the new profile.
+      required: false
+      selector:
+        text:
+
+rename_profile:
+  name: Rename profile
+  description: Rename a profile. The active and default pointers update if they reference it.
+  fields:
+    old:
+      name: Old name
+      description: Current name of the profile to rename.
+      required: true
+      example: home
+      selector:
+        text:
+    new:
+      name: New name
+      description: New name for the profile. Must not already exist.
+      required: true
+      example: weekday
+      selector:
+        text:
+
+delete_profile:
+  name: Delete profile
+  description: Delete a profile. Refuses to delete the default profile. If the active profile is deleted, the default becomes active.
+  fields:
+    name:
+      name: Name
+      description: Profile to delete. Cannot be the default profile.
+      required: true
+      example: trip
       selector:
         text:

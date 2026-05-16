@@ -1,12 +1,17 @@
 """Service registration.
 
-Eight services, all keyed by zone *slug* (not entity_id) so the call site
-matches the storage key. Schemas use voluptuous + entity selectors so
-Developer Tools renders sensible UI.
+Twelve services: schedule mutators (set/add/update/remove transition),
+override control (start/cancel), legacy importer, profile switch, and
+profile CRUD (create/clone/rename/delete). All zone-scoped services are
+keyed by zone *slug* (not entity_id) so the call site matches the
+storage key. Schemas use voluptuous + entity selectors so Developer
+Tools renders sensible UI.
 
 Schedule mutators all run a normalize pass before persisting; they raise
 ServiceValidationError on malformed input rather than letting the user
-write garbage to the store.
+write garbage to the store. Profile-CRUD handlers wrap (KeyError,
+ValueError) from the registry/store as ServiceValidationError so users
+see a consistent error class regardless of which layer rejected.
 """
 
 from __future__ import annotations
@@ -42,6 +47,10 @@ SERVICE_START_OVERRIDE = "start_override"
 SERVICE_CANCEL_OVERRIDE = "cancel_override"
 SERVICE_SET_PROFILE = "set_profile"
 SERVICE_IMPORT_LEGACY = "import_legacy"
+SERVICE_CREATE_PROFILE = "create_profile"
+SERVICE_CLONE_PROFILE = "clone_profile"
+SERVICE_RENAME_PROFILE = "rename_profile"
+SERVICE_DELETE_PROFILE = "delete_profile"
 
 _TIME_RE = r"^[0-2]\d:[0-5]\d$"
 
@@ -99,6 +108,36 @@ _IMPORT_LEGACY_SCHEMA = vol.Schema(
     }
 )
 
+# Length caps prevent a malicious / accidental LAN client from bloating
+# the .storage file with a multi-MB profile name. 64 chars is well over
+# the human-readable range; 256 for descriptions allows a sentence.
+_PROFILE_NAME = vol.All(cv.string, vol.Length(min=1, max=64))
+_PROFILE_DESCRIPTION = vol.All(cv.string, vol.Length(max=256))
+
+_CREATE_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): _PROFILE_NAME,
+        vol.Optional("description", default=""): _PROFILE_DESCRIPTION,
+    }
+)
+
+_CLONE_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("source"): _PROFILE_NAME,
+        vol.Required("target"): _PROFILE_NAME,
+        vol.Optional("description", default=""): _PROFILE_DESCRIPTION,
+    }
+)
+
+_RENAME_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("old"): _PROFILE_NAME,
+        vol.Required("new"): _PROFILE_NAME,
+    }
+)
+
+_DELETE_PROFILE_SCHEMA = vol.Schema({vol.Required("name"): _PROFILE_NAME})
+
 
 def _data(hass: HomeAssistant) -> ComfortBandData:
     return hass.data[DOMAIN]  # type: ignore[no-any-return]
@@ -155,7 +194,7 @@ async def _refresh_zone_if_active(hass: HomeAssistant, zone_name: str) -> None:
 
 
 async def async_register_services(hass: HomeAssistant) -> None:
-    """Idempotently register all 8 services."""
+    """Idempotently register all 12 services."""
     if hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
         return
 
@@ -244,6 +283,51 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _set_profile(call: ServiceCall) -> None:
         await _data(hass).profile_registry.async_set_active(call.data["profile"])
 
+    async def _create_profile(call: ServiceCall) -> None:
+        name = call.data["name"].strip()
+        if not name:
+            raise ServiceValidationError("Profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_create(name, call.data["description"])
+        except (KeyError, ValueError) as err:
+            # async_add_profile only raises ValueError today; broad catch
+            # mirrors the other three CRUD handlers and is defensive
+            # against future storage changes.
+            raise ServiceValidationError(str(err)) from err
+
+    async def _clone_profile(call: ServiceCall) -> None:
+        source = call.data["source"].strip()
+        target = call.data["target"].strip()
+        if not source:
+            raise ServiceValidationError("Source profile name cannot be empty")
+        if not target:
+            raise ServiceValidationError("Target profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_clone(source, target, call.data["description"])
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
+
+    async def _rename_profile(call: ServiceCall) -> None:
+        old = call.data["old"].strip()
+        new = call.data["new"].strip()
+        if not old:
+            raise ServiceValidationError("Old profile name cannot be empty")
+        if not new:
+            raise ServiceValidationError("New profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_rename(old, new)
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
+
+    async def _delete_profile(call: ServiceCall) -> None:
+        name = call.data["name"].strip()
+        if not name:
+            raise ServiceValidationError("Profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_delete(name)
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
+
     async def _import_legacy(call: ServiceCall) -> None:
         zone_name = call.data["zone"]
         source = call.data["source_zone_name"]
@@ -254,8 +338,10 @@ async def async_register_services(hass: HomeAssistant) -> None:
             transitions = read_legacy_hourly_schedule(hass, source)
         except ValueError as err:
             raise ServiceValidationError(str(err)) from err
-        # Importer writes to "home" profile; baseline + current both seeded.
-        await store.async_set_zone_schedule(zone_name, "home", _to_stored(transitions))
+        # Importer writes to the default profile (originally "home"; tracks
+        # renames so this still works after the user renames home → weekday).
+        default = _data(hass).profile_registry.default
+        await store.async_set_zone_schedule(zone_name, default, _to_stored(transitions))
         LOGGER.info(
             "Imported legacy schedule for %s from input_number.%s_hour_*: %d transitions",
             zone_name,
@@ -296,4 +382,16 @@ async def async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_IMPORT_LEGACY, _import_legacy, schema=_IMPORT_LEGACY_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CREATE_PROFILE, _create_profile, schema=_CREATE_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLONE_PROFILE, _clone_profile, schema=_CLONE_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RENAME_PROFILE, _rename_profile, schema=_RENAME_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_DELETE_PROFILE, _delete_profile, schema=_DELETE_PROFILE_SCHEMA
     )

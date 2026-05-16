@@ -34,7 +34,6 @@ from homeassistant.util import dt as dt_util
 from . import hysteresis, schedule
 from .const import (
     ACTION_UNKNOWN,
-    DEFAULT_PROFILE,
     LOGGER,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
@@ -229,9 +228,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             zone = self._store.get_zone(self.zone_name)
             override_until = None
 
-        # Resolve scheduled band (falls back to manual band if no schedule).
+        # Resolve scheduled band (falls back to default profile's schedule,
+        # then to manual band). `default_profile` tracks the renamed-home
+        # name, so this still works after the user renames the original
+        # "home" profile.
+        default_profile = self._store.default_profile
         schedule_data = zone["schedules"].get(active_profile) or zone["schedules"].get(
-            DEFAULT_PROFILE
+            default_profile
         )
         sched_low, sched_high = self._resolve_schedule(
             schedule_data, fallback=(zone["manual_low"], zone["manual_high"])

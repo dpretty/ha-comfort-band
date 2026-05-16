@@ -37,8 +37,15 @@ TEMP_MAX: Final = 26.0
 TEMP_STEP: Final = 0.5
 
 # Profiles.
+# DEFAULT_PROFILE is the *seed* default for fresh installs. After install the
+# live default is tracked per-store as `default_profile`, which moves with
+# renames — see `ComfortBandStore.default_profile`.
 DEFAULT_PROFILE: Final = "home"
-BUILTIN_PROFILES: Final = ("home", "away", "sleep")
+BUILTIN_PROFILES: Final = ("home", "away")
+# Hard cap on user-defined profiles. Generous (50 is far beyond any
+# realistic household), but prevents an unbounded-create loop from bloating
+# the .storage file.
+MAX_PROFILES: Final = 50
 
 # Action labels (returned by hysteresis.decide; surfaced via the current_action sensor).
 ACTION_HEAT: Final = "heating"
@@ -69,4 +76,5 @@ PLATFORMS_PROFILE_MANAGER: Final = (Platform.SELECT,)
 
 # Signals (async_dispatcher).
 SIGNAL_ACTIVE_PROFILE_CHANGED: Final = f"{DOMAIN}_active_profile_changed"
+SIGNAL_PROFILE_LIST_CHANGED: Final = f"{DOMAIN}_profile_list_changed"
 SIGNAL_ZONE_SCHEDULE_CHANGED: Final = f"{DOMAIN}_zone_schedule_changed"
