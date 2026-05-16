@@ -8,7 +8,7 @@ zone coordinator listens on.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
@@ -33,6 +33,17 @@ class ActiveProfileSelect(ComfortBandProfileEntity, SelectEntity):
     @property
     def current_option(self) -> str | None:
         return self._registry().active
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        # Surface the rename-aware default and per-profile descriptions so the
+        # card can render them without a second WS round-trip. Pushed
+        # alongside `options` and `state` every time the entity writes state.
+        registry = self._registry()
+        return {
+            "default_profile": registry.default,
+            "descriptions": {name: registry.description(name) for name in registry.names},
+        }
 
     async def async_select_option(self, option: str) -> None:
         await self._registry().async_set_active(option)

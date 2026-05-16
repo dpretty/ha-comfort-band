@@ -20,8 +20,9 @@ async def test_first_load_returns_default_skeleton(
     store = ComfortBandStore(hass)
     await store.async_load()
     assert store.list_zones() == []
-    assert store.list_profiles() == ["away", "home", "sleep"]
+    assert store.list_profiles() == ["away", "home"]
     assert store.active_profile == "home"
+    assert store.default_profile == "home"
 
 
 async def test_default_zone_has_sane_initial_values(
@@ -195,6 +196,198 @@ async def test_set_zone_schedule_independent_lists(
     schedule = store.get_zone_schedule("office", "home")
     assert schedule is not None
     assert schedule["baseline"][0]["low"] == 20.0
+
+
+# ----- profile CRUD: clone / rename / migration -----
+
+
+async def test_get_profile_returns_deep_copy(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    profile = store.get_profile("home")
+    profile["description"] = "tampered"
+    assert store.get_profile("home")["description"] != "tampered"
+
+
+async def test_get_profile_unknown_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    with pytest.raises(KeyError):
+        store.get_profile("vacation")
+
+
+async def test_clone_profile_copies_per_zone_schedules(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    baseline = [{"at": "06:00", "low": 20.0, "high": 23.0}]
+    await store.async_set_zone_schedule("office", "home", baseline)
+
+    await store.async_clone_profile("home", "weekend", "Saturdays + Sundays")
+
+    assert "weekend" in store.list_profiles()
+    assert store.get_profile("weekend")["description"] == "Saturdays + Sundays"
+    cloned = store.get_zone_schedule("office", "weekend")
+    assert cloned is not None
+    assert cloned["baseline"] == baseline
+    # Mutate the source schedule; cloned must be independent.
+    await store.async_set_zone_schedule(
+        "office", "home", [{"at": "07:00", "low": 21.0, "high": 22.0}]
+    )
+    cloned_after = store.get_zone_schedule("office", "weekend")
+    assert cloned_after is not None
+    assert cloned_after["baseline"] == baseline
+
+
+async def test_clone_to_existing_target_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    with pytest.raises(ValueError, match="already exists"):
+        await store.async_clone_profile("home", "away")
+
+
+async def test_clone_from_unknown_source_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    with pytest.raises(KeyError):
+        await store.async_clone_profile("ghost", "new")
+
+
+async def test_rename_profile_renames_in_profiles_and_zones(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_set_zone_schedule(
+        "office", "away", [{"at": "06:00", "low": 18.0, "high": 21.0}]
+    )
+
+    await store.async_rename_profile("away", "trip")
+
+    assert "trip" in store.list_profiles()
+    assert "away" not in store.list_profiles()
+    assert store.get_profile("trip")["name"] == "trip"
+    # Schedule key followed the rename.
+    assert store.get_zone_schedule("office", "trip") is not None
+    assert store.get_zone_schedule("office", "away") is None
+
+
+async def test_rename_active_profile_updates_active_pointer(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_set_active_profile("away")
+    await store.async_rename_profile("away", "trip")
+    assert store.active_profile == "trip"
+
+
+async def test_rename_default_profile_updates_default_pointer(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_rename_profile("home", "weekday")
+    assert store.default_profile == "weekday"
+    # And deletion of the new default name is now refused.
+    with pytest.raises(ValueError, match="Cannot delete the default profile"):
+        await store.async_remove_profile("weekday")
+
+
+async def test_rename_to_existing_name_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    with pytest.raises(ValueError, match="already exists"):
+        await store.async_rename_profile("away", "home")
+
+
+async def test_rename_unknown_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    with pytest.raises(KeyError):
+        await store.async_rename_profile("ghost", "new")
+
+
+async def test_rename_noop_returns_quickly(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_rename_profile("home", "home")  # no-op
+    assert store.list_profiles() == ["away", "home"]
+
+
+async def test_remove_profile_strips_zone_schedules(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_set_zone_schedule(
+        "office", "away", [{"at": "06:00", "low": 18.0, "high": 21.0}]
+    )
+    assert store.get_zone_schedule("office", "away") is not None
+    await store.async_remove_profile("away")
+    # Orphan schedule cleaned up.
+    assert store.get_zone_schedule("office", "away") is None
+
+
+async def test_remove_profile_after_default_rename_uses_new_name(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Rename of `home` to e.g. `weekday` should leave `weekday` undeletable
+    (because it's still the default). The literal string "home" is no longer
+    privileged after a rename."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_rename_profile("home", "weekday")
+    # Re-create a profile named "home" — should now be deletable, since it
+    # is no longer the default.
+    await store.async_add_profile("home", "user-recreated")
+    await store.async_remove_profile("home")
+    assert "home" not in store.list_profiles()
+
+
+async def test_load_legacy_data_without_default_profile_migrates(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A v0.1 payload (no `default_profile` key) should migrate to `home`."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {},
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+                "sleep": {"name": "sleep", "description": "Overnight schedule."},
+            },
+            "active_profile": "home",
+            # NB: no `default_profile` key.
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.default_profile == "home"
+    # The legacy "sleep" profile survives as a normal user profile.
+    assert "sleep" in store.list_profiles()
+    # And is deletable now (no longer a built-in, not the default).
+    await store.async_remove_profile("sleep")
+    assert "sleep" not in store.list_profiles()
 
 
 async def test_set_zone_schedule_fires_signal(

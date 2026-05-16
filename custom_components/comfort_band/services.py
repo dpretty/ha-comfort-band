@@ -42,6 +42,10 @@ SERVICE_START_OVERRIDE = "start_override"
 SERVICE_CANCEL_OVERRIDE = "cancel_override"
 SERVICE_SET_PROFILE = "set_profile"
 SERVICE_IMPORT_LEGACY = "import_legacy"
+SERVICE_CREATE_PROFILE = "create_profile"
+SERVICE_CLONE_PROFILE = "clone_profile"
+SERVICE_RENAME_PROFILE = "rename_profile"
+SERVICE_DELETE_PROFILE = "delete_profile"
 
 _TIME_RE = r"^[0-2]\d:[0-5]\d$"
 
@@ -98,6 +102,30 @@ _IMPORT_LEGACY_SCHEMA = vol.Schema(
         vol.Required("source_zone_name"): cv.string,
     }
 )
+
+_CREATE_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): cv.string,
+        vol.Optional("description", default=""): cv.string,
+    }
+)
+
+_CLONE_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("source"): cv.string,
+        vol.Required("target"): cv.string,
+        vol.Optional("description", default=""): cv.string,
+    }
+)
+
+_RENAME_PROFILE_SCHEMA = vol.Schema(
+    {
+        vol.Required("old"): cv.string,
+        vol.Required("new"): cv.string,
+    }
+)
+
+_DELETE_PROFILE_SCHEMA = vol.Schema({vol.Required("name"): cv.string})
 
 
 def _data(hass: HomeAssistant) -> ComfortBandData:
@@ -244,6 +272,43 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _set_profile(call: ServiceCall) -> None:
         await _data(hass).profile_registry.async_set_active(call.data["profile"])
 
+    async def _create_profile(call: ServiceCall) -> None:
+        name = call.data["name"].strip()
+        if not name:
+            raise ServiceValidationError("Profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_create(name, call.data["description"])
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+
+    async def _clone_profile(call: ServiceCall) -> None:
+        target = call.data["target"].strip()
+        source = call.data["source"]
+        if not target:
+            raise ServiceValidationError("Target profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_clone(
+                source, target, call.data["description"]
+            )
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
+
+    async def _rename_profile(call: ServiceCall) -> None:
+        new = call.data["new"].strip()
+        old = call.data["old"]
+        if not new:
+            raise ServiceValidationError("New profile name cannot be empty")
+        try:
+            await _data(hass).profile_registry.async_rename(old, new)
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
+
+    async def _delete_profile(call: ServiceCall) -> None:
+        try:
+            await _data(hass).profile_registry.async_delete(call.data["name"])
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+
     async def _import_legacy(call: ServiceCall) -> None:
         zone_name = call.data["zone"]
         source = call.data["source_zone_name"]
@@ -296,4 +361,16 @@ async def async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_IMPORT_LEGACY, _import_legacy, schema=_IMPORT_LEGACY_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CREATE_PROFILE, _create_profile, schema=_CREATE_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLONE_PROFILE, _clone_profile, schema=_CLONE_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RENAME_PROFILE, _rename_profile, schema=_RENAME_PROFILE_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_DELETE_PROFILE, _delete_profile, schema=_DELETE_PROFILE_SCHEMA
     )

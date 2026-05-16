@@ -56,7 +56,12 @@ async def test_profile_manager_entry_creates_select(
     state = hass.states.get("select.comfort_band_profiles_active_profile")
     assert state is not None
     assert state.state == "home"
-    assert sorted(state.attributes["options"]) == ["away", "home", "sleep"]
+    assert sorted(state.attributes["options"]) == ["away", "home"]
+    assert state.attributes["default_profile"] == "home"
+    # Per-profile descriptions exposed alongside options for the card.
+    descriptions = state.attributes["descriptions"]
+    assert set(descriptions.keys()) == {"away", "home"}
+    assert "occupied" in descriptions["home"].lower()
 
 
 async def test_zone_room_temp_sensor_mirrors_external(
