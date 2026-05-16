@@ -91,6 +91,34 @@ async def test_well_above_band_decides_cool(
     assert state.decision.target_temp == 22.5
 
 
+async def test_schedule_fallback_follows_renamed_default_profile(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """When the active profile has no schedule, fall back to the *default
+    profile's* schedule — even after that profile has been renamed."""
+    # Seed a schedule on "home" then rename home -> weekday. The active
+    # profile is still "home" (now renamed), so the active key also
+    # changes; switch active to "away" (which has no schedule) to exercise
+    # the fallback path.
+    store = coordinator._store
+    await store.async_set_zone_schedule(
+        "office", "home", [{"at": "00:00", "low": 21.0, "high": 23.0}]
+    )
+    await store.async_rename_profile("home", "weekday")
+    await store.async_set_active_profile("away")  # away has no schedule
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+    try:
+        state = await coordinator._async_update_data()
+        # Should fall back to "weekday" (the renamed default), not the manual band.
+        assert state.effective_low == 21.0
+        assert state.effective_high == 23.0
+    finally:
+        # The schedule update schedules a transition-timer; cancel it so
+        # pytest-homeassistant-custom-component's "lingering timer" guard
+        # doesn't trip in teardown.
+        await coordinator.async_unload()
+
+
 async def test_shadow_mode_does_not_call_climate(
     hass: HomeAssistant, coordinator: ZoneCoordinator
 ) -> None:
