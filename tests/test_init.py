@@ -64,6 +64,34 @@ async def test_profile_manager_entry_creates_select(
     assert "occupied" in descriptions["home"].lower()
 
 
+async def test_select_entity_attributes_track_rename(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    profile_manager_entry: MockConfigEntry,
+) -> None:
+    """End-to-end: renaming the default profile updates the select entity's
+    `default_profile` and `descriptions` attributes (via the new
+    SIGNAL_PROFILE_LIST_CHANGED → async_write_ha_state path)."""
+    profile_manager_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(profile_manager_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        "comfort_band",
+        "rename_profile",
+        {"old": "home", "new": "weekday"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("select.comfort_band_profiles_active_profile")
+    assert state is not None
+    assert state.state == "weekday"  # active also followed the rename
+    assert sorted(state.attributes["options"]) == ["away", "weekday"]
+    assert state.attributes["default_profile"] == "weekday"
+    assert set(state.attributes["descriptions"].keys()) == {"away", "weekday"}
+
+
 async def test_zone_room_temp_sensor_mirrors_external(
     hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
 ) -> None:

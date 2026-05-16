@@ -164,6 +164,13 @@ class ComfortBandStore:
                 }
                 raw["default_profile"] = DEFAULT_PROFILE
             migrated = True
+        # Defensive: if active_profile points at a profile that no longer
+        # exists (corruption, hand-edited .storage), fall back to the default
+        # so subsequent `extra_state_attributes` / coordinator reads don't
+        # raise KeyError on every state push.
+        if raw.get("active_profile") not in raw.get("profiles", {}):
+            raw["active_profile"] = raw["default_profile"]
+            migrated = True
         if migrated:
             await self._store.async_save(self._data)
         self._loaded = True
