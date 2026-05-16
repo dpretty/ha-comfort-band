@@ -57,11 +57,14 @@ def ws_get_schedule(
     connection.send_result(msg["id"], schedule)
 
 
+_NAME_FIELD = vol.All(str, vol.Length(min=1, max=255))
+
+
 @websocket_command(
     {
         vol.Required("type"): "comfort_band/subscribe_schedule",
-        vol.Required("zone"): str,
-        vol.Required("profile"): str,
+        vol.Required("zone"): _NAME_FIELD,
+        vol.Required("profile"): _NAME_FIELD,
     }
 )
 @async_response
@@ -80,17 +83,16 @@ async def ws_subscribe_schedule(
     zone = msg["zone"]
     profile = msg["profile"]
 
-    try:
-        initial = data.store.get_zone_schedule(zone, profile)
-    except KeyError:
+    if not data.store.has_zone(zone):
         connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
         return
-    # get_zone_schedule returns None for unknown profiles on a valid zone —
-    # surface that as an error so the client doesn't sit in a "loading"
-    # state on a subscription that will never fire.
+    # An unknown profile is a typo, not an empty schedule: get_zone_schedule
+    # would return None for both, which would leave the client on a
+    # subscription that never fires. Reject up front.
     if profile not in data.store.list_profiles():
         connection.send_error(msg["id"], "profile_not_found", f"Profile {profile!r} does not exist")
         return
+    initial = data.store.get_zone_schedule(zone, profile)
 
     @callback
     def _forward(
