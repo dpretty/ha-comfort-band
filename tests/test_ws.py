@@ -222,6 +222,29 @@ async def test_subscribe_unknown_zone_errors(
     assert conn.errors == [(13, "zone_not_found", "Zone 'ghost' does not exist")]
 
 
+async def test_subscribe_unknown_profile_errors(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """An unknown profile on a valid zone also errors — never leaves a dangling sub."""
+    conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {
+            "id": 15,
+            "type": "comfort_band/subscribe_schedule",
+            "zone": "office",
+            "profile": "ghost",
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert conn.results == []
+    assert conn.messages == []
+    assert conn.subscriptions == {}
+    assert conn.errors == [(15, "profile_not_found", "Profile 'ghost' does not exist")]
+
+
 async def test_subscribe_unsubscribe_stops_updates(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:

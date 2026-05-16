@@ -85,6 +85,12 @@ async def ws_subscribe_schedule(
     except KeyError:
         connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
         return
+    # get_zone_schedule returns None for unknown profiles on a valid zone —
+    # surface that as an error so the client doesn't sit in a "loading"
+    # state on a subscription that will never fire.
+    if profile not in data.store.list_profiles():
+        connection.send_error(msg["id"], "profile_not_found", f"Profile {profile!r} does not exist")
+        return
 
     @callback
     def _forward(
