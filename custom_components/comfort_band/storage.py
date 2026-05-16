@@ -38,6 +38,7 @@ from .const import (
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PROFILE,
+    MAX_PROFILES,
     SIGNAL_ZONE_SCHEDULE_CHANGED,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -279,6 +280,11 @@ class ComfortBandStore:
     async def async_add_profile(self, name: str, description: str = "") -> None:
         if name in self._data["profiles"]:
             raise ValueError(f"Profile {name!r} already exists")
+        if len(self._data["profiles"]) >= MAX_PROFILES:
+            raise ValueError(
+                f"Cannot create more than {MAX_PROFILES} profiles "
+                f"(currently {len(self._data['profiles'])})"
+            )
         self._data["profiles"][name] = {"name": name, "description": description}
         await self.async_save()
 
@@ -289,6 +295,11 @@ class ComfortBandStore:
             raise KeyError(source)
         if target in self._data["profiles"]:
             raise ValueError(f"Profile {target!r} already exists")
+        if len(self._data["profiles"]) >= MAX_PROFILES:
+            raise ValueError(
+                f"Cannot create more than {MAX_PROFILES} profiles "
+                f"(currently {len(self._data['profiles'])})"
+            )
         self._data["profiles"][target] = {"name": target, "description": description}
         for zone in self._data["zones"].values():
             src_schedule = zone["schedules"].get(source)

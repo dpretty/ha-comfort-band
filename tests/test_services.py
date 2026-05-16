@@ -387,6 +387,27 @@ async def test_create_profile_name_length_capped(
         )
 
 
+async def test_clone_profile_empty_source_raises_clear_error(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Source profile name cannot be empty"):
+        await hass.services.async_call(
+            DOMAIN,
+            "clone_profile",
+            {"source": "   ", "target": "weekend"},
+            blocking=True,
+        )
+
+
+async def test_rename_profile_empty_old_raises_clear_error(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Old profile name cannot be empty"):
+        await hass.services.async_call(
+            DOMAIN, "rename_profile", {"old": "  ", "new": "trip"}, blocking=True
+        )
+
+
 async def test_import_legacy_writes_to_default_after_home_rename(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:

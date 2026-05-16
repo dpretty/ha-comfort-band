@@ -290,6 +290,8 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _clone_profile(call: ServiceCall) -> None:
         source = call.data["source"].strip()
         target = call.data["target"].strip()
+        if not source:
+            raise ServiceValidationError("Source profile name cannot be empty")
         if not target:
             raise ServiceValidationError("Target profile name cannot be empty")
         try:
@@ -302,6 +304,8 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _rename_profile(call: ServiceCall) -> None:
         old = call.data["old"].strip()
         new = call.data["new"].strip()
+        if not old:
+            raise ServiceValidationError("Old profile name cannot be empty")
         if not new:
             raise ServiceValidationError("New profile name cannot be empty")
         try:

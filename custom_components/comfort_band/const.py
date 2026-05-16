@@ -42,6 +42,10 @@ TEMP_STEP: Final = 0.5
 # renames — see `ComfortBandStore.default_profile`.
 DEFAULT_PROFILE: Final = "home"
 BUILTIN_PROFILES: Final = ("home", "away")
+# Hard cap on user-defined profiles. Generous (50 is far beyond any
+# realistic household), but prevents an unbounded-create loop from bloating
+# the .storage file.
+MAX_PROFILES: Final = 50
 
 # Action labels (returned by hysteresis.decide; surfaced via the current_action sensor).
 ACTION_HEAT: Final = "heating"

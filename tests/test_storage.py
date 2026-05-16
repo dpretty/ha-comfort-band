@@ -444,6 +444,36 @@ async def test_clone_profile_without_source_schedule_creates_empty_target(
     assert store.get_zone_schedule("office", "weekend") is None
 
 
+async def test_add_profile_count_cap(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Cap on total profile count guards against unbounded growth of the
+    .storage file from a misbehaving caller."""
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    # Built-ins already use 2 slots; fill up to MAX_PROFILES.
+    for i in range(MAX_PROFILES - 2):
+        await store.async_add_profile(f"p{i}")
+    assert len(store.list_profiles()) == MAX_PROFILES
+    with pytest.raises(ValueError, match=f"more than {MAX_PROFILES}"):
+        await store.async_add_profile("one_too_many")
+
+
+async def test_clone_profile_count_cap(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    for i in range(MAX_PROFILES - 2):
+        await store.async_add_profile(f"p{i}")
+    with pytest.raises(ValueError, match=f"more than {MAX_PROFILES}"):
+        await store.async_clone_profile("home", "extra")
+
+
 async def test_set_zone_schedule_fires_signal(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
