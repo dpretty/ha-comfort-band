@@ -1,9 +1,9 @@
 """Websocket commands for the Comfort Band frontend card.
 
 The integration's services in `services.py` are write-only; the card needs
-a read API to render the schedule editor. This module owns the read API
-plus a push subscription so multiple card instances stay in sync without
-polling.
+read APIs to render the schedule editor. This module owns both: the
+request/response `get_schedule` and the push `subscribe_schedule` that
+keeps multiple card instances in sync without polling.
 """
 
 from __future__ import annotations
@@ -51,12 +51,10 @@ def ws_get_schedule(
     data: ComfortBandData = hass.data[DOMAIN]
     zone = msg["zone"]
     profile = msg["profile"]
-    try:
-        schedule = data.store.get_zone_schedule(zone, profile)
-    except KeyError:
+    if not data.store.has_zone(zone):
         connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
         return
-    connection.send_result(msg["id"], schedule)
+    connection.send_result(msg["id"], data.store.get_zone_schedule(zone, profile))
 
 
 @websocket_command(
@@ -109,5 +107,8 @@ async def ws_subscribe_schedule(
     connection.subscriptions[msg["id"]] = async_dispatcher_connect(
         hass, SIGNAL_ZONE_SCHEDULE_CHANGED, _forward
     )
+    # `send_result` must precede `send_event`: the HA WS protocol expects
+    # the subscription ack before any events, and the JS client only
+    # resolves its `subscribeMessage` promise on the result frame.
     connection.send_result(msg["id"])
     connection.send_event(msg["id"], {"schedule": initial})
