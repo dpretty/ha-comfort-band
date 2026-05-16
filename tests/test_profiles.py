@@ -246,3 +246,30 @@ async def test_delete_fires_list_signal(
     finally:
         unsub()
     assert len(received) == 1
+
+
+async def test_delete_active_after_default_rename_signals_new_default(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Regression test for the rename-aware default-profile fallback:
+    after `home` is renamed to `weekday`, deleting whichever profile is
+    active should fall back to `weekday`, NOT to the literal `home`."""
+    registry = await _make_registry(hass)
+    await registry.async_rename("home", "weekday")
+    await registry.async_create("trip")
+    await registry.async_set_active("trip")
+
+    received: list[str] = []
+
+    @callback
+    def on_change(name: str) -> None:
+        received.append(name)
+
+    unsub = async_dispatcher_connect(hass, SIGNAL_ACTIVE_PROFILE_CHANGED, on_change)
+    try:
+        await registry.async_delete("trip")
+    finally:
+        unsub()
+
+    assert received == ["weekday"]
+    assert registry.active == "weekday"

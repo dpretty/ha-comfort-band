@@ -322,8 +322,11 @@ async def async_register_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(str(err)) from err
 
     async def _delete_profile(call: ServiceCall) -> None:
+        name = call.data["name"].strip()
+        if not name:
+            raise ServiceValidationError("Profile name cannot be empty")
         try:
-            await _data(hass).profile_registry.async_delete(call.data["name"].strip())
+            await _data(hass).profile_registry.async_delete(name)
         except (KeyError, ValueError) as err:
             raise ServiceValidationError(str(err)) from err
 
