@@ -10,7 +10,7 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.1.1.** The integration logic is the same as v0.0.2 / v0.1.0 — full coordinator, per-zone entities, profile schedules, override timers, legacy importer. v0.1.0 added a `comfort_band/get_schedule` websocket command for the companion Lovelace card. v0.1.1 is just a repo cleanup release (the card moves to its own repo — see below).
+**v0.2.0.** Adds a `comfort_band/subscribe_schedule` websocket command so the card can receive live schedule updates from any source (a second card on another dashboard, an automation, Developer Tools → Services) without polling. The store fires a new `SIGNAL_ZONE_SCHEDULE_CHANGED` dispatcher signal on every persisted schedule write. The older `comfort_band/get_schedule` request/response command remains for back-compat. The integration logic itself is unchanged from v0.1 — full coordinator, per-zone entities, profile schedules, override timers, legacy importer.
 
 Every zone still defaults to **shadow mode** (`switch.{zone}_enabled = off`): the integration computes the heat/cool/idle decision and updates the `current_action` sensor, but does **not** call `climate.set_hvac_mode`. Flip the switch on per zone when you're ready to cut over.
 

@@ -6,7 +6,9 @@ from typing import Any
 
 import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
+from custom_components.comfort_band.const import SIGNAL_ZONE_SCHEDULE_CHANGED
 from custom_components.comfort_band.storage import ComfortBandStore
 
 # ----- defaults -----
@@ -193,3 +195,33 @@ async def test_set_zone_schedule_independent_lists(
     schedule = store.get_zone_schedule("office", "home")
     assert schedule is not None
     assert schedule["baseline"][0]["low"] == 20.0
+
+
+async def test_set_zone_schedule_fires_signal(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Every persisted schedule write must dispatch SIGNAL_ZONE_SCHEDULE_CHANGED."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+
+    received: list[tuple[str, str, Any]] = []
+    unsub = async_dispatcher_connect(
+        hass,
+        SIGNAL_ZONE_SCHEDULE_CHANGED,
+        lambda zone, profile, schedule: received.append((zone, profile, schedule)),
+    )
+    try:
+        baseline = [{"at": "06:00", "low": 20.0, "high": 23.0}]
+        await store.async_set_zone_schedule("office", "home", baseline)
+        await hass.async_block_till_done()
+    finally:
+        unsub()
+
+    assert len(received) == 1
+    zone, profile, schedule = received[0]
+    assert zone == "office"
+    assert profile == "home"
+    assert schedule is not None
+    assert schedule["baseline"] == baseline
+    assert schedule["current"] == baseline

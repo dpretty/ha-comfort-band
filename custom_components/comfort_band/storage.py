@@ -19,6 +19,7 @@ import copy
 from typing import Any, TypedDict, cast
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 __all__ = [
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PROFILE,
+    SIGNAL_ZONE_SCHEDULE_CHANGED,
     STORAGE_KEY,
     STORAGE_VERSION,
     TEMP_MAX,
@@ -121,6 +123,7 @@ class ComfortBandStore:
     """Wraps `Store[StoredData]` with typed accessors and copy-on-read isolation."""
 
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store: Store[StoredData] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._data: StoredData = _default_data()
         self._loaded = False
@@ -199,11 +202,25 @@ class ComfortBandStore:
         if profile_name not in self._data["profiles"]:
             raise ValueError(f"Profile {profile_name!r} does not exist")
         # Independent baseline/current lists so caller mutation doesn't alias.
-        self._data["zones"][zone_name]["schedules"][profile_name] = {
+        persisted: StoredProfileSchedule = {
             "baseline": copy.deepcopy(baseline),
             "current": copy.deepcopy(current) if current is not None else copy.deepcopy(baseline),
         }
+        self._data["zones"][zone_name]["schedules"][profile_name] = persisted
         await self.async_save()
+        # The sibling SIGNAL_ACTIVE_PROFILE_CHANGED is fired from ProfileRegistry
+        # (a wrapper) to keep the store notification-unaware. There is no
+        # analogous wrapper for schedule writes — services.py mutates the store
+        # directly — so firing here covers every call site without adding an
+        # empty pass-through layer. Separate deep-copy keeps listener mutations
+        # from aliasing in-memory state.
+        async_dispatcher_send(
+            self._hass,
+            SIGNAL_ZONE_SCHEDULE_CHANGED,
+            zone_name,
+            profile_name,
+            copy.deepcopy(persisted),
+        )
 
     # ----- profiles -----
 
