@@ -112,9 +112,7 @@ async def test_delete_active_profile_falls_back_and_signals(
 # ----- list-changed signal -----
 
 
-async def test_create_fires_list_signal(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_create_fires_list_signal(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     registry = await _make_registry(hass)
     received: list[None] = []
 
@@ -176,9 +174,7 @@ async def test_rename_non_active_fires_list_signal_only(
         active_signals.append(name)
 
     unsub_list = async_dispatcher_connect(hass, SIGNAL_PROFILE_LIST_CHANGED, on_list_only)
-    unsub_active = async_dispatcher_connect(
-        hass, SIGNAL_ACTIVE_PROFILE_CHANGED, on_active_capture
-    )
+    unsub_active = async_dispatcher_connect(hass, SIGNAL_ACTIVE_PROFILE_CHANGED, on_active_capture)
     try:
         await registry.async_rename("away", "trip")  # active is "home"
     finally:
@@ -229,9 +225,7 @@ async def test_rename_default_moves_default_pointer(
         await registry.async_delete("weekday")
 
 
-async def test_delete_fires_list_signal(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_delete_fires_list_signal(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     registry = await _make_registry(hass)
     await registry.async_create("vacation")
     received: list[None] = []

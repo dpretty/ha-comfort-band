@@ -241,18 +241,14 @@ async def test_create_profile_blank_name_raises(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
     with pytest.raises(ServiceValidationError, match="cannot be empty"):
-        await hass.services.async_call(
-            DOMAIN, "create_profile", {"name": "   "}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "   "}, blocking=True)
 
 
 async def test_create_profile_duplicate_raises(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
     with pytest.raises(ServiceValidationError, match="already exists"):
-        await hass.services.async_call(
-            DOMAIN, "create_profile", {"name": "home"}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "home"}, blocking=True)
 
 
 async def test_clone_profile_service(
@@ -346,12 +342,8 @@ async def test_rename_profile_unknown_raises(
 async def test_delete_profile_service(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
-    await hass.services.async_call(
-        DOMAIN, "create_profile", {"name": "vacation"}, blocking=True
-    )
-    await hass.services.async_call(
-        DOMAIN, "delete_profile", {"name": "vacation"}, blocking=True
-    )
+    await hass.services.async_call(DOMAIN, "create_profile", {"name": "vacation"}, blocking=True)
+    await hass.services.async_call(DOMAIN, "delete_profile", {"name": "vacation"}, blocking=True)
     registry = hass.data[DOMAIN].profile_registry
     assert "vacation" not in registry.names
 
@@ -360,9 +352,7 @@ async def test_delete_default_profile_raises(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
     with pytest.raises(ServiceValidationError, match="Cannot delete the default profile"):
-        await hass.services.async_call(
-            DOMAIN, "delete_profile", {"name": "home"}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "delete_profile", {"name": "home"}, blocking=True)
 
 
 async def test_delete_unknown_profile_raises(
@@ -372,9 +362,7 @@ async def test_delete_unknown_profile_raises(
     # mutators; the service catches (KeyError, ValueError) and wraps as
     # ServiceValidationError. The name is echoed in the wrapped message.
     with pytest.raises(ServiceValidationError, match="ghost"):
-        await hass.services.async_call(
-            DOMAIN, "delete_profile", {"name": "ghost"}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "delete_profile", {"name": "ghost"}, blocking=True)
 
 
 async def test_create_profile_name_length_capped(
@@ -385,9 +373,7 @@ async def test_create_profile_name_length_capped(
     from voluptuous import MultipleInvalid
 
     with pytest.raises((MultipleInvalid, ServiceValidationError)):
-        await hass.services.async_call(
-            DOMAIN, "create_profile", {"name": "x" * 65}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": "x" * 65}, blocking=True)
 
 
 async def test_create_profile_at_cap_raises_via_service_layer(
@@ -400,9 +386,7 @@ async def test_create_profile_at_cap_raises_via_service_layer(
 
     # Fill up to cap (2 builtins already exist).
     for i in range(MAX_PROFILES - 2):
-        await hass.services.async_call(
-            DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True)
     with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
         await hass.services.async_call(
             DOMAIN, "create_profile", {"name": "one_too_many"}, blocking=True
@@ -417,9 +401,7 @@ async def test_clone_profile_at_cap_raises_via_service_layer(
     from custom_components.comfort_band.const import MAX_PROFILES
 
     for i in range(MAX_PROFILES - 2):
-        await hass.services.async_call(
-            DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True
-        )
+        await hass.services.async_call(DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True)
     with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
         await hass.services.async_call(
             DOMAIN,

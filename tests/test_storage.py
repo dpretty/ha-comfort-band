@@ -314,9 +314,7 @@ async def test_rename_to_existing_name_raises(
         await store.async_rename_profile("away", "home")
 
 
-async def test_rename_unknown_raises(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_rename_unknown_raises(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     store = ComfortBandStore(hass)
     await store.async_load()
     with pytest.raises(KeyError):
@@ -444,9 +442,7 @@ async def test_clone_profile_without_source_schedule_creates_empty_target(
     assert store.get_zone_schedule("office", "weekend") is None
 
 
-async def test_add_profile_count_cap(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_add_profile_count_cap(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     """Cap on total profile count guards against unbounded growth of the
     .storage file from a misbehaving caller."""
     from custom_components.comfort_band.const import MAX_PROFILES
@@ -461,9 +457,7 @@ async def test_add_profile_count_cap(
         await store.async_add_profile("one_too_many")
 
 
-async def test_clone_profile_count_cap(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_clone_profile_count_cap(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     from custom_components.comfort_band.const import MAX_PROFILES
 
     store = ComfortBandStore(hass)

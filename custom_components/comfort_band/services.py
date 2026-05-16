@@ -303,9 +303,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         if not target:
             raise ServiceValidationError("Target profile name cannot be empty")
         try:
-            await _data(hass).profile_registry.async_clone(
-                source, target, call.data["description"]
-            )
+            await _data(hass).profile_registry.async_clone(source, target, call.data["description"])
         except (KeyError, ValueError) as err:
             raise ServiceValidationError(str(err)) from err
 

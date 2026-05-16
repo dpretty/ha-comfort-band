@@ -295,9 +295,7 @@ class ComfortBandStore:
         self._data["profiles"][name] = {"name": name, "description": description}
         await self.async_save()
 
-    async def async_clone_profile(
-        self, source: str, target: str, description: str = ""
-    ) -> None:
+    async def async_clone_profile(self, source: str, target: str, description: str = "") -> None:
         if source not in self._data["profiles"]:
             raise KeyError(source)
         if target in self._data["profiles"]:
