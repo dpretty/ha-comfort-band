@@ -14,7 +14,6 @@ import voluptuous as vol
 from homeassistant.components.websocket_api import async_register_command
 from homeassistant.components.websocket_api.connection import ActiveConnection
 from homeassistant.components.websocket_api.decorators import async_response, websocket_command
-from homeassistant.components.websocket_api.messages import event_message
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
@@ -23,6 +22,9 @@ from .const import DOMAIN, SIGNAL_ZONE_SCHEDULE_CHANGED
 if TYPE_CHECKING:
     from . import ComfortBandData
     from .storage import StoredProfileSchedule
+
+
+_NAME_FIELD = vol.All(str, vol.Length(min=1, max=255))
 
 
 @callback
@@ -35,8 +37,8 @@ def async_register_ws_commands(hass: HomeAssistant) -> None:
 @websocket_command(
     {
         vol.Required("type"): "comfort_band/get_schedule",
-        vol.Required("zone"): str,
-        vol.Required("profile"): str,
+        vol.Required("zone"): _NAME_FIELD,
+        vol.Required("profile"): _NAME_FIELD,
     }
 )
 @callback
@@ -55,9 +57,6 @@ def ws_get_schedule(
         connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
         return
     connection.send_result(msg["id"], schedule)
-
-
-_NAME_FIELD = vol.All(str, vol.Length(min=1, max=255))
 
 
 @websocket_command(
@@ -92,20 +91,23 @@ async def ws_subscribe_schedule(
     if profile not in data.store.list_profiles():
         connection.send_error(msg["id"], "profile_not_found", f"Profile {profile!r} does not exist")
         return
+    # No awaits between this snapshot and the dispatcher_connect below —
+    # a future refactor that introduces one would risk missing an update
+    # written in the gap.
     initial = data.store.get_zone_schedule(zone, profile)
 
     @callback
     def _forward(
         changed_zone: str,
         changed_profile: str,
-        schedule: StoredProfileSchedule | None,
+        schedule: StoredProfileSchedule,
     ) -> None:
         if changed_zone != zone or changed_profile != profile:
             return
-        connection.send_message(event_message(msg["id"], {"schedule": schedule}))
+        connection.send_event(msg["id"], {"schedule": schedule})
 
     connection.subscriptions[msg["id"]] = async_dispatcher_connect(
         hass, SIGNAL_ZONE_SCHEDULE_CHANGED, _forward
     )
     connection.send_result(msg["id"])
-    connection.send_message(event_message(msg["id"], {"schedule": initial}))
+    connection.send_event(msg["id"], {"schedule": initial})

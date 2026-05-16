@@ -28,7 +28,7 @@ class _FakeConnection:
     def __init__(self) -> None:
         self.results: list[tuple[int, Any]] = []
         self.errors: list[tuple[int, str, str]] = []
-        self.messages: list[dict[str, Any]] = []
+        self.events: list[tuple[int, Any]] = []
         self.subscriptions: dict[int, Callable[[], None]] = {}
 
     def send_result(self, msg_id: int, data: Any = None) -> None:
@@ -37,8 +37,10 @@ class _FakeConnection:
     def send_error(self, msg_id: int, code: str, message: str) -> None:
         self.errors.append((msg_id, code, message))
 
-    def send_message(self, message: dict[str, Any]) -> None:
-        self.messages.append(message)
+    def send_event(self, msg_id: int, event: Any | None = None) -> None:
+        # Real ActiveConnection serialises via event_message() →
+        # message_to_json_bytes(); the test only cares about the payload.
+        self.events.append((msg_id, event))
 
     def async_handle_exception(self, msg: dict[str, Any], err: Exception) -> None:
         # Mirrors the real ActiveConnection contract: surface bugs as errors
@@ -127,8 +129,8 @@ async def test_command_is_registered_at_setup(
 
 
 def _events_from(conn: _FakeConnection) -> list[Any]:
-    """Extract the `event` payload from each event_message captured."""
-    return [m["event"] for m in conn.messages if m.get("type") == "event"]
+    """Extract the event payload from each send_event call."""
+    return [event for _msg_id, event in conn.events]
 
 
 async def test_subscribe_sends_initial_value_then_updates(
@@ -176,9 +178,23 @@ async def test_subscribe_sends_initial_value_then_updates(
 
 
 async def test_subscribe_filters_to_matching_zone_profile(
-    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_zone: None,
+    make_zone_entry: Any,
 ) -> None:
     """Updates for an unrelated (zone, profile) must not reach the subscriber."""
+    # Second zone so we can probe both filter axes.
+    kitchen_entry = make_zone_entry(
+        zone_name="kitchen",
+        climate_entity="climate.kitchen_hvac",
+        temp_sensor="sensor.kitchen_temp",
+    )
+    kitchen_entry.add_to_hass(hass)
+    hass.states.async_set("sensor.kitchen_temp", "20.0", {})
+    assert await hass.config_entries.async_setup(kitchen_entry.entry_id)
+    await hass.async_block_till_done()
+
     conn = _FakeConnection()
     ws_subscribe_schedule(
         hass,
@@ -200,7 +216,20 @@ async def test_subscribe_filters_to_matching_zone_profile(
         blocking=True,
     )
     await hass.async_block_till_done()
+    assert len(_events_from(conn)) == baseline_count
 
+    # Write to the matching profile on a different zone — must not echo through.
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "zone": "kitchen",
+            "profile": "home",
+            "transitions": [{"at": "07:00", "low": 19.0, "high": 22.0}],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
     assert len(_events_from(conn)) == baseline_count
 
 
@@ -217,7 +246,7 @@ async def test_subscribe_unknown_zone_errors(
     await hass.async_block_till_done()
 
     assert conn.results == []
-    assert conn.messages == []
+    assert conn.events == []
     assert conn.subscriptions == {}
     assert conn.errors == [(13, "zone_not_found", "Zone 'ghost' does not exist")]
 
@@ -240,7 +269,7 @@ async def test_subscribe_unknown_profile_errors(
     await hass.async_block_till_done()
 
     assert conn.results == []
-    assert conn.messages == []
+    assert conn.events == []
     assert conn.subscriptions == {}
     assert conn.errors == [(15, "profile_not_found", "Profile 'ghost' does not exist")]
 
