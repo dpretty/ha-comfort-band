@@ -47,7 +47,13 @@ def ws_get_schedule(
     connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Return `{baseline, current}` for the (zone, profile), or `null` if unset."""
+    """Return `{baseline, current}` for the (zone, profile), or `null` if unset.
+
+    Returns `null` for both "profile has no schedule yet" and "profile
+    does not exist" — the request/response shape can't distinguish them.
+    The push command `subscribe_schedule` errors on unknown profiles so
+    the card doesn't sit on a subscription that will never fire.
+    """
     data: ComfortBandData = hass.data[DOMAIN]
     zone = msg["zone"]
     profile = msg["profile"]
