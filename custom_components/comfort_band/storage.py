@@ -332,7 +332,10 @@ class ComfortBandStore:
         if name == self._data["default_profile"]:
             raise ValueError(f"Cannot delete the default profile {name!r}")
         if name not in self._data["profiles"]:
-            return
+            # Consistent with the sibling mutators (clone/rename) which both
+            # raise KeyError on unknown names. ProfileRegistry catches and
+            # re-raises as ServiceValidationError for the service layer.
+            raise KeyError(name)
         del self._data["profiles"][name]
         # Clean up orphan per-zone schedules — otherwise dead-weight on disk.
         for zone in self._data["zones"].values():

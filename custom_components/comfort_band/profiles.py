@@ -64,10 +64,9 @@ class ProfileRegistry:
             async_dispatcher_send(self._hass, SIGNAL_ACTIVE_PROFILE_CHANGED, new)
 
     async def async_delete(self, name: str) -> None:
-        if name == self.default:
-            raise ValueError(f"Cannot delete the default profile {name!r}")
-        if name not in self.names:
-            raise KeyError(f"Profile {name!r} does not exist")
+        # The store raises KeyError for unknown names and ValueError for the
+        # default. We capture `was_active` first; if the store raises, the
+        # dispatcher is never called (the await propagates the exception).
         was_active = self.active == name
         await self._store.async_remove_profile(name)
         async_dispatcher_send(self._hass, SIGNAL_PROFILE_LIST_CHANGED)

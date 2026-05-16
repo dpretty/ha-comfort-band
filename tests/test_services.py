@@ -368,7 +368,10 @@ async def test_delete_default_profile_raises(
 async def test_delete_unknown_profile_raises(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
-    with pytest.raises(ServiceValidationError, match="does not exist"):
+    # Storage raises KeyError(name) consistent with the clone/rename
+    # mutators; the service catches (KeyError, ValueError) and wraps as
+    # ServiceValidationError. The name is echoed in the wrapped message.
+    with pytest.raises(ServiceValidationError, match="ghost"):
         await hass.services.async_call(
             DOMAIN, "delete_profile", {"name": "ghost"}, blocking=True
         )
