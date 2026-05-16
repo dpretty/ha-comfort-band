@@ -9,26 +9,41 @@ adds nothing testable beyond what the framework already guarantees
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from homeassistant.core import HomeAssistant
 
-from custom_components.comfort_band.ws import ws_get_schedule
+from custom_components.comfort_band.ws import ws_get_schedule, ws_subscribe_schedule
 
 
 class _FakeConnection:
-    """Minimal stand-in for `websocket_api.ActiveConnection`."""
+    """Minimal stand-in for `websocket_api.ActiveConnection`.
+
+    Captures every send_* and tracks the `subscriptions` dict used by
+    HA's WS framework for cleanup on disconnect.
+    """
 
     def __init__(self) -> None:
         self.results: list[tuple[int, Any]] = []
         self.errors: list[tuple[int, str, str]] = []
+        self.messages: list[dict[str, Any]] = []
+        self.subscriptions: dict[int, Callable[[], None]] = {}
 
-    def send_result(self, msg_id: int, data: Any) -> None:
+    def send_result(self, msg_id: int, data: Any = None) -> None:
         self.results.append((msg_id, data))
 
     def send_error(self, msg_id: int, code: str, message: str) -> None:
         self.errors.append((msg_id, code, message))
+
+    def send_message(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+
+    def async_handle_exception(self, msg: dict[str, Any], err: Exception) -> None:
+        # Mirrors the real ActiveConnection contract: surface bugs as errors
+        # rather than swallowing them so the test sees a failure.
+        self.errors.append((msg["id"], "unhandled_exception", repr(err)))
 
 
 @pytest.fixture
@@ -102,6 +117,137 @@ async def test_get_schedule_errors_for_unknown_zone(
 async def test_command_is_registered_at_setup(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
-    """Sanity: async_register_ws_commands() runs and the command is wired."""
+    """Sanity: async_register_ws_commands() runs and the commands are wired."""
     handlers = hass.data.get("websocket_api", {})
     assert "comfort_band/get_schedule" in handlers
+    assert "comfort_band/subscribe_schedule" in handlers
+
+
+# ----- subscribe_schedule -----
+
+
+def _events_from(conn: _FakeConnection) -> list[Any]:
+    """Extract the `event` payload from each event_message captured."""
+    return [m["event"] for m in conn.messages if m.get("type") == "event"]
+
+
+async def test_subscribe_sends_initial_value_then_updates(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Subscribe pushes the current schedule, then echoes every later write."""
+    initial = [{"at": "06:00", "low": 20.0, "high": 23.0}]
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {"zone": "office", "profile": "home", "transitions": initial},
+        blocking=True,
+    )
+
+    conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 11, "type": "comfort_band/subscribe_schedule", "zone": "office", "profile": "home"},
+    )
+    await hass.async_block_till_done()
+
+    assert conn.errors == []
+    assert conn.results == [(11, None)]
+    events = _events_from(conn)
+    assert len(events) == 1
+    assert events[0]["schedule"]["baseline"] == initial
+    assert 11 in conn.subscriptions
+
+    updated = [
+        {"at": "06:00", "low": 20.0, "high": 23.0},
+        {"at": "22:00", "low": 18.0, "high": 21.0},
+    ]
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {"zone": "office", "profile": "home", "transitions": updated},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    events = _events_from(conn)
+    assert len(events) == 2
+    assert events[1]["schedule"]["baseline"] == updated
+
+
+async def test_subscribe_filters_to_matching_zone_profile(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Updates for an unrelated (zone, profile) must not reach the subscriber."""
+    conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 12, "type": "comfort_band/subscribe_schedule", "zone": "office", "profile": "home"},
+    )
+    await hass.async_block_till_done()
+    baseline_count = len(_events_from(conn))
+
+    # Write to a different profile on the same zone — must not echo through.
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "zone": "office",
+            "profile": "away",
+            "transitions": [{"at": "06:00", "low": 17.0, "high": 20.0}],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert len(_events_from(conn)) == baseline_count
+
+
+async def test_subscribe_unknown_zone_errors(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """An unknown zone surfaces a typed error and does not open a subscription."""
+    conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 13, "type": "comfort_band/subscribe_schedule", "zone": "ghost", "profile": "home"},
+    )
+    await hass.async_block_till_done()
+
+    assert conn.results == []
+    assert conn.messages == []
+    assert conn.subscriptions == {}
+    assert conn.errors == [(13, "zone_not_found", "Zone 'ghost' does not exist")]
+
+
+async def test_subscribe_unsubscribe_stops_updates(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """Calling the stored unsubscribe handle detaches the dispatcher listener."""
+    conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 14, "type": "comfort_band/subscribe_schedule", "zone": "office", "profile": "home"},
+    )
+    await hass.async_block_till_done()
+
+    unsub = conn.subscriptions[14]
+    unsub()
+
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "zone": "office",
+            "profile": "home",
+            "transitions": [{"at": "06:00", "low": 20.0, "high": 23.0}],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Only the initial event from subscribe — nothing after unsub.
+    assert len(_events_from(conn)) == 1

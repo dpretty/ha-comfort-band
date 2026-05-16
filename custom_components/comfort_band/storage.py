@@ -19,6 +19,7 @@ import copy
 from typing import Any, TypedDict, cast
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
 __all__ = [
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PROFILE,
+    SIGNAL_ZONE_SCHEDULE_CHANGED,
     STORAGE_KEY,
     STORAGE_VERSION,
     TEMP_MAX,
@@ -121,6 +123,7 @@ class ComfortBandStore:
     """Wraps `Store[StoredData]` with typed accessors and copy-on-read isolation."""
 
     def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
         self._store: Store[StoredData] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._data: StoredData = _default_data()
         self._loaded = False
@@ -204,6 +207,13 @@ class ComfortBandStore:
             "current": copy.deepcopy(current) if current is not None else copy.deepcopy(baseline),
         }
         await self.async_save()
+        async_dispatcher_send(
+            self._hass,
+            SIGNAL_ZONE_SCHEDULE_CHANGED,
+            zone_name,
+            profile_name,
+            self.get_zone_schedule(zone_name, profile_name),
+        )
 
     # ----- profiles -----
 

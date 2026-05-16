@@ -69,3 +69,4 @@ PLATFORMS_PROFILE_MANAGER: Final = (Platform.SELECT,)
 
 # Signals (async_dispatcher).
 SIGNAL_ACTIVE_PROFILE_CHANGED: Final = f"{DOMAIN}_active_profile_changed"
+SIGNAL_ZONE_SCHEDULE_CHANGED: Final = f"{DOMAIN}_zone_schedule_changed"
