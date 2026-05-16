@@ -54,7 +54,7 @@ Plus one global entity: `select.comfort_band_profiles_active_profile`.
 
 ### Profile manager entity attributes
 
-`select.comfort_band_profiles_active_profile` carries three attributes the card (or any consumer) can read alongside the standard `options` / `state`:
+`select.comfort_band_profiles_active_profile` carries two extra attributes the card (or any consumer) can read alongside the standard `options` / `state`:
 
 - `default_profile` — the rename-aware fallback target. Initially `"home"`; tracks renames. The profile pointed to by this attribute cannot be deleted.
 - `descriptions` — a `{profile_name: description}` map; each profile's optional description as set via `create_profile` / `clone_profile`.
@@ -63,7 +63,7 @@ The card uses presence of `default_profile` as a feature flag — if it's missin
 
 ## Importing a legacy schedule
 
-If you're migrating from a hand-rolled YAML system that stored each zone's schedule as 48 `input_number` helpers (one each for low and high, per hour 00..23), the `comfort_band.import_legacy` service will collapse them into a transition list and seed the zone's `home` profile.
+If you're migrating from a hand-rolled YAML system that stored each zone's schedule as 48 `input_number` helpers (one each for low and high, per hour 00..23), the `comfort_band.import_legacy` service will collapse them into a transition list and seed the zone's **default profile** (initially `home`; tracks renames).
 
 In **Developer Tools → Services**:
 

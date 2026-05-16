@@ -390,6 +390,25 @@ async def test_create_profile_name_length_capped(
         )
 
 
+async def test_create_profile_at_cap_raises_via_service_layer(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """The cap is enforced at the storage layer; verify the error
+    propagates through the service handler as ServiceValidationError so
+    the card surfaces it via the existing error-handling path."""
+    from custom_components.comfort_band.const import MAX_PROFILES
+
+    # Fill up to cap (2 builtins already exist).
+    for i in range(MAX_PROFILES - 2):
+        await hass.services.async_call(
+            DOMAIN, "create_profile", {"name": f"p{i}"}, blocking=True
+        )
+    with pytest.raises(ServiceValidationError, match=f"more than {MAX_PROFILES}"):
+        await hass.services.async_call(
+            DOMAIN, "create_profile", {"name": "one_too_many"}, blocking=True
+        )
+
+
 async def test_clone_profile_empty_source_raises_clear_error(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:

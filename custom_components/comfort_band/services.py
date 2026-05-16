@@ -1,12 +1,17 @@
 """Service registration.
 
-Eight services, all keyed by zone *slug* (not entity_id) so the call site
-matches the storage key. Schemas use voluptuous + entity selectors so
-Developer Tools renders sensible UI.
+Twelve services: schedule mutators (set/add/update/remove transition),
+override control (start/cancel), legacy importer, profile switch, and
+profile CRUD (create/clone/rename/delete). All zone-scoped services are
+keyed by zone *slug* (not entity_id) so the call site matches the
+storage key. Schemas use voluptuous + entity selectors so Developer
+Tools renders sensible UI.
 
 Schedule mutators all run a normalize pass before persisting; they raise
 ServiceValidationError on malformed input rather than letting the user
-write garbage to the store.
+write garbage to the store. Profile-CRUD handlers wrap (KeyError,
+ValueError) from the registry/store as ServiceValidationError so users
+see a consistent error class regardless of which layer rejected.
 """
 
 from __future__ import annotations
@@ -189,7 +194,7 @@ async def _refresh_zone_if_active(hass: HomeAssistant, zone_name: str) -> None:
 
 
 async def async_register_services(hass: HomeAssistant) -> None:
-    """Idempotently register all 8 services."""
+    """Idempotently register all 12 services."""
     if hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
         return
 
@@ -284,7 +289,10 @@ async def async_register_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError("Profile name cannot be empty")
         try:
             await _data(hass).profile_registry.async_create(name, call.data["description"])
-        except ValueError as err:
+        except (KeyError, ValueError) as err:
+            # async_add_profile only raises ValueError today; broad catch
+            # mirrors the other three CRUD handlers and is defensive
+            # against future storage changes.
             raise ServiceValidationError(str(err)) from err
 
     async def _clone_profile(call: ServiceCall) -> None:
