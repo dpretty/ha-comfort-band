@@ -110,8 +110,8 @@ class ComfortBandConfigFlow(ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(entry: ConfigEntry) -> OptionsFlow:
-        return ZoneOptionsFlow(entry)
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        return ZoneOptionsFlow()
 
 
 class ZoneOptionsFlow(OptionsFlow):
@@ -120,17 +120,26 @@ class ZoneOptionsFlow(OptionsFlow):
     Resolution order at read time is `entry.options[CONF_HUMIDITY_SENSOR]`
     falling back to `entry.data[CONF_HUMIDITY_SENSOR]` — so existing zones
     that picked a humidity sensor at first-setup keep working, and an
-    OptionsFlow edit wins thereafter.
-    """
+    OptionsFlow edit wins thereafter. Submitting an empty form normalises
+    to `{CONF_HUMIDITY_SENSOR: None}` so a user can clear a previously-set
+    sensor.
 
-    def __init__(self, entry: ConfigEntry) -> None:
-        self.entry = entry
+    Uses the modern HA convention: `self.config_entry` is resolved by the
+    base class from `self.hass`, no `__init__` override required.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-        current = self.entry.options.get(
-            CONF_HUMIDITY_SENSOR, self.entry.data.get(CONF_HUMIDITY_SENSOR)
+            # Voluptuous omits the key when the EntitySelector is left empty.
+            # Normalise to None so the resolution below sees a value (not a
+            # missing key that falls through to entry.data — which would
+            # silently re-apply the previously-saved sensor).
+            return self.async_create_entry(
+                title="",
+                data={CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR)},
+            )
+        current = self.config_entry.options.get(
+            CONF_HUMIDITY_SENSOR, self.config_entry.data.get(CONF_HUMIDITY_SENSOR)
         )
         schema = vol.Schema(
             {

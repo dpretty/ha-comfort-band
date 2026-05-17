@@ -19,6 +19,11 @@ class EnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
     """Master kill: while OFF the integration is in shadow mode -- it computes
     decisions and logs intent but does NOT call climate.set_hvac_mode.
     Default is OFF so the legacy YAML keeps driving until per-zone cutover.
+
+    Deliberately NOT marked EntityCategory.CONFIG: this is the zone's
+    primary operational control and should render as a top-level entity
+    on the device page, not under the collapsed "Configuration" section
+    where the learning / use-apparent toggles live.
     """
 
     def __init__(self, coordinator: ZoneCoordinator) -> None:

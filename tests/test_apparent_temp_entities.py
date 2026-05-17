@@ -59,11 +59,11 @@ async def test_apparent_temp_sensor_reads_steadman_value(
 ) -> None:
     state = hass.states.get("sensor.office_apparent_temperature")
     assert state is not None
-    # 21 °C, 50 % RH → Steadman 21.16, rounded to 21.2 by the sensor.
+    # 21 °C, 50 % RH → Steadman 21.09, rounded to 21.1 by the sensor.
     assert state.state != "unknown"
     assert state.state != "unavailable"
     value = float(state.state)
-    assert abs(value - 21.16) < 0.1
+    assert abs(value - 21.09) < 0.1
 
 
 async def test_apparent_temp_equals_room_when_humidity_absent(

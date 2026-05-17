@@ -340,29 +340,30 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     # ----- helpers -----
 
-    def _read_room_temp(self) -> tuple[float | None, bool]:
-        state = self.hass.states.get(self.temp_entity_id)
-        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, "", None):
-            return None, False
-        try:
-            return float(state.state), True
-        except (TypeError, ValueError):
-            return None, False
-
-    def _read_humidity(self) -> float | None:
-        """Returns the configured humidity sensor's value, or None if no
-        humidity sensor was configured or the current reading is missing /
-        non-numeric. The apparent-temp formula treats None as "no
-        adjustment", so this is the safe pass-through value."""
-        if self.humidity_entity_id is None:
+    def _read_numeric_sensor(self, entity_id: str | None) -> float | None:
+        """Shared read path for any external numeric sensor: returns the
+        float value, or None when the entity is missing, unavailable, or
+        non-numeric. Used by both the room-temp and humidity readers (and
+        any future sensor input — predictive control / IAQ / etc.)."""
+        if entity_id is None:
             return None
-        state = self.hass.states.get(self.humidity_entity_id)
+        state = self.hass.states.get(entity_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, "", None):
             return None
         try:
             return float(state.state)
         except (TypeError, ValueError):
             return None
+
+    def _read_room_temp(self) -> tuple[float | None, bool]:
+        # `sensor_available` is True iff a numeric reading was produced.
+        value = self._read_numeric_sensor(self.temp_entity_id)
+        return value, value is not None
+
+    def _read_humidity(self) -> float | None:
+        """The apparent-temp formula treats None as "no adjustment", so a
+        missing / offline humidity sensor degrades gracefully."""
+        return self._read_numeric_sensor(self.humidity_entity_id)
 
     def _resolve_schedule(
         self,

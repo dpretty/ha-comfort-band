@@ -82,11 +82,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not data.store.has_zone(zone_name):
             await data.store.async_add_zone(zone_name)
 
-        # Humidity sensor is optional; OptionsFlow can also set it post-hoc.
-        # Options win over data so an edit survives without an entry rebuild.
-        humidity_entity_id = entry.options.get(
-            CONF_HUMIDITY_SENSOR, entry.data.get(CONF_HUMIDITY_SENSOR)
-        )
+        # Humidity sensor is optional; OptionsFlow can also set / clear it
+        # post-hoc. The OptionsFlow always writes the key (possibly None)
+        # so "key present in options" means "user has edited this", even
+        # when they're clearing the value. Without the explicit `in` check
+        # below, a `.get(..., entry.data...)` fallback would silently
+        # re-apply the data value, defeating the clear path.
+        if CONF_HUMIDITY_SENSOR in entry.options:
+            humidity_entity_id = entry.options[CONF_HUMIDITY_SENSOR]
+        else:
+            humidity_entity_id = entry.data.get(CONF_HUMIDITY_SENSOR)
         coordinator = ZoneCoordinator(
             hass,
             data.store,
