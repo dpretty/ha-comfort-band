@@ -69,6 +69,14 @@ class StoredZone(TypedDict):
     deadband_above: float
     min_cycle_minutes: int
     enabled: bool
+    # Gate for the v0.4+ learning cluster (apparent-temp-aware nudges,
+    # predictive control). Not consumed by anything yet — wired so future
+    # PRs can read it without another storage migration.
+    learning_enabled: bool
+    # When True, hysteresis decisions consume the *apparent* temperature
+    # instead of the raw room reading. Falls back to room temp automatically
+    # when no humidity reading is available.
+    use_apparent_temperature: bool
     last_action_at: str | None
     last_action: str | None
 
@@ -120,6 +128,8 @@ def _default_zone(zone_name: str) -> StoredZone:
         "deadband_above": DEFAULT_DEADBAND_ABOVE,
         "min_cycle_minutes": DEFAULT_MIN_CYCLE_MINUTES,
         "enabled": False,
+        "learning_enabled": False,
+        "use_apparent_temperature": False,
         "last_action_at": None,
         "last_action": None,
     }
@@ -171,6 +181,17 @@ class ComfortBandStore:
         if raw.get("active_profile") not in raw.get("profiles", {}):
             raw["active_profile"] = raw["default_profile"]
             migrated = True
+        # v0.3 → v0.4 migration: backfill `learning_enabled` and
+        # `use_apparent_temperature` on every existing zone. Without this
+        # `async_update_zone` would KeyError when callers set these new
+        # fields, and entity reads of `zone["learning_enabled"]` would crash.
+        for zone in raw.get("zones", {}).values():
+            if "learning_enabled" not in zone:
+                zone["learning_enabled"] = False
+                migrated = True
+            if "use_apparent_temperature" not in zone:
+                zone["use_apparent_temperature"] = False
+                migrated = True
         if migrated:
             await self._store.async_save(self._data)
         self._loaded = True

@@ -6,6 +6,7 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -34,8 +35,60 @@ class EnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
         await self.coordinator.async_set_enabled(False)
 
 
+class LearningEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
+    """Master gate for the learning cluster (apparent-temp-aware nudges and
+    predictive control). Default OFF -- same shadow-mode posture as
+    `enabled`. Read by future PRs (#9, #11); has no decision effect today.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "learning_enabled")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.zone["learning_enabled"]
+
+    async def async_turn_on(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_learning_enabled(True)
+
+    async def async_turn_off(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_learning_enabled(False)
+
+
+class UseApparentTemperatureSwitch(ComfortBandZoneEntity, SwitchEntity):
+    """When ON, hysteresis decisions consume the apparent (humidity-adjusted)
+    temperature instead of the raw room reading. Falls back to room temp
+    automatically when no humidity reading is available, so it's safe to
+    leave on even if the humidity sensor is flaky. Default OFF -- opt-in
+    behaviour change.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "use_apparent_temperature")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.zone["use_apparent_temperature"]
+
+    async def async_turn_on(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_use_apparent_temperature(True)
+
+    async def async_turn_off(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_use_apparent_temperature(False)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator: ZoneCoordinator = hass.data[DOMAIN].zone_coordinators[entry.entry_id]
-    async_add_entities([EnabledSwitch(coordinator)])
+    async_add_entities(
+        [
+            EnabledSwitch(coordinator),
+            LearningEnabledSwitch(coordinator),
+            UseApparentTemperatureSwitch(coordinator),
+        ]
+    )

@@ -91,6 +91,94 @@ async def test_well_above_band_decides_cool(
     assert state.decision.target_temp == 22.5
 
 
+async def test_use_apparent_temperature_swaps_decision_input(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """With a humidity sensor configured AND `use_apparent_temperature` ON,
+    the hysteresis decider sees the Steadman value, not the raw room temp."""
+    humidity_entity = "sensor.office_humidity"
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_update_zone("office", use_apparent_temperature=True)
+    coordinator = ZoneCoordinator(
+        hass,
+        store,
+        "office",
+        CLIMATE_ENTITY,
+        TEMP_ENTITY,
+        humidity_entity_id=humidity_entity,
+    )
+    # 27 °C room + 85 % RH → apparent ≈ 30 °C — above the default 22.5 high
+    # band. Without the switch the decider would see 27 (cool either way),
+    # but with humidity boost it's clearly above and the asserted band makes
+    # the swap test the discriminating value.
+    hass.states.async_set(TEMP_ENTITY, "27.0", {})
+    hass.states.async_set(humidity_entity, "85", {})
+    state = await coordinator._async_update_data()
+    assert state.room == 27.0
+    assert state.humidity == 85.0
+    # Apparent stored on the state alongside the raw room reading.
+    assert state.apparent_temperature is not None
+    assert state.apparent_temperature > state.room
+    # `decision_room` is the value that was actually fed into hysteresis.
+    assert state.decision_room == state.apparent_temperature
+
+
+async def test_use_apparent_temperature_off_uses_raw_room(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Default behaviour: hysteresis sees the raw room reading even when a
+    humidity sensor is configured."""
+    humidity_entity = "sensor.office_humidity"
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    # `use_apparent_temperature` is False by default.
+    coordinator = ZoneCoordinator(
+        hass,
+        store,
+        "office",
+        CLIMATE_ENTITY,
+        TEMP_ENTITY,
+        humidity_entity_id=humidity_entity,
+    )
+    hass.states.async_set(TEMP_ENTITY, "27.0", {})
+    hass.states.async_set(humidity_entity, "85", {})
+    state = await coordinator._async_update_data()
+    # Apparent is still computed and surfaced; just not used for decisions.
+    assert state.apparent_temperature is not None
+    assert state.apparent_temperature > state.room
+    assert state.decision_room == state.room  # NOT the apparent value
+
+
+async def test_use_apparent_falls_back_to_room_when_humidity_unavailable(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """The point of the safety net: flipping `use_apparent_temperature` ON
+    must still produce sensible decisions when the humidity sensor goes
+    offline. `compute(T, None) -> T`, so decision_room === room."""
+    humidity_entity = "sensor.office_humidity"
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_update_zone("office", use_apparent_temperature=True)
+    coordinator = ZoneCoordinator(
+        hass,
+        store,
+        "office",
+        CLIMATE_ENTITY,
+        TEMP_ENTITY,
+        humidity_entity_id=humidity_entity,
+    )
+    hass.states.async_set(TEMP_ENTITY, "21.5", {})
+    # No humidity sensor state at all — equivalent to unavailable.
+    state = await coordinator._async_update_data()
+    assert state.humidity is None
+    assert state.apparent_temperature == state.room
+    assert state.decision_room == state.room
+
+
 async def test_schedule_fallback_follows_renamed_default_profile(
     hass: HomeAssistant, coordinator: ZoneCoordinator
 ) -> None:

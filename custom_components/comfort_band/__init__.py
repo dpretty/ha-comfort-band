@@ -21,6 +21,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_HUMIDITY_SENSOR,
     CONF_KIND,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
@@ -81,21 +82,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not data.store.has_zone(zone_name):
             await data.store.async_add_zone(zone_name)
 
+        # Humidity sensor is optional; OptionsFlow can also set it post-hoc.
+        # Options win over data so an edit survives without an entry rebuild.
+        humidity_entity_id = entry.options.get(
+            CONF_HUMIDITY_SENSOR, entry.data.get(CONF_HUMIDITY_SENSOR)
+        )
         coordinator = ZoneCoordinator(
             hass,
             data.store,
             zone_name,
             entry.data[CONF_CLIMATE_ENTITY],
             entry.data[CONF_TEMP_SENSOR],
+            humidity_entity_id=humidity_entity_id,
         )
         await coordinator.async_setup()
         data.zone_coordinators[entry.entry_id] = coordinator
         data.zone_slug_to_entry_id[zone_name] = entry.entry_id
+        # Reload on OptionsFlow save so a humidity-sensor change picks up
+        # without a HA restart.
+        entry.async_on_unload(entry.add_update_listener(_async_reload_on_options_change))
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS_ZONE)
         return True
 
     LOGGER.error("Unknown ConfigEntry kind %r on %s", kind, entry.entry_id)
     return False
+
+
+async def _async_reload_on_options_change(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

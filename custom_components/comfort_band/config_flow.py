@@ -14,11 +14,13 @@ import re
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_HUMIDITY_SENSOR,
     CONF_KIND,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
@@ -29,6 +31,10 @@ from .const import (
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
+_HUMIDITY_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=["sensor"], device_class=["humidity"])
+)
+
 _ZONE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_ZONE_NAME): selector.TextSelector(),
@@ -38,6 +44,7 @@ _ZONE_SCHEMA = vol.Schema(
         vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["sensor"], device_class=["temperature"])
         ),
+        vol.Optional(CONF_HUMIDITY_SENSOR): _HUMIDITY_SELECTOR,
     }
 )
 
@@ -69,6 +76,10 @@ class ComfortBandConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_ZONE_NAME: slug,
                         CONF_CLIMATE_ENTITY: user_input[CONF_CLIMATE_ENTITY],
                         CONF_TEMP_SENSOR: user_input[CONF_TEMP_SENSOR],
+                        # Optional — None if the user didn't pick one. Stored
+                        # in entry data; the OptionsFlow below mirrors it
+                        # under entry options for later edits.
+                        CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR),
                     },
                 )
         return self.async_show_form(step_id="zone", data_schema=_ZONE_SCHEMA, errors=errors)
@@ -90,3 +101,43 @@ class ComfortBandConfigFlow(ConfigFlow, domain=DOMAIN):
             entry.data.get(CONF_KIND) == ENTRY_KIND_PROFILE_MANAGER
             for entry in self._async_current_entries()
         )
+
+    @classmethod
+    def async_supports_options_flow(cls, entry: ConfigEntry) -> bool:
+        # Only zone entries have editable options today. The profile-manager
+        # singleton has nothing user-tunable beyond what the card surfaces.
+        return entry.data.get(CONF_KIND) == ENTRY_KIND_ZONE
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: ConfigEntry) -> OptionsFlow:
+        return ZoneOptionsFlow(entry)
+
+
+class ZoneOptionsFlow(OptionsFlow):
+    """Single-field flow: attach / change / clear the optional humidity sensor.
+
+    Resolution order at read time is `entry.options[CONF_HUMIDITY_SENSOR]`
+    falling back to `entry.data[CONF_HUMIDITY_SENSOR]` — so existing zones
+    that picked a humidity sensor at first-setup keep working, and an
+    OptionsFlow edit wins thereafter.
+    """
+
+    def __init__(self, entry: ConfigEntry) -> None:
+        self.entry = entry
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+        current = self.entry.options.get(
+            CONF_HUMIDITY_SENSOR, self.entry.data.get(CONF_HUMIDITY_SENSOR)
+        )
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_HUMIDITY_SENSOR,
+                    description={"suggested_value": current},
+                ): _HUMIDITY_SELECTOR,
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

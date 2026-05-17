@@ -428,6 +428,51 @@ async def test_load_legacy_data_with_empty_profiles_reseeds_builtins(
     assert set(store.list_profiles()) == {"home", "away"}
 
 
+async def test_load_legacy_v0_3_zone_backfills_new_fields(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A v0.3 zone payload (no `learning_enabled` / `use_apparent_temperature`
+    yet) must backfill both fields with `False` on load — otherwise any
+    later `async_update_zone(..., learning_enabled=...)` would KeyError.
+    """
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "enabled": False,
+                    # NB: no learning_enabled / use_apparent_temperature.
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    zone = store.get_zone("office")
+    assert zone["learning_enabled"] is False
+    assert zone["use_apparent_temperature"] is False
+    # And update_zone now works on the new field without KeyError.
+    await store.async_update_zone("office", learning_enabled=True)
+    assert store.get_zone("office")["learning_enabled"] is True
+
+
 async def test_clone_profile_without_source_schedule_creates_empty_target(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
