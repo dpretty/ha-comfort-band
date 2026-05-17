@@ -179,6 +179,41 @@ async def test_use_apparent_falls_back_to_room_when_humidity_unavailable(
     assert state.decision_room == state.room
 
 
+async def test_humidity_going_unavailable_mid_stream_falls_back_to_room(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Sibling case to the never-registered test above: the humidity sensor
+    publishes a valid reading, then transitions to `unavailable` (sensor
+    drops off the network, integration unloads, etc.). The `_read_humidity`
+    `STATE_UNAVAILABLE` guard branch isn't exercised by the
+    state-never-set path — it returns early on `state is None`. This pins
+    the explicit-unavailable behaviour so a regression there can't slip in.
+    """
+    humidity_entity = "sensor.office_humidity"
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_update_zone("office", use_apparent_temperature=True)
+    coordinator = ZoneCoordinator(
+        hass,
+        store,
+        "office",
+        CLIMATE_ENTITY,
+        TEMP_ENTITY,
+        humidity_entity_id=humidity_entity,
+    )
+    hass.states.async_set(TEMP_ENTITY, "21.5", {})
+    hass.states.async_set(humidity_entity, "60", {})
+    first = await coordinator._async_update_data()
+    assert first.humidity == 60.0
+    # Now simulate the sensor dropping mid-stream.
+    hass.states.async_set(humidity_entity, "unavailable", {})
+    after = await coordinator._async_update_data()
+    assert after.humidity is None
+    assert after.apparent_temperature == after.room
+    assert after.decision_room == after.room
+
+
 async def test_schedule_fallback_follows_renamed_default_profile(
     hass: HomeAssistant, coordinator: ZoneCoordinator
 ) -> None:

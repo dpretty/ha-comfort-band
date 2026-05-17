@@ -207,8 +207,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(self.zone_name, learning_enabled=learning_enabled)
         await self.async_refresh()
 
-    async def async_set_use_apparent_temperature(self, use_apparent: bool) -> None:
-        await self._store.async_update_zone(self.zone_name, use_apparent_temperature=use_apparent)
+    async def async_set_use_apparent_temperature(self, use_apparent_temperature: bool) -> None:
+        await self._store.async_update_zone(
+            self.zone_name, use_apparent_temperature=use_apparent_temperature
+        )
         await self.async_refresh()
 
     async def _set_manual_and_override(self, **manual_fields: float) -> None:

@@ -39,4 +39,11 @@ def compute(temp_c: float, humidity_pct: float | None) -> float:
     if humidity_pct is None or not 0.0 <= humidity_pct <= 100.0:
         return temp_c
     vapor_pressure = (humidity_pct / 100.0) * 6.105 * math.exp(17.27 * temp_c / (237.7 + temp_c))
-    return temp_c + 0.33 * vapor_pressure - 4.00
+    result = temp_c + 0.33 * vapor_pressure - 4.00
+    # Belt-and-suspenders for a sensor publishing a numerically valid but
+    # wildly out-of-range temperature (e.g. -300 °C after a unit-mismatch
+    # misconfig). The exponent diverges and `result` becomes inf, which
+    # would otherwise be surfaced to HA as an entity value that fails unit
+    # validation. Fall back to the raw temp in that case — the upstream
+    # decision pipeline already handles a nonsense room reading.
+    return result if math.isfinite(result) else temp_c
