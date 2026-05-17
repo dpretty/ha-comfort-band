@@ -185,6 +185,12 @@ class ComfortBandStore:
         # `use_apparent_temperature` on every existing zone. Without this
         # `async_update_zone` would KeyError when callers set these new
         # fields, and entity reads of `zone["learning_enabled"]` would crash.
+        #
+        # STORAGE_VERSION intentionally stays at 1: field additions with
+        # safe defaults are forward-compatible (old payload + missing
+        # field → backfill yields a valid new payload). A version bump
+        # would force an async_migrate_func code path that we don't need
+        # — the in-place defaulting here covers every load.
         for zone in raw.get("zones", {}).values():
             if "learning_enabled" not in zone:
                 zone["learning_enabled"] = False

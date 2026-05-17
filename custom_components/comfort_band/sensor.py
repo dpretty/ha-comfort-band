@@ -84,6 +84,11 @@ class ApparentTemperatureSensor(_TemperatureSensor):
 
     @property
     def native_value(self) -> float | None:
+        # 1-decimal rounding matches RoomTemperatureSensor — both sources
+        # feed the band gauge and the card's "Feels like" line, which
+        # subtract them to decide whether to render the row. Keeping the
+        # precision identical prevents a permanent sub-0.1 °C delta from
+        # forcing the row visible at every humidity value.
         value = self.coordinator.data.apparent_temperature
         return None if value is None else round(value, 1)
 
