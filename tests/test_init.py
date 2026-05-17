@@ -21,11 +21,14 @@ _EXPECTED_ZONE_ENTITIES = (
     "sensor.office_effective_low",
     "sensor.office_effective_high",
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror
+    "sensor.office_apparent_temperature",
     "sensor.office_override_ends",
     "sensor.office_current_action",
     "binary_sensor.office_override_active",
     "button.office_cancel_override",
     "switch.office_enabled",
+    "switch.office_learning_enabled",
+    "switch.office_use_apparent_temperature",
 )
 
 

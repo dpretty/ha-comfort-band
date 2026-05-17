@@ -31,7 +31,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import hysteresis, schedule
+from . import apparent_temp, hysteresis, schedule
 from .const import (
     ACTION_UNKNOWN,
     LOGGER,
@@ -55,11 +55,19 @@ class ZoneState:
     `zone` is the full StoredZone (deep-copied) so entities can read tunables
     (manual_low/high, deadband_*, override_hours, enabled, ...) without
     poking the store directly.
+
+    `room` is always the *raw* room reading. `apparent_temperature` is
+    always the Steadman value (which equals `room` when humidity is None).
+    `decision_room` is whichever of those was actually fed into hysteresis —
+    surfaced for the card so users can see the value driving control.
     """
 
     zone: StoredZone
     room: float | None
     sensor_available: bool
+    humidity: float | None
+    apparent_temperature: float | None
+    decision_room: float | None
     effective_low: float
     effective_high: float
     sched_low: float
@@ -87,6 +95,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         zone_name: str,
         climate_entity_id: str,
         temp_entity_id: str,
+        humidity_entity_id: str | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -98,6 +107,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self.zone_name = zone_name
         self.climate_entity_id = climate_entity_id
         self.temp_entity_id = temp_entity_id
+        self.humidity_entity_id = humidity_entity_id
         self._unsub_state: CALLBACK_TYPE | None = None
         self._unsub_signal: CALLBACK_TYPE | None = None
         self._unsub_debounce: CALLBACK_TYPE | None = None
@@ -108,9 +118,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_setup(self) -> None:
         """Wire event-driven triggers and run the first refresh."""
-        self._unsub_state = async_track_state_change_event(
-            self.hass, [self.temp_entity_id], self._on_temp_change
-        )
+        # Subscribe to temp + (optionally) humidity changes via the same
+        # debounced path — a humidity-only change should re-evaluate when
+        # `use_apparent_temperature` is on.
+        watch = [self.temp_entity_id]
+        if self.humidity_entity_id is not None:
+            watch.append(self.humidity_entity_id)
+        self._unsub_state = async_track_state_change_event(self.hass, watch, self._on_temp_change)
         self._unsub_signal = async_dispatcher_connect(
             self.hass, SIGNAL_ACTIVE_PROFILE_CHANGED, self._on_profile_change
         )
@@ -142,6 +156,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     async def async_set_param(self, field: str, value: Any) -> None:
         """Update a tunable (deadband_*, override_hours, min_cycle_minutes)
         without triggering an override.
+
+        Uses `async_request_refresh` (queued + deduped) rather than
+        `async_refresh` because Number entities can fire rapid-fire writes
+        when the user drags a slider; deduping avoids a thundering-herd
+        of coordinator refreshes. The user-flip mutators below
+        (`async_set_enabled`, `async_set_learning_enabled`, etc.) use the
+        immediate `async_refresh` because a switch is one tap.
         """
         await self._store.async_update_zone(self.zone_name, **{field: value})
         await self.async_request_refresh()
@@ -182,6 +203,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(self.zone_name, enabled=enabled)
         await self.async_refresh()
 
+    async def async_set_learning_enabled(self, learning_enabled: bool) -> None:
+        await self._store.async_update_zone(self.zone_name, learning_enabled=learning_enabled)
+        await self.async_refresh()
+
+    async def async_set_use_apparent_temperature(self, use_apparent_temperature: bool) -> None:
+        await self._store.async_update_zone(
+            self.zone_name, use_apparent_temperature=use_apparent_temperature
+        )
+        await self.async_refresh()
+
     async def _set_manual_and_override(self, **manual_fields: float) -> None:
         zone = self._store.get_zone(self.zone_name)
         until = (dt_util.utcnow() + timedelta(hours=zone["override_hours"])).isoformat()
@@ -218,6 +249,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         active_profile = self._store.active_profile
 
         room, sensor_available = self._read_room_temp()
+        humidity = self._read_humidity()
+        # `apparent_temp.compute(T, None) → T`, so when humidity is
+        # unavailable the apparent value silently equals the room reading.
+        # That's deliberate: it lets `use_apparent_temperature=True` stay
+        # safe across humidity-sensor outages.
+        apparent_temperature = apparent_temp.compute(room, humidity) if room is not None else None
 
         # Re-validate override.
         now_utc = dt_util.utcnow()
@@ -257,9 +294,24 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             )
             eff_low = eff_high - 0.5
 
+        # Per-zone choice: feed apparent temperature (humidity-adjusted
+        # "feels like") into the decider instead of the raw room reading.
+        # Defaults to raw room. Apparent equals room when humidity is None,
+        # so this is safe to leave ON even if the humidity sensor flakes.
+        use_apparent = zone["use_apparent_temperature"]
+        decision_room = apparent_temperature if use_apparent else room
+        LOGGER.debug(
+            "%s: decision room=%s (use_apparent=%s, room=%s, apparent=%s)",
+            self.zone_name,
+            decision_room,
+            use_apparent,
+            room,
+            apparent_temperature,
+        )
+
         decision = hysteresis.decide(
             HysteresisInputs(
-                room=room,
+                room=decision_room,
                 low=eff_low,
                 high=eff_high,
                 deadband_below=zone["deadband_below"],
@@ -277,6 +329,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             zone=zone,
             room=room,
             sensor_available=sensor_available,
+            humidity=humidity,
+            apparent_temperature=apparent_temperature,
+            decision_room=decision_room,
             effective_low=eff_low,
             effective_high=eff_high,
             sched_low=sched_low,
@@ -294,14 +349,30 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     # ----- helpers -----
 
-    def _read_room_temp(self) -> tuple[float | None, bool]:
-        state = self.hass.states.get(self.temp_entity_id)
+    def _read_numeric_sensor(self, entity_id: str | None) -> float | None:
+        """Shared read path for any external numeric sensor: returns the
+        float value, or None when the entity is missing, unavailable, or
+        non-numeric. Used by both the room-temp and humidity readers (and
+        any future sensor input — predictive control / IAQ / etc.)."""
+        if entity_id is None:
+            return None
+        state = self.hass.states.get(entity_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, "", None):
-            return None, False
+            return None
         try:
-            return float(state.state), True
+            return float(state.state)
         except (TypeError, ValueError):
-            return None, False
+            return None
+
+    def _read_room_temp(self) -> tuple[float | None, bool]:
+        # `sensor_available` is True iff a numeric reading was produced.
+        value = self._read_numeric_sensor(self.temp_entity_id)
+        return value, value is not None
+
+    def _read_humidity(self) -> float | None:
+        """The apparent-temp formula treats None as "no adjustment", so a
+        missing / offline humidity sensor degrades gracefully."""
+        return self._read_numeric_sensor(self.humidity_entity_id)
 
     def _resolve_schedule(
         self,

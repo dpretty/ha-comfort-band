@@ -10,7 +10,9 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.3.0.** Adds full profile CRUD: four new services (`create_profile`, `clone_profile`, `rename_profile`, `delete_profile`) and a new `SIGNAL_PROFILE_LIST_CHANGED` dispatcher signal so the singleton select entity (and any subscribed cards) re-render on every profile mutation. The `default_profile` is now tracked per-store and survives renames — whatever profile holds that role cannot be deleted. Built-in profiles narrowed from `home / away / sleep` to **`home` + `away`**; existing installs keep any `sleep` profile they had as a normal user profile that can now be renamed or deleted.
+**v0.4.0.** Adds apparent-temperature support: a per-zone optional **humidity sensor** (configurable via ConfigFlow or a new OptionsFlow on existing zones), a new `sensor.{zone}_apparent_temperature` (Steadman 1994 simplified; equals room temp when no humidity is configured), and a per-zone `switch.{zone}_use_apparent_temperature` toggle that feeds the apparent value into hysteresis decisions instead of the raw room reading. Decisions fall back to the raw reading automatically when the humidity sensor is unavailable. Also adds `switch.{zone}_learning_enabled` — a master gate for the v0.4+ learning cluster (#9, #11); no decision effect today but the storage field is wired so future PRs read it directly.
+
+**v0.3.0** added full profile CRUD: four new services (`create_profile`, `clone_profile`, `rename_profile`, `delete_profile`) and a new `SIGNAL_PROFILE_LIST_CHANGED` dispatcher signal so the singleton select entity (and any subscribed cards) re-render on every profile mutation. The `default_profile` is now tracked per-store and survives renames — whatever profile holds that role cannot be deleted. Built-in profiles narrowed from `home / away / sleep` to **`home` + `away`**; existing installs keep any `sleep` profile they had as a normal user profile that can now be renamed or deleted.
 
 **v0.2.0** added a `comfort_band/subscribe_schedule` websocket command so the card receives live schedule updates from any source without polling.
 
@@ -34,6 +36,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
    - **Zone name (slug)**: lowercase letters / digits / underscores, e.g. `office`. Becomes part of every entity_id.
    - **Climate entity**: the `climate.*` entity Comfort Band will eventually drive (e.g. a Mitsubishi mini-split).
    - **Room-temperature sensor**: a `sensor.*` of `device_class: temperature` to watch.
+   - **Humidity sensor (optional)**: a `sensor.*` of `device_class: humidity`. When set, enables apparent temperature ("feels like"). Can be added / changed / cleared later via **Configure** on the zone entry.
 3. Repeat for every room.
 
 ## Entities created per zone
@@ -43,12 +46,15 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | `number` | `manual_low`, `manual_high` | UI writes start an override |
 | `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes` | Tunables |
 | `sensor` | `effective_low`, `effective_high` | Active band (override or schedule) |
-| `sensor` | `room_temperature` | Diagnostic mirror of the source sensor |
+| `sensor` | `room_temperature` | Diagnostic mirror of the source sensor. Carries `humidity_sensor` (the configured entity_id, or null) as a state attribute. |
+| `sensor` | `apparent_temperature` | Steadman 1994 "feels like". Equals room temp when no humidity sensor is configured. |
 | `sensor` | `override_ends` | Timestamp; null when no override |
 | `sensor` | `current_action` | `heating` / `cooling` / `idle` / `unknown` |
 | `binary_sensor` | `override_active` | True while override is in effect |
 | `button` | `cancel_override` | Press to immediately end an override |
 | `switch` | `enabled` | Master kill — defaults OFF (shadow mode) |
+| `switch` | `learning_enabled` | Gate for the v0.4+ learning cluster (auto-nudges, predictive control). Default OFF; no effect today. |
+| `switch` | `use_apparent_temperature` | When ON, hysteresis decisions use the apparent value instead of the raw room reading. Falls back to room temp automatically if humidity is unavailable. Default OFF. |
 
 Plus one global entity: `select.comfort_band_profiles_active_profile`.
 

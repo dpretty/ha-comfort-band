@@ -15,12 +15,13 @@
         "data": {
           "zone_name": "Zone name (slug)",
           "climate_entity": "Climate entity",
-          "temp_sensor": "Room-temperature sensor"
+          "temp_sensor": "Room-temperature sensor",
+          "humidity_sensor": "Humidity sensor (optional, enables apparent temperature)"
         }
       },
       "profile_manager": {
         "title": "Set up profile manager",
-        "description": "Creates the global active-profile selector with built-in profiles (home, away, sleep). Only one is allowed."
+        "description": "Creates the global active-profile selector with built-in profiles (home, away). Only one is allowed."
       }
     },
     "abort": {
@@ -29,6 +30,17 @@
     },
     "error": {
       "invalid_slug": "Use lowercase letters, digits, and underscores only (2-32 characters; must start with a letter)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure zone",
+        "description": "Attach, change, or clear the humidity sensor used to compute apparent temperature for this zone.",
+        "data": {
+          "humidity_sensor": "Humidity sensor (optional)"
+        }
+      }
     }
   },
   "entity": {
@@ -77,6 +89,9 @@
       "room_temperature": {
         "name": "Room temperature"
       },
+      "apparent_temperature": {
+        "name": "Apparent temperature"
+      },
       "override_ends": {
         "name": "Override ends"
       },
@@ -93,6 +108,12 @@
     "switch": {
       "enabled": {
         "name": "Enabled"
+      },
+      "learning_enabled": {
+        "name": "Learning enabled"
+      },
+      "use_apparent_temperature": {
+        "name": "Use apparent temperature"
       }
     }
   }

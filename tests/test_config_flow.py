@@ -92,12 +92,15 @@ async def test_zone_flow_creates_entry(hass: HomeAssistant, hass_storage: dict[s
     result = await hass.config_entries.flow.async_configure(form["flow_id"], _VALID_ZONE_INPUT)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["title"] == "Comfort Band: office"
-    assert result["data"] == {
-        CONF_KIND: ENTRY_KIND_ZONE,
-        CONF_ZONE_NAME: "office",
-        CONF_CLIMATE_ENTITY: "climate.office_hvac",
-        CONF_TEMP_SENSOR: "sensor.office_room_temperature",
-    }
+    # `humidity_sensor` is optional in the schema; when omitted from
+    # _VALID_ZONE_INPUT it lands as None in the entry data.
+    assert result["data"][CONF_KIND] == ENTRY_KIND_ZONE
+    assert result["data"][CONF_ZONE_NAME] == "office"
+    assert result["data"][CONF_CLIMATE_ENTITY] == "climate.office_hvac"
+    assert result["data"][CONF_TEMP_SENSOR] == "sensor.office_room_temperature"
+    from custom_components.comfort_band.const import CONF_HUMIDITY_SENSOR
+
+    assert result["data"][CONF_HUMIDITY_SENSOR] is None
 
 
 async def test_zone_flow_normalises_slug(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
@@ -212,3 +215,122 @@ async def test_session_a_placeholder_is_removed_at_setup(
     assert result is False
     await hass.async_block_till_done()
     assert hass.config_entries.async_get_entry(placeholder.entry_id) is None
+
+
+# ----- OptionsFlow (humidity sensor) -----
+
+
+async def test_options_flow_sets_humidity_sensor(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """Existing zones can attach a humidity sensor via OptionsFlow."""
+    from custom_components.comfort_band.const import CONF_HUMIDITY_SENSOR
+
+    entry = make_zone_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    init_result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert init_result["type"] == FlowResultType.FORM
+
+    result = await hass.config_entries.options.async_configure(
+        init_result["flow_id"],
+        {CONF_HUMIDITY_SENSOR: "sensor.office_humidity"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options.get(CONF_HUMIDITY_SENSOR) == "sensor.office_humidity"
+
+
+async def test_options_flow_unavailable_for_profile_manager(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    profile_manager_entry: MockConfigEntry,
+) -> None:
+    """Only zone entries have editable options; the profile manager has none."""
+    profile_manager_entry.add_to_hass(hass)
+    handler = config_entries.HANDLERS[DOMAIN]
+    assert handler.async_supports_options_flow(profile_manager_entry) is False
+
+
+async def test_options_flow_can_clear_humidity_sensor_set_in_data(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """If a humidity sensor was set at ConfigFlow time, the OptionsFlow
+    must be able to clear it. The fix in async_step_init normalises the
+    missing-key case to {key: None} so the resolution in __init__.py
+    sees the cleared value instead of falling through to entry.data.
+    """
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.comfort_band.const import (
+        CONF_CLIMATE_ENTITY,
+        CONF_HUMIDITY_SENSOR,
+        CONF_KIND,
+        CONF_TEMP_SENSOR,
+        CONF_ZONE_NAME,
+        ENTRY_KIND_ZONE,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="zone:office",
+        title="Comfort Band: office",
+        data={
+            CONF_KIND: ENTRY_KIND_ZONE,
+            CONF_ZONE_NAME: "office",
+            CONF_CLIMATE_ENTITY: "climate.office_hvac",
+            CONF_TEMP_SENSOR: "sensor.office_room_temperature",
+            CONF_HUMIDITY_SENSOR: "sensor.office_humidity",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Coordinator picks up the humidity_sensor from entry.data.
+    coordinator = hass.data[DOMAIN].zone_coordinators[entry.entry_id]
+    assert coordinator.humidity_entity_id == "sensor.office_humidity"
+
+    # Submit an empty OptionsFlow form (selector left blank) → should
+    # clear the sensor on the next reload.
+    init_result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(init_result["flow_id"], {})
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    # Key must be present in options (with None) so the resolution code
+    # path doesn't fall back to entry.data.
+    assert CONF_HUMIDITY_SENSOR in entry.options
+    assert entry.options[CONF_HUMIDITY_SENSOR] is None
+
+    # The reload listener fires and re-creates the coordinator with no
+    # humidity sensor.
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN].zone_coordinators[entry.entry_id]
+    assert coordinator.humidity_entity_id is None
+
+
+async def test_options_flow_save_triggers_reload(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """Saving the OptionsFlow must reload the entry so the coordinator
+    picks up the new humidity sensor without a HA restart."""
+    from custom_components.comfort_band.const import CONF_HUMIDITY_SENSOR
+
+    entry = make_zone_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN].zone_coordinators[entry.entry_id]
+    assert coordinator.humidity_entity_id is None  # no humidity at setup
+
+    init_result = await hass.config_entries.options.async_init(entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        init_result["flow_id"],
+        {CONF_HUMIDITY_SENSOR: "sensor.office_humidity"},
+    )
+    await hass.async_block_till_done()
+
+    # Reload listener fires; new coordinator picks up the new sensor.
+    new_coordinator = hass.data[DOMAIN].zone_coordinators[entry.entry_id]
+    assert new_coordinator.humidity_entity_id == "sensor.office_humidity"

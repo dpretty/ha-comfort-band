@@ -52,6 +52,10 @@ class EffectiveHighSensor(_TemperatureSensor):
 class RoomTemperatureSensor(_TemperatureSensor):
     """Diagnostic mirror of the source sensor; lets the card read everything
     from the comfort_band namespace.
+
+    Also exposes the configured `humidity_sensor` entity_id as an attribute
+    so the card's Settings tab can show the current value without a
+    separate WS round-trip. None when not configured.
     """
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -62,6 +66,31 @@ class RoomTemperatureSensor(_TemperatureSensor):
     @property
     def native_value(self) -> float | None:
         return self.coordinator.data.room
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        return {"humidity_sensor": self.coordinator.humidity_entity_id}
+
+
+class ApparentTemperatureSensor(_TemperatureSensor):
+    """Steadman 1994 apparent temperature ("feels like"). Equals room temp
+    when no humidity sensor is configured or its reading is unavailable.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "apparent_temperature")
+
+    @property
+    def native_value(self) -> float | None:
+        # 1-decimal rounding matches RoomTemperatureSensor — both sources
+        # feed the band gauge and the card's "Feels like" line, which
+        # subtract them to decide whether to render the row. Keeping the
+        # precision identical prevents a permanent sub-0.1 °C delta from
+        # forcing the row visible at every humidity value.
+        value = self.coordinator.data.apparent_temperature
+        return None if value is None else round(value, 1)
 
 
 class OverrideEndsSensor(ComfortBandZoneEntity, SensorEntity):
@@ -96,6 +125,7 @@ async def async_setup_entry(
             EffectiveLowSensor(coordinator),
             EffectiveHighSensor(coordinator),
             RoomTemperatureSensor(coordinator),
+            ApparentTemperatureSensor(coordinator),
             OverrideEndsSensor(coordinator),
             CurrentActionSensor(coordinator),
         ]
