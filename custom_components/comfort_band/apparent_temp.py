@@ -27,6 +27,14 @@ def compute(temp_c: float, humidity_pct: float | None) -> float:
     when humidity isn't available. The whole point of the toggle is to
     let users keep `use_apparent_temperature=True` without worrying that
     a flaky humidity sensor will silently break decisions.
+
+    NB: a *real* humidity reading of exactly 0% is allowed through and
+    produces `AT = T - 4.00` (the Steadman baseline with zero vapor
+    pressure). That's physically correct but rare in residential indoor
+    air, and a sensor publishing exactly 0 on boot/error is a real
+    failure mode. Future tightening could clamp the lower guard to
+    e.g. 5%; for now we keep the formula honest and let the
+    `compute(T, None)` fallback handle the typical sensor-offline case.
     """
     if humidity_pct is None or not 0.0 <= humidity_pct <= 100.0:
         return temp_c

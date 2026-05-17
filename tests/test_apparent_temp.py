@@ -28,6 +28,14 @@ def test_humidity_over_100_returns_temp_unchanged() -> None:
     assert compute(22.0, 150.0) == 22.0
 
 
+def test_humidity_exactly_zero_produces_steadman_baseline() -> None:
+    # 0% RH is physically valid (zero vapor pressure → AT = T - 4.00).
+    # Documented in the compute() docstring: future tightening might
+    # clamp this, but for now it stays honest to the formula. This test
+    # pins the current behaviour so an accidental change is caught.
+    assert math.isclose(compute(22.0, 0.0), 18.0, abs_tol=0.01)
+
+
 def test_low_humidity_makes_room_feel_cooler() -> None:
     # 20 °C and 30 % RH → feels-like below 20 (the constant -4.00 in the
     # formula dominates when vapor pressure is low). Steadman reference

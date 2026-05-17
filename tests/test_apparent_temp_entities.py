@@ -7,6 +7,7 @@ service-call paths.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ HUMIDITY_ENTITY = "sensor.office_humidity"
 @pytest.fixture
 async def zone_with_humidity(
     hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
-) -> None:
+) -> AsyncIterator[None]:
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
     from custom_components.comfort_band.const import (
@@ -52,6 +53,9 @@ async def zone_with_humidity(
     hass.states.async_set(HUMIDITY_ENTITY, "50", {})
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    # Yield so future teardown hooks (entry unload, etc.) can run if needed.
+    # Matches the pattern HA core uses for fixtures that own a ConfigEntry.
+    yield
 
 
 async def test_apparent_temp_sensor_reads_steadman_value(

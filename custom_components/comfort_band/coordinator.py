@@ -156,6 +156,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     async def async_set_param(self, field: str, value: Any) -> None:
         """Update a tunable (deadband_*, override_hours, min_cycle_minutes)
         without triggering an override.
+
+        Uses `async_request_refresh` (queued + deduped) rather than
+        `async_refresh` because Number entities can fire rapid-fire writes
+        when the user drags a slider; deduping avoids a thundering-herd
+        of coordinator refreshes. The user-flip mutators below
+        (`async_set_enabled`, `async_set_learning_enabled`, etc.) use the
+        immediate `async_refresh` because a switch is one tap.
         """
         await self._store.async_update_zone(self.zone_name, **{field: value})
         await self.async_request_refresh()
