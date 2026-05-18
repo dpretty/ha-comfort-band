@@ -460,13 +460,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         # Cross-mode min-cycle: don't flip between heat and cool too quickly.
         # The hysteresis decider never returns heat → cool directly — it
-        # always releases through idle first — so by the time we see the
-        # flip-to-cool, `last_action` is `idle`. Look back at the action
-        # before idle via `previous_action`. `last_action_at` is the time
-        # the current (idle) action was committed, which equals the time
-        # the prior heat/cool ended — exactly the timestamp the dwell
-        # should be measured against. Idle/unknown prior actions don't
-        # trigger the gate (no prior commitment to dwell after).
+        # always releases through idle first — so on the normal path
+        # `last_action` is `idle` and we look back at the action before
+        # idle via `previous_action`. `last_action_at` is the time the
+        # current (idle) action was committed, which equals the time the
+        # prior heat/cool ended — exactly the timestamp the dwell should
+        # be measured against. Idle/unknown prior actions don't trigger
+        # the gate (no prior commitment to dwell after).
+        #
+        # The `last_action in (HEAT, COOL)` branch is defensive: it
+        # cannot fire if the always-through-idle invariant in
+        # hysteresis.py holds, but it ensures the gate still triggers if
+        # that invariant is ever violated rather than silently allowing
+        # a direct flip.
         prior_active_action = (
             last_action if last_action in (ACTION_HEAT, ACTION_COOL) else zone["previous_action"]
         )
