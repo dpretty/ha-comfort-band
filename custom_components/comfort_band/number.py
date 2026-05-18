@@ -1,10 +1,11 @@
 """Per-zone number entities.
 
-Six tunables are exposed as `number.{zone}_<key>`. Two of them
+Seven tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other four (`override_hours`, `deadband_below`, `deadband_above`,
-`min_cycle_minutes`) are simple persisted tunables.
+The other five (`override_hours`, `deadband_below`, `deadband_above`,
+`min_cycle_minutes`, `cross_mode_min_minutes`) are simple persisted
+tunables.
 """
 
 from __future__ import annotations
@@ -82,6 +83,14 @@ _SPECS: tuple[_NumberSpec, ...] = (
     _NumberSpec(
         key="min_cycle_minutes",
         field="min_cycle_minutes",
+        min_value=0,
+        max_value=60,
+        step=1,
+        unit=UnitOfTime.MINUTES,
+    ),
+    _NumberSpec(
+        key="cross_mode_min_minutes",
+        field="cross_mode_min_minutes",
         min_value=0,
         max_value=60,
         step=1,

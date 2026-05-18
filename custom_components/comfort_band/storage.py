@@ -33,6 +33,7 @@ __all__ = [
 
 from .const import (
     BUILTIN_PROFILES,
+    DEFAULT_CROSS_MODE_MIN_MINUTES,
     DEFAULT_DEADBAND_ABOVE,
     DEFAULT_DEADBAND_BELOW,
     DEFAULT_MIN_CYCLE_MINUTES,
@@ -68,6 +69,15 @@ class StoredZone(TypedDict):
     deadband_below: float
     deadband_above: float
     min_cycle_minutes: int
+    # Dwell between heat↔cool flips. Default tracks `min_cycle_minutes` at
+    # zone creation but is independently tunable. Set to 0 to restore the
+    # pre-v0.5 "mode flips fire immediately" behaviour.
+    cross_mode_min_minutes: int
+    # The action that was current immediately before `last_action`. Needed
+    # to detect cross-mode flips that go through idle (heat → idle → cool),
+    # since by the time the predictor sees the flip-to-cool, the persisted
+    # `last_action` is already `idle`.
+    previous_action: str | None
     enabled: bool
     # Gate for the v0.4+ learning cluster (apparent-temp-aware nudges,
     # predictive control). Not consumed by anything yet — wired so future
@@ -127,6 +137,8 @@ def _default_zone(zone_name: str) -> StoredZone:
         "deadband_below": DEFAULT_DEADBAND_BELOW,
         "deadband_above": DEFAULT_DEADBAND_ABOVE,
         "min_cycle_minutes": DEFAULT_MIN_CYCLE_MINUTES,
+        "cross_mode_min_minutes": DEFAULT_CROSS_MODE_MIN_MINUTES,
+        "previous_action": None,
         "enabled": False,
         "learning_enabled": False,
         "use_apparent_temperature": False,
@@ -197,6 +209,19 @@ class ComfortBandStore:
                 migrated = True
             if "use_apparent_temperature" not in zone:
                 zone["use_apparent_temperature"] = False
+                migrated = True
+            # v0.4 → v0.5: default the cross-mode dwell to the zone's
+            # existing min_cycle_minutes so users who tuned same-mode dwell
+            # carry that preference into cross-mode automatically. Falls
+            # back to DEFAULT_MIN_CYCLE_MINUTES only if min_cycle_minutes
+            # is itself somehow absent (paranoid).
+            if "cross_mode_min_minutes" not in zone:
+                zone["cross_mode_min_minutes"] = zone.get(
+                    "min_cycle_minutes", DEFAULT_MIN_CYCLE_MINUTES
+                )
+                migrated = True
+            if "previous_action" not in zone:
+                zone["previous_action"] = None
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

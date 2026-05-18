@@ -10,7 +10,9 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.4.0.** Adds apparent-temperature support: a per-zone optional **humidity sensor** (configurable via ConfigFlow or a new OptionsFlow on existing zones), a new `sensor.{zone}_apparent_temperature` (Steadman 1994 simplified; equals room temp when no humidity is configured), and a per-zone `switch.{zone}_use_apparent_temperature` toggle that feeds the apparent value into hysteresis decisions instead of the raw room reading. Decisions fall back to the raw reading automatically when the humidity sensor is unavailable. Also adds `switch.{zone}_learning_enabled` — a master gate for the v0.4+ learning cluster (#9, #11); no decision effect today but the storage field is wired so future PRs read it directly.
+**v0.5.0.** Adds **cross-mode min-cycle dwell** to suppress rapid `heat ↔ cool` mode flips ([#16](https://github.com/dpretty/ha-comfort-band/issues/16)). New per-zone `number.{zone}_cross_mode_min_minutes` defaults to the zone's current `min_cycle_minutes` (8 by default) — `heat → cool` and `cool → heat` transitions now wait that many minutes after the last action. Idle releases (`heat → idle`, `cool → idle`) still fire immediately so a heat or cool cycle can always stop. **Behaviour change for existing users:** mode flips previously fired instantly; set the new entity to `0` to restore that.
+
+**v0.4.0** added apparent-temperature support: a per-zone optional **humidity sensor** (configurable via ConfigFlow or a new OptionsFlow on existing zones), a new `sensor.{zone}_apparent_temperature` (Steadman 1994 simplified; equals room temp when no humidity is configured), and a per-zone `switch.{zone}_use_apparent_temperature` toggle that feeds the apparent value into hysteresis decisions instead of the raw room reading. Decisions fall back to the raw reading automatically when the humidity sensor is unavailable. Also adds `switch.{zone}_learning_enabled` — a master gate for the v0.4+ learning cluster (#9, #11); no decision effect today but the storage field is wired so future PRs read it directly.
 
 **v0.3.0** added full profile CRUD: four new services (`create_profile`, `clone_profile`, `rename_profile`, `delete_profile`) and a new `SIGNAL_PROFILE_LIST_CHANGED` dispatcher signal so the singleton select entity (and any subscribed cards) re-render on every profile mutation. The `default_profile` is now tracked per-store and survives renames — whatever profile holds that role cannot be deleted. Built-in profiles narrowed from `home / away / sleep` to **`home` + `away`**; existing installs keep any `sleep` profile they had as a normal user profile that can now be renamed or deleted.
 
@@ -44,7 +46,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | Platform | Entity | Notes |
 |---|---|---|
 | `number` | `manual_low`, `manual_high` | UI writes start an override |
-| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes` | Tunables |
+| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes` | Tunables |
 | `sensor` | `effective_low`, `effective_high` | Active band (override or schedule) |
 | `sensor` | `room_temperature` | Diagnostic mirror of the source sensor. Carries `humidity_sensor` (the configured entity_id, or null) as a state attribute. |
 | `sensor` | `apparent_temperature` | Steadman 1994 "feels like". Equals room temp when no humidity sensor is configured. |

@@ -34,9 +34,11 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["enabled"] is False  # shadow-mode default
     assert zone["override_until"] is None
     assert zone["last_action"] is None
+    assert zone["previous_action"] is None
     assert zone["deadband_below"] == 0.3
     assert zone["deadband_above"] == 0.5
     assert zone["min_cycle_minutes"] == 8
+    assert zone["cross_mode_min_minutes"] == 8
     assert zone["override_hours"] == 3
     assert zone["manual_low"] < zone["manual_high"]
     assert zone["schedules"] == {}
@@ -468,9 +470,63 @@ async def test_load_legacy_v0_3_zone_backfills_new_fields(
     zone = store.get_zone("office")
     assert zone["learning_enabled"] is False
     assert zone["use_apparent_temperature"] is False
+    # The v0.4 → v0.5 backfill ran on the same load and defaulted
+    # cross_mode_min_minutes from the existing min_cycle_minutes (8).
+    # `previous_action` is added at the same time and starts unset.
+    assert zone["cross_mode_min_minutes"] == 8
+    assert zone["previous_action"] is None
     # And update_zone now works on the new field without KeyError.
     await store.async_update_zone("office", learning_enabled=True)
     assert store.get_zone("office")["learning_enabled"] is True
+
+
+async def test_load_legacy_v0_4_zone_backfills_cross_mode_from_min_cycle(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A v0.4 zone payload (has learning_enabled / use_apparent_temperature
+    but no `cross_mode_min_minutes`) must backfill the new field from the
+    zone's own min_cycle_minutes — preserving any custom tuning the user
+    had applied to same-mode dwell."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    # User had tuned same-mode down to 4 min; cross-mode
+                    # should inherit that, not the system default of 8.
+                    "min_cycle_minutes": 4,
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    # NB: no cross_mode_min_minutes.
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    zone = store.get_zone("office")
+    assert zone["cross_mode_min_minutes"] == 4  # inherited from min_cycle_minutes
+    assert zone["previous_action"] is None  # also backfilled in the same pass
+    # And update_zone now works on the new field without KeyError.
+    await store.async_update_zone("office", cross_mode_min_minutes=15)
+    assert store.get_zone("office")["cross_mode_min_minutes"] == 15
 
 
 async def test_clone_profile_without_source_schedule_creates_empty_target(
