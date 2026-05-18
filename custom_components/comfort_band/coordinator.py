@@ -441,6 +441,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         last_action = zone["last_action"]
         last_action_at = _parse_iso(zone["last_action_at"])
         now_utc = dt_util.utcnow()
+        # `elapsed_s` is None for a fresh-from-restart zone (no action has
+        # ever been committed). Both gates below short-circuit on `None`
+        # via their `elapsed_s is not None` guards, so neither suppresses
+        # the first heat or cool — correct: there's no committed action
+        # to dwell after.
         elapsed_s = (
             (now_utc - last_action_at).total_seconds() if last_action_at is not None else None
         )
@@ -477,11 +482,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         ):
             LOGGER.debug(
                 "%s: cross-mode min-cycle suppressed %s → %s "
-                "(prior=%s elapsed=%.0fs, threshold=%dmin)",
+                "(via=%s elapsed=%.0fs, threshold=%dmin)",
                 self.zone_name,
-                last_action,
-                decision.action,
                 prior_active_action,
+                decision.action,
+                last_action,
                 elapsed_s,
                 zone["cross_mode_min_minutes"],
             )

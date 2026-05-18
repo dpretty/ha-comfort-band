@@ -532,6 +532,86 @@ async def test_cross_mode_min_cycle_does_not_block_first_action(
     await coordinator.async_unload()
 
 
+async def test_cross_mode_gate_does_not_suppress_same_mode_bounce(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """heat → idle → heat (room re-cools within the cross-mode window) is
+    NOT a cross-mode flip — both the prior and the new active action are
+    `heating`. The gate's `prior_active_action != decision.action` guard
+    must let this through. Sanity-check against a future refactor that
+    drops the inequality check and starts suppressing same-mode bounces."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Drop min_cycle_minutes to 0 so the same-mode dwell is out of the way —
+    # this test isolates the cross-mode gate's inequality guard. Keep
+    # cross_mode_min_minutes at its default 8 so the gate would fire if it
+    # incorrectly treated same-mode bounces as flips.
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=0)
+
+    # Heat fires, then releases to idle.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Within the 8-min cross-mode window (tick 2 min — well inside), the
+    # room cools again and re-triggers heat. The cross-mode gate sees
+    # prior_active_action=heating, decision.action=heating, and must let
+    # this through because they're the same mode.
+    freezer.tick(timedelta(minutes=2))
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    heat_calls = [c for c in set_modes if c["hvac_mode"] == "heat"]
+    assert heat_calls, "Same-mode bounce (heat→idle→heat) must not be gated as a cross-mode flip"
+    await coordinator.async_unload()
+
+
+async def test_previous_action_preserved_across_same_mode_re_commits(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A same-mode re-issue (heat is still appropriate after the min-cycle
+    window expires) must NOT overwrite `previous_action`. Otherwise after
+    `heat → idle → heat → idle → cool` the cross-mode gate would lose
+    track of the first heat and treat the second heat→idle→cool sequence
+    as the first one. Pins the `last_action != decision.action` guard at
+    the commit site so a future refactor that drops it gets caught."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    store = coordinator._store
+
+    # First heat: previous_action becomes None (was None before).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert store.get_zone("office")["previous_action"] is None
+
+    # Tick past the same-mode min-cycle window (default 8 min) and refresh
+    # with the same heat-triggering temperature. The coordinator re-issues
+    # the heat command. Critically, `previous_action` must stay None — it
+    # was None before and the re-issue isn't a real transition.
+    freezer.tick(timedelta(minutes=10))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    zone = store.get_zone("office")
+    assert zone["last_action"] == "heating"
+    assert zone["previous_action"] is None, (
+        "Same-mode re-issue must not overwrite previous_action with self-reference"
+    )
+    await coordinator.async_unload()
+
+
 async def test_previous_action_records_prior_non_idle_through_idle_release(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
