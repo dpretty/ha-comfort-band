@@ -75,7 +75,7 @@ class StoredZone(TypedDict):
     cross_mode_min_minutes: int
     # The action that was current immediately before `last_action`. Needed
     # to detect cross-mode flips that go through idle (heat → idle → cool),
-    # since by the time the predictor sees the flip-to-cool, the persisted
+    # since by the time the coordinator sees the flip-to-cool, the persisted
     # `last_action` is already `idle`.
     previous_action: str | None
     enabled: bool
