@@ -72,6 +72,9 @@
       },
       "min_cycle_minutes": {
         "name": "Minimum cycle minutes"
+      },
+      "cross_mode_min_minutes": {
+        "name": "Cross-mode minimum minutes"
       }
     },
     "select": {

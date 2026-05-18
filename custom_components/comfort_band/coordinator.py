@@ -33,6 +33,8 @@ from homeassistant.util import dt as dt_util
 
 from . import apparent_temp, hysteresis, schedule
 from .const import (
+    ACTION_COOL,
+    ACTION_HEAT,
     ACTION_UNKNOWN,
     LOGGER,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
@@ -154,8 +156,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         return self._store.get_zone(self.zone_name)
 
     async def async_set_param(self, field: str, value: Any) -> None:
-        """Update a tunable (deadband_*, override_hours, min_cycle_minutes)
-        without triggering an override.
+        """Update a tunable (deadband_*, override_hours, min_cycle_minutes,
+        cross_mode_min_minutes) without triggering an override.
 
         Uses `async_request_refresh` (queued + deduped) rather than
         `async_refresh` because Number entities can fire rapid-fire writes
@@ -418,8 +420,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """Translate the decision into climate.set_hvac_mode + set_temperature.
 
         Skipped entirely when `enabled=False` (shadow mode -- log only).
-        Min-cycle suppression filters re-issue of the *same* action; mode
-        flips fire immediately so heat+cool can't deadlock.
+        Min-cycle suppression filters re-issue of the *same* action;
+        cross-mode-cycle suppression blocks heat↔cool flips within a short
+        dwell. Idle releases (heat→idle, cool→idle) pass through unchecked
+        so a heat or cool cycle can always stop.
         """
         if not enabled:
             LOGGER.debug(
@@ -437,12 +441,61 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         last_action = zone["last_action"]
         last_action_at = _parse_iso(zone["last_action_at"])
         now_utc = dt_util.utcnow()
+        # `elapsed_s` is None for a fresh-from-restart zone (no action has
+        # ever been committed). Both gates below short-circuit on `None`
+        # via their `elapsed_s is not None` guards, so neither suppresses
+        # the first heat or cool — correct: there's no committed action
+        # to dwell after.
+        elapsed_s = (
+            (now_utc - last_action_at).total_seconds() if last_action_at is not None else None
+        )
 
+        # Same-mode min-cycle: don't re-issue the same action too quickly.
         if (
             last_action == decision.action
-            and last_action_at is not None
-            and (now_utc - last_action_at).total_seconds() < zone["min_cycle_minutes"] * 60
+            and elapsed_s is not None
+            and elapsed_s < zone["min_cycle_minutes"] * 60
         ):
+            return
+
+        # Cross-mode min-cycle: don't flip between heat and cool too quickly.
+        # The hysteresis decider never returns heat → cool directly — it
+        # always releases through idle first — so on the normal path
+        # `last_action` is `idle` and we look back at the action before
+        # idle via `previous_action`. `last_action_at` is the time the
+        # current (idle) action was committed, which equals the time the
+        # prior heat/cool ended — exactly the timestamp the dwell should
+        # be measured against. Idle/unknown prior actions don't trigger
+        # the gate (no prior commitment to dwell after).
+        #
+        # The `last_action in (HEAT, COOL)` branch is defensive: it
+        # cannot fire if the always-through-idle invariant in
+        # hysteresis.py holds, but it ensures the gate still triggers if
+        # that invariant is ever violated rather than silently allowing
+        # a direct flip.
+        prior_active_action = (
+            last_action if last_action in (ACTION_HEAT, ACTION_COOL) else zone["previous_action"]
+        )
+        is_cross_mode_flip = (
+            prior_active_action in (ACTION_HEAT, ACTION_COOL)
+            and decision.action in (ACTION_HEAT, ACTION_COOL)
+            and prior_active_action != decision.action
+        )
+        if (
+            is_cross_mode_flip
+            and elapsed_s is not None
+            and elapsed_s < zone["cross_mode_min_minutes"] * 60
+        ):
+            LOGGER.debug(
+                "%s: cross-mode min-cycle suppressed %s → %s "
+                "(via=%s elapsed=%.0fs, threshold=%dmin)",
+                self.zone_name,
+                prior_active_action,
+                decision.action,
+                last_action,
+                elapsed_s,
+                zone["cross_mode_min_minutes"],
+            )
             return
 
         await self.hass.services.async_call(
@@ -461,10 +514,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 },
                 blocking=True,
             )
+        # Roll `previous_action` forward on real transitions; leave it alone
+        # on same-mode re-commits (after the min-cycle window expires the
+        # coordinator re-issues the same hvac_mode — that's a refresh, not
+        # a transition, and the prior non-idle action shouldn't be
+        # overwritten by a same-action self-reference).
+        new_previous_action = (
+            last_action if last_action != decision.action else zone["previous_action"]
+        )
         await self._store.async_update_zone(
             self.zone_name,
             last_action=decision.action,
             last_action_at=now_utc.isoformat(),
+            previous_action=new_previous_action,
         )
 
 

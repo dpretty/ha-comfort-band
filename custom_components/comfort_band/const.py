@@ -30,6 +30,7 @@ CONF_OVERRIDE_HOURS: Final = "override_hours"
 DEFAULT_DEADBAND_BELOW: Final = 0.3
 DEFAULT_DEADBAND_ABOVE: Final = 0.5
 DEFAULT_MIN_CYCLE_MINUTES: Final = 8
+DEFAULT_CROSS_MODE_MIN_MINUTES: Final = DEFAULT_MIN_CYCLE_MINUTES
 DEFAULT_OVERRIDE_HOURS: Final = 3
 
 # Number entity bounds (matches the legacy input_number ranges).

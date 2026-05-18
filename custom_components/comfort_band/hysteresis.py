@@ -3,13 +3,22 @@
 `decide()` is a single-shot pure function: given the current room temperature,
 the effective band, the per-side deadbands, and the action currently in progress,
 it returns the desired terminal state. The coordinator handles the side effects
-(min-cycle suppression, dispatching to climate.set_hvac_mode + set_temperature).
+(same-mode and cross-mode min-cycle suppression, dispatching to
+climate.set_hvac_mode + set_temperature).
 
 Hysteresis loop:
   - Enter heat at room < low - deadband_below; release at room >= low.
   - Enter cool at room > high + deadband_above; release at room <= high.
   - In band -> idle (fan_only).
   - room is None -> unknown (caller does not write to climate).
+
+Mode transitions always pass through idle: from a heating state the only
+non-heat outcome is idle (when room >= low), and from a cooling state the
+only non-cool outcome is idle (when room <= high). The decider never
+returns cool directly from a heating state or heat directly from a cooling
+state. The coordinator's cross-mode-cycle gate relies on this invariant —
+if the routing rule changes here, the gate's `previous_action` logic must
+be revisited.
 """
 
 from __future__ import annotations

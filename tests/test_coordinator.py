@@ -380,6 +380,270 @@ async def test_override_starts_then_expires(
     await coordinator.async_unload()
 
 
+async def test_cross_mode_min_cycle_suppresses_heat_to_cool(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """heat → idle (release) → cool gets suppressed when the gap is shorter
+    than `cross_mode_min_minutes`. The hysteresis decider always routes
+    through idle (decide() returns idle once the room hits the band edge),
+    so cross-mode tracking relies on `previous_action`: by the time the
+    flip-to-cool is evaluated, `last_action` is `idle`."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # Heat fires (room well below low=19.5).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Release to idle (room hits low band edge).
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Within the 8-min default window, the room overshoots well above
+    # high+deadband_above=23.0. Cross-mode gate should suppress cool.
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "24.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    cool_calls = [c for c in set_modes if c["hvac_mode"] == "cool"]
+    assert cool_calls == [], f"Cross-mode dwell should suppress cool, got {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_cross_mode_min_cycle_suppresses_cool_to_heat(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Symmetric to heat→cool: cool → idle → heat suppressed within window."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # Cool fires (room well above high+deadband_above=23.0).
+    hass.states.async_set(TEMP_ENTITY, "24.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Release to idle.
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Within window, room undershoots below low-deadband_below=19.2.
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    heat_calls = [c for c in set_modes if c["hvac_mode"] == "heat"]
+    assert heat_calls == [], f"Cross-mode dwell should suppress heat, got {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_cross_mode_min_cycle_allows_flip_after_window(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """After `cross_mode_min_minutes` elapses since release, the flip fires."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Tick past the 8-min cross-mode window.
+    freezer.tick(timedelta(minutes=10))
+
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "24.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    cool_calls = [c for c in set_modes if c["hvac_mode"] == "cool"]
+    assert cool_calls, f"Cool should fire after the window, got {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_cross_mode_min_cycle_zero_disables_gate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Setting cross_mode_min_minutes to 0 restores pre-v0.5 instant-flip behaviour."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Disable the gate before any actions.
+    await coordinator._store.async_update_zone("office", cross_mode_min_minutes=0)
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "24.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    cool_calls = [c for c in set_modes if c["hvac_mode"] == "cool"]
+    assert cool_calls, f"With cross_mode=0 the flip should fire immediately, got {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_cross_mode_min_cycle_does_not_block_first_action(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Fresh-from-restart zone has no previous_action; the gate must not
+    block the first heat. Regression guard against treating None as a flip."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    heat_calls = [c for c in set_modes if c["hvac_mode"] == "heat"]
+    assert heat_calls, f"First heat must fire (no prior action), got {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_cross_mode_gate_does_not_suppress_same_mode_bounce(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """heat → idle → heat (room re-cools within the cross-mode window) is
+    NOT a cross-mode flip — both the prior and the new active action are
+    `heating`. The gate's `prior_active_action != decision.action` guard
+    must let this through. Sanity-check against a future refactor that
+    drops the inequality check and starts suppressing same-mode bounces."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Drop min_cycle_minutes to 0 so the same-mode dwell is out of the way —
+    # this test isolates the cross-mode gate's inequality guard. Keep
+    # cross_mode_min_minutes at its default 8 so the gate would fire if it
+    # incorrectly treated same-mode bounces as flips.
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=0)
+
+    # Heat fires, then releases to idle.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Within the 8-min cross-mode window (tick 2 min — well inside), the
+    # room cools again and re-triggers heat. The cross-mode gate sees
+    # prior_active_action=heating, decision.action=heating, and must let
+    # this through because they're the same mode.
+    freezer.tick(timedelta(minutes=2))
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    heat_calls = [c for c in set_modes if c["hvac_mode"] == "heat"]
+    assert heat_calls, "Same-mode bounce (heat→idle→heat) must not be gated as a cross-mode flip"
+    await coordinator.async_unload()
+
+
+async def test_previous_action_preserved_across_same_mode_re_commits(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A same-mode re-issue (heat is still appropriate after the min-cycle
+    window expires) must NOT overwrite `previous_action`. Otherwise after
+    `heat → idle → heat → idle → cool` the cross-mode gate would lose
+    track of the first heat and treat the second heat→idle→cool sequence
+    as the first one. Pins the `last_action != decision.action` guard at
+    the commit site so a future refactor that drops it gets caught."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    store = coordinator._store
+
+    # First heat: previous_action becomes None (was None before).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert store.get_zone("office")["previous_action"] is None
+
+    # Tick past the same-mode min-cycle window (default 8 min) and refresh
+    # with the same heat-triggering temperature. The coordinator re-issues
+    # the heat command. Critically, `previous_action` must stay None — it
+    # was None before and the re-issue isn't a real transition.
+    freezer.tick(timedelta(minutes=10))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    zone = store.get_zone("office")
+    assert zone["last_action"] == "heating"
+    assert zone["previous_action"] is None, (
+        "Same-mode re-issue must not overwrite previous_action with self-reference"
+    )
+    await coordinator.async_unload()
+
+
+async def test_previous_action_records_prior_non_idle_through_idle_release(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The cross-mode gate above is the consumer; this pins the underlying
+    storage invariant so a future refactor of `_maybe_apply_action`'s commit
+    step that drops `previous_action` tracking gets caught here, not in the
+    behavioural tests where the failure is harder to localise."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    store = coordinator._store
+
+    # Heat fires: previous_action is still None (was None before).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    zone = store.get_zone("office")
+    assert zone["last_action"] == "heating"
+    assert zone["previous_action"] is None
+
+    # Heat → idle: previous_action becomes heating.
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    zone = store.get_zone("office")
+    assert zone["last_action"] == "idle"
+    assert zone["previous_action"] == "heating"
+    await coordinator.async_unload()
+
+
 async def test_cancel_override_immediately_clears_it(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
