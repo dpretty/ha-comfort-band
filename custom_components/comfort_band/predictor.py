@@ -1,15 +1,17 @@
 """Predictive controller for Comfort Band.
 
 Per-zone rolling-window thermal-slope estimator paired with anticipatory
-startup/shutoff. Composes with hysteresis: `decide()` returns the same
-`HysteresisDecision` shape, so downstream apply logic (min-cycle gates,
-climate calls) does not need to know prediction is happening.
+startup, shutoff, and passive drift acceptance. Composes with hysteresis:
+`decide()` returns the same `HysteresisDecision` shape, so downstream apply
+logic (min-cycle gates, climate calls) does not need to know prediction is
+happening.
 
 The decider is a pure function: given the rolling sample buffer, the current
-`HysteresisInputs` snapshot, the lookahead horizon, and the hysteresis decision
-that would otherwise be issued, it returns either:
+`HysteresisInputs` snapshot, the lookahead horizon, the per-zone comfort
+tolerance, and the hysteresis decision that would otherwise be issued, it
+returns either:
   - the same hysteresis decision (no anticipation triggered), OR
-  - an earlier action (anticipated heat/cool, or anticipated idle release).
+  - an earlier action (anticipated heat / cool, or anticipated idle release).
 
 Module structure mirrors `hysteresis.py`: stateless logic, all state passed
 in/out via dataclasses; `now` is injected so unit tests stay pure.
@@ -19,12 +21,18 @@ each computed over the most recent contiguous run of like-actioned samples in
 the buffer. Each may be None when its segment has fewer than
 SLOPE_MIN_SAMPLES samples or the WLS denominator is near-singular.
 
-Anticipatory shutoff projects at the *band* edge (low/high) — it triggers
-the same idle-release that hysteresis would issue once the band is crossed,
-just earlier so the room peaks at the edge instead of overshooting.
-Anticipatory startup projects at the *deadband* edge — it triggers the
-same heat/cool entry that hysteresis would issue once the deadband is
-crossed, just earlier.
+Three projection thresholds, summarised:
+- Anticipatory **shutoff** projects at the band edge (`low`/`high`): fires
+  the same idle-release hysteresis would issue once the band is crossed,
+  just earlier so the room peaks at the edge instead of overshooting.
+- Anticipatory **startup** projects at the deadband edge (`low - db_below` /
+  `high + db_above`): fires the same heat / cool entry hysteresis would
+  issue once the deadband is crossed, just earlier.
+- Passive **drift acceptance** projects at the band edge too: suppresses
+  the heat / cool hysteresis wants to fire when the slope says natural
+  recovery will return us within the lookahead window. Bounded by
+  `passive_tolerance` (per-zone comfort floor) and a forecast-movement
+  jitter guard.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ from .const import (
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    PASSIVE_FORECAST_MOVEMENT_MIN_C,
     SAMPLE_MAX_COUNT,
     SAMPLE_MIN_INTERVAL_S,
     SAMPLE_WINDOW_MINUTES,
@@ -291,26 +300,42 @@ def decide(
     inputs: HysteresisInputs,
     *,
     lookahead_minutes: int,
+    passive_tolerance: float,
     hysteresis_decision: HysteresisDecision,
 ) -> HysteresisDecision:
-    """Anticipate startup or shutoff; otherwise return the hysteresis decision.
+    """Anticipate startup, shutoff, or passive recovery; otherwise defer to
+    hysteresis.
 
     Takes pre-computed slopes (caller is expected to need them anyway for
     the thermal_slope sensor) -- avoids a redundant WLS pass per refresh.
 
-    Shutoff anticipation (current action == heat/cool) takes priority over
-    startup — stopping early matters more than starting early because
-    overshoot is harder to recover from than late starts. The branches are
-    mutually exclusive on `current_action` so at most one fires per call.
+    Three predictor behaviours, branched on `current_action`:
 
-    Shutoff projects at the hysteresis *release* threshold (`low` for heat,
-    `high` for cool): hysteresis releases when room reaches that edge, but
-    by then thermal momentum carries it past. Anticipating the crossing
-    lets the room peak *at* the edge instead of overshooting it.
+    - **Shutoff** (current heat/cool): projects forward at the recovery
+      slope, releases to idle when projection reaches the hysteresis release
+      threshold (`low` for heat, `high` for cool). Hysteresis itself
+      releases at the edge, but thermal momentum then carries the room past;
+      anticipating the crossing lets the room peak *at* the edge instead.
 
-    Startup projects at the deadband entry edge (`low - deadband_below` /
-    `high + deadband_above`): we trigger the same entry condition hysteresis
-    would use later, just earlier.
+    - **Startup** (current idle/unknown, hysteresis says idle): projects
+      forward at the idle slope, fires heat / cool when projection crosses
+      the deadband entry edge (`low - deadband_below` / `high + deadband_above`).
+      Same entry condition hysteresis would use later, just earlier.
+
+    - **Passive drift acceptance** (current idle/unknown, hysteresis says
+      heat/cool): hysteresis wants to act because the room is already past
+      the deadband, but the slope is reversing -- natural recovery will
+      return us to band within `lookahead_minutes`. Stay idle. Two guards
+      apply: the forecast must move the room by at least
+      `PASSIVE_FORECAST_MOVEMENT_MIN_C` toward the band (defends against
+      false-positive suppression on sensor jitter), and the room must be
+      within `passive_tolerance` °C of the band edge (per-zone comfort
+      floor; 0 disables).
+
+    Shutoff takes priority over startup -- stopping early matters more than
+    starting early because overshoot is harder to recover from than late
+    starts. The branches are mutually exclusive on `current_action` so at
+    most one return fires per call.
     """
     if inputs.room is None:
         return UNKNOWN_DECISION
@@ -325,19 +350,43 @@ def decide(
             projected = inputs.room + slopes.recovery_cool * lookahead_minutes
             if projected <= inputs.high:
                 return idle_decision()
-    # ACTION_UNKNOWN routes into the idle/startup branch because passive
-    # drift is the only behavior the predictor can model when the previous
-    # action is unknown (room sensor just came back, fresh boot, etc.).
-    # The idle slope is computed from action==idle samples, so this means
-    # "if the buffer has any idle history, use it for startup."
+    # ACTION_UNKNOWN routes into the idle branch because passive drift is
+    # the only behavior the predictor can model when the previous action
+    # is unknown (room sensor just came back, fresh boot, etc.). The idle
+    # slope is computed from action==idle samples, so this means "if the
+    # buffer has any idle history, use it."
     elif inputs.current_action in (ACTION_IDLE, ACTION_UNKNOWN) and slopes.idle is not None:
-        if slopes.idle < -_SLOPE_EPSILON_PER_MINUTE:
-            projected = inputs.room + slopes.idle * lookahead_minutes
-            if projected < (inputs.low - inputs.deadband_below):
-                return heat_decision(inputs.low)
-        elif slopes.idle > _SLOPE_EPSILON_PER_MINUTE:
-            projected = inputs.room + slopes.idle * lookahead_minutes
-            if projected > (inputs.high + inputs.deadband_above):
-                return cool_decision(inputs.high)
+        projected = inputs.room + slopes.idle * lookahead_minutes
+
+        # Anticipatory startup: room in band, slope predicts crossing out.
+        if slopes.idle < -_SLOPE_EPSILON_PER_MINUTE and projected < (
+            inputs.low - inputs.deadband_below
+        ):
+            return heat_decision(inputs.low)
+        if slopes.idle > _SLOPE_EPSILON_PER_MINUTE and projected > (
+            inputs.high + inputs.deadband_above
+        ):
+            return cool_decision(inputs.high)
+
+        # Passive drift acceptance: hysteresis wants to act because room
+        # is outside the band, but natural recovery will return us within
+        # the lookahead window. The slope-sign predicates below cleanly
+        # partition with the startup branches above -- startup heat needs
+        # a cooling slope, passive heat needs a warming slope, so they
+        # never both apply to the same input.
+        if hysteresis_decision.action == ACTION_HEAT and (
+            slopes.idle > _SLOPE_EPSILON_PER_MINUTE
+            and projected >= inputs.low
+            and projected - inputs.room >= PASSIVE_FORECAST_MOVEMENT_MIN_C
+            and inputs.room >= inputs.low - passive_tolerance
+        ):
+            return idle_decision()
+        if hysteresis_decision.action == ACTION_COOL and (
+            slopes.idle < -_SLOPE_EPSILON_PER_MINUTE
+            and projected <= inputs.high
+            and inputs.room - projected >= PASSIVE_FORECAST_MOVEMENT_MIN_C
+            and inputs.room <= inputs.high + passive_tolerance
+        ):
+            return idle_decision()
 
     return hysteresis_decision

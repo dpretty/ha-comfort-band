@@ -94,15 +94,19 @@ def _decide_from_samples(
     lookahead_minutes: int,
     hysteresis_decision: HysteresisDecision,
     now: datetime,
+    passive_tolerance: float = 0.5,
 ) -> HysteresisDecision:
     """Test convenience: estimate slopes from samples, then call decide().
     Mirrors what the coordinator does (compute slopes once, feed in).
+    `passive_tolerance` defaults to the production default (0.5 °C); tests
+    that exercise the passive-acceptance branch override it explicitly.
     """
     slopes = estimate_slopes(samples, now=now)
     return decide(
         slopes,
         inputs,
         lookahead_minutes=lookahead_minutes,
+        passive_tolerance=passive_tolerance,
         hysteresis_decision=hysteresis_decision,
     )
 
@@ -463,6 +467,152 @@ def test_shutoff_releases_before_hysteresis_would() -> None:
         now=samples[-1].t,
     )
     assert decision.action == ACTION_IDLE
+
+
+# ----- decide: passive drift acceptance -----
+
+
+def test_passive_heat_suppressed_when_idle_slope_recovers() -> None:
+    # Room is below the deadband entry (hysteresis would fire heat), but the
+    # idle slope is positive and projection lands comfortably inside the
+    # band within lookahead. Predictor should override hysteresis to idle.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=8.0)
+    inputs = _inputs(19.5, current=ACTION_IDLE)  # 0.5 below low=20 (within tolerance 0.5)
+    # Projection: 19.5 + 8/60*5 = 20.17 > low (20.0). Movement 0.67 >= 0.1.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+
+
+def test_passive_cool_suppressed_when_idle_slope_recovers() -> None:
+    # Symmetric: room above deadband (hyst would cool), but slope is
+    # negative and projection lands comfortably inside the band.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=24.0, slope_per_h=-8.0)
+    inputs = _inputs(23.5, current=ACTION_IDLE)  # 0.5 above high=23
+    # Projection: 23.5 - 8/60*5 = 22.83 < high. Movement 0.67 >= 0.1.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_cool(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+
+
+def test_passive_falls_through_when_slope_wrong_sign() -> None:
+    # Hyst says heat but slope is negative (room cooling further). Passive
+    # branch requires a recovering slope -- fall through to hysteresis.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=20.0, slope_per_h=-2.0)
+    inputs = _inputs(19.5, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_passive_falls_through_when_projection_does_not_reach_band() -> None:
+    # Slope is positive but too shallow: projection still below low.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=1.0)
+    inputs = _inputs(19.0, current=ACTION_IDLE)  # within tolerance, but...
+    # Projection: 19.0 + 1/60*5 = 19.083 < low (20). Predictor can't promise
+    # we'll be back in band by then -- defer to hysteresis.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_passive_falls_through_when_deviation_exceeds_tolerance() -> None:
+    # Room is deeper below band than passive_tolerance allows -- comfort
+    # floor wins, predictor doesn't suppress even with a strong slope.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.0, slope_per_h=20.0)
+    inputs = _inputs(19.0, current=ACTION_IDLE)  # 1.0 below low, tolerance 0.5
+    # Projection: 19.0 + 20/60*5 = 20.67 >= low. But room < (low - tolerance).
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+        passive_tolerance=0.5,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_passive_falls_through_when_forecast_movement_below_min() -> None:
+    # Slope is just above epsilon (so passes the slope-sign guard) but the
+    # forecast moves the room by < PASSIVE_FORECAST_MOVEMENT_MIN_C (0.1 °C).
+    # Without this jitter guard a sensor-noise slope could spuriously
+    # suppress a hysteresis-correct heat call.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=19.4, slope_per_h=0.6)
+    inputs = _inputs(19.6, current=ACTION_IDLE)
+    # Projection: 19.6 + 0.6/60*5 = 19.65. Even though >= low would fail,
+    # the key assertion is movement = 0.05 < 0.1, so suppression must NOT
+    # fire even if projection happened to clear low.
+    inputs_at_boundary = _inputs(20.0 - 0.05, current=ACTION_IDLE, low=20.0)  # crafted edge
+    decision = _decide_from_samples(
+        samples,
+        inputs_at_boundary,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    # Movement = 0.05 °C, below the 0.1 °C jitter guard -- expect hyst.
+    assert decision == _hyst_heat()
+    # The original inputs (without the boundary craft) should also fall
+    # through, demonstrating the same guard via the projection-< -low path.
+    decision2 = _decide_from_samples(
+        samples, inputs, lookahead_minutes=5, hysteresis_decision=_hyst_heat(), now=samples[-1].t
+    )
+    assert decision2 == _hyst_heat()
+
+
+def test_passive_falls_through_when_idle_slope_none() -> None:
+    # Fewer than SLOPE_MIN_SAMPLES idle samples -> idle_slope is None ->
+    # predictor cannot evaluate passive branch -> hysteresis fires heat.
+    samples = _samples_at(
+        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=18.5, slope_per_h=6.0
+    )
+    inputs = _inputs(19.5, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_passive_tolerance_zero_disables_suppression() -> None:
+    # passive_tolerance=0 means even a room right at low - 0.001 won't
+    # be tolerated. Provides users an "always defer to hysteresis on
+    # band exits" knob for restoring pre-v0.7 behaviour.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=6.0)
+    inputs = _inputs(19.5, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+        passive_tolerance=0.0,
+    )
+    assert decision == _hyst_heat()
 
 
 # ----- decide: fall-through -----

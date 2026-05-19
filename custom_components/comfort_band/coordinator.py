@@ -190,8 +190,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_set_param(self, field: str, value: Any) -> None:
         """Update a tunable (deadband_*, override_hours, min_cycle_minutes,
-        cross_mode_min_minutes, lookahead_minutes) without triggering an
-        override.
+        cross_mode_min_minutes, lookahead_minutes, passive_tolerance)
+        without triggering an override.
 
         Uses `async_request_refresh` (queued + deduped) rather than
         `async_refresh` because Number entities can fire rapid-fire writes
@@ -362,6 +362,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             thermal_slopes,
             hyst_inputs,
             lookahead_minutes=zone["lookahead_minutes"],
+            passive_tolerance=zone["passive_tolerance"],
             hysteresis_decision=hyst_decision,
         )
         final_decision = predicted_decision if zone["learning_enabled"] else hyst_decision

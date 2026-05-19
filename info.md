@@ -2,7 +2,7 @@
 
 Per-room HVAC band-control for Home Assistant. Heats below a low threshold, cools above a high threshold, idles in between — giving heat pumps and mini-splits margin instead of fighting to hold a single setpoint.
 
-**v0.6.0** adds predictive control via a learned thermal-slope estimator: the integration projects room temperature forward and triggers heat / cool earlier when an idle drift will cross the band, or releases earlier when a recovery rate would overshoot. Gated by `switch.{zone}_learning_enabled` (default OFF — opt in when you're ready). Builds on the v0.1 core (per-zone entities, asymmetric-deadband hysteresis, profile-driven schedules), v0.2 schedule WS subscription, v0.3 profile CRUD, v0.4 apparent-temperature support, and v0.5 cross-mode min-cycle dwell.
+**v0.7.0** extends the v0.6 predictive controller with passive drift acceptance: when the room has crossed the band edge but the slope says natural recovery will return us to band within the lookahead window, the predictor stays idle instead of firing heat / cool. Bounded by `number.{zone}_passive_tolerance` (default 0.5 °C; 0 disables). Gated by the existing `switch.{zone}_learning_enabled` — default behaviour is unchanged unless you've opted into predictive control. Builds on the v0.1 core (per-zone entities, asymmetric-deadband hysteresis, profile-driven schedules), v0.2 schedule WS subscription, v0.3 profile CRUD, v0.4 apparent-temperature support, v0.5 cross-mode min-cycle dwell, and v0.6 learned thermal-slope estimator.
 
 The Lovelace card lives in a separate repo — install [dpretty/ha-comfort-band-card](https://github.com/dpretty/ha-comfort-band-card) via HACS as a Dashboard Custom Repository.
 

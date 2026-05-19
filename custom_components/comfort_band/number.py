@@ -1,11 +1,11 @@
 """Per-zone number entities.
 
-Eight tunables are exposed as `number.{zone}_<key>`. Two of them
+Nine tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other six (`override_hours`, `deadband_below`, `deadband_above`,
-`min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`) are
-simple persisted tunables.
+The other seven (`override_hours`, `deadband_below`, `deadband_above`,
+`min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`,
+`passive_tolerance`) are simple persisted tunables.
 """
 
 from __future__ import annotations
@@ -18,7 +18,16 @@ from homeassistant.const import UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, LOOKAHEAD_MAX, LOOKAHEAD_MIN, TEMP_MAX, TEMP_MIN, TEMP_STEP
+from .const import (
+    DOMAIN,
+    LOOKAHEAD_MAX,
+    LOOKAHEAD_MIN,
+    PASSIVE_TOLERANCE_MAX,
+    PASSIVE_TOLERANCE_MIN,
+    TEMP_MAX,
+    TEMP_MIN,
+    TEMP_STEP,
+)
 from .coordinator import ZoneCoordinator
 from .entity import ComfortBandZoneEntity
 
@@ -103,6 +112,14 @@ _SPECS: tuple[_NumberSpec, ...] = (
         max_value=LOOKAHEAD_MAX,
         step=1,
         unit=UnitOfTime.MINUTES,
+    ),
+    _NumberSpec(
+        key="passive_tolerance",
+        field="passive_tolerance",
+        min_value=PASSIVE_TOLERANCE_MIN,
+        max_value=PASSIVE_TOLERANCE_MAX,
+        step=0.1,
+        unit=UnitOfTemperature.CELSIUS,
     ),
 )
 

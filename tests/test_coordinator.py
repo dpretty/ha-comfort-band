@@ -1076,3 +1076,31 @@ async def test_climate_state_echo_does_not_flush(
 
     assert coordinator._samples_cache == samples_before
     await coordinator.async_unload()
+
+
+async def test_passive_tolerance_threaded_to_predictor(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Sets `passive_tolerance=0` on the zone, then drives a setup where
+    the v0.7 passive branch would otherwise suppress heat. With the tunable
+    at zero the comfort floor is infinitely tight, so heat must fire --
+    proves the per-zone value actually reaches `predictor.decide()`."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone(
+        "office", learning_enabled=True, passive_tolerance=0.0
+    )
+    # Room below deadband entry (hyst would fire heat) + warming slope
+    # whose projection lands inside band: passive branch would suppress
+    # with default tolerance, but must NOT suppress with passive_tolerance=0.
+    _seed_idle_drift(coordinator, start_temp=18.0, slope_per_h=8.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.0", {})  # default low=19.5, db_below=0.3 -> hyst heats
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == HVAC_MODE_HEAT for c in set_modes), set_modes
+    await coordinator.async_unload()
