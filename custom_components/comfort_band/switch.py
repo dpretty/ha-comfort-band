@@ -41,9 +41,11 @@ class EnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
 
 
 class LearningEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
-    """Master gate for the learning cluster (apparent-temp-aware nudges and
-    predictive control). Default OFF -- same shadow-mode posture as
-    `enabled`. Read by future PRs (#9, #11); has no decision effect today.
+    """Master gate for the v0.6 predictive controller. Default OFF -- same
+    shadow-mode posture as `enabled`. When ON, `predictor.decide()`'s
+    anticipated action replaces `hysteresis.decide()`'s reactive one as the
+    final decision forwarded to climate. The `predicted_action` sensor
+    populates regardless so users can shadow-compare before flipping it.
     """
 
     _attr_entity_category = EntityCategory.CONFIG

@@ -31,15 +31,18 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import apparent_temp, hysteresis, schedule
+from . import apparent_temp, hysteresis, predictor, schedule
 from .const import (
     ACTION_COOL,
     ACTION_HEAT,
     ACTION_UNKNOWN,
+    CLIMATE_ECHO_WINDOW_S,
     LOGGER,
+    SAMPLE_PERSIST_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
 from .hysteresis import HysteresisDecision, HysteresisInputs
+from .predictor import Sample, ThermalSlopes
 from .schedule import Transition, normalize_schedule, schedule_from_dict
 
 if TYPE_CHECKING:
@@ -77,6 +80,11 @@ class ZoneState:
     override_active: bool
     override_until: datetime | None
     decision: HysteresisDecision
+    # v0.6 predictive control: predicted_decision is always populated (shadow
+    # mode), regardless of learning_enabled. thermal_slopes carries the
+    # current learned slopes for the thermal_slope sensor's attributes.
+    predicted_decision: HysteresisDecision
+    thermal_slopes: ThermalSlopes
 
     @property
     def enabled(self) -> bool:
@@ -115,6 +123,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_debounce: CALLBACK_TYPE | None = None
         self._unsub_override_timer: CALLBACK_TYPE | None = None
         self._unsub_transition_timer: CALLBACK_TYPE | None = None
+        # v0.6 predictive control. Buffer is hydrated from store in
+        # `async_setup`; the climate-state listener detects manual edits and
+        # flushes to keep the slope estimator honest under mixed control.
+        # `_last_sample_persist_at` throttles disk writes -- see _append_sample.
+        self._samples_cache: list[Sample] = []
+        self._last_command_state: dict[str, Any] | None = None
+        self._last_command_at: datetime | None = None
+        self._unsub_climate: CALLBACK_TYPE | None = None
+        self._last_sample_persist_at: datetime | None = None
 
     # ----- setup / teardown -----
 
@@ -130,6 +147,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_signal = async_dispatcher_connect(
             self.hass, SIGNAL_ACTIVE_PROFILE_CHANGED, self._on_profile_change
         )
+        # Hydrate the v0.6 sample buffer from store + subscribe to climate
+        # state changes (manual-edit detector keeps the slope estimator honest).
+        zone = self._store.get_zone(self.zone_name)
+        self._samples_cache = predictor.load_samples(zone["samples"])
+        self._unsub_climate = async_track_state_change_event(
+            self.hass, [self.climate_entity_id], self._on_climate_state_change
+        )
         await self.async_config_entry_first_refresh()
 
     async def async_unload(self) -> None:
@@ -140,6 +164,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._unsub_debounce,
             self._unsub_override_timer,
             self._unsub_transition_timer,
+            self._unsub_climate,
         ):
             if unsub is not None:
                 unsub()
@@ -148,6 +173,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_debounce = None
         self._unsub_override_timer = None
         self._unsub_transition_timer = None
+        self._unsub_climate = None
+        # v0.6 predictive caches -- reset to honour the "safe to call
+        # repeatedly" contract. (HA normally constructs a new coordinator
+        # on reload, so this is future-proofing more than current need.)
+        self._samples_cache = []
+        self._last_command_state = None
+        self._last_command_at = None
+        self._last_sample_persist_at = None
 
     # ----- mutators (called from entities + services) -----
 
@@ -157,7 +190,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_set_param(self, field: str, value: Any) -> None:
         """Update a tunable (deadband_*, override_hours, min_cycle_minutes,
-        cross_mode_min_minutes) without triggering an override.
+        cross_mode_min_minutes, lookahead_minutes) without triggering an
+        override.
 
         Uses `async_request_refresh` (queued + deduped) rather than
         `async_refresh` because Number entities can fire rapid-fire writes
@@ -311,16 +345,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             apparent_temperature,
         )
 
-        decision = hysteresis.decide(
-            HysteresisInputs(
-                room=decision_room,
-                low=eff_low,
-                high=eff_high,
-                deadband_below=zone["deadband_below"],
-                deadband_above=zone["deadband_above"],
-                current_action=zone["last_action"] or ACTION_UNKNOWN,
-            )
+        hyst_inputs = HysteresisInputs(
+            room=decision_room,
+            low=eff_low,
+            high=eff_high,
+            deadband_below=zone["deadband_below"],
+            deadband_above=zone["deadband_above"],
+            current_action=zone["last_action"] or ACTION_UNKNOWN,
         )
+        hyst_decision = hysteresis.decide(hyst_inputs)
+        # Predictor runs every refresh (shadow mode). Slopes are computed once
+        # and fed into both `decide()` (anticipation logic) and the
+        # thermal_slope sensor's attributes (via ZoneState).
+        thermal_slopes = predictor.estimate_slopes(self._samples_cache, now=now_utc)
+        predicted_decision = predictor.decide(
+            thermal_slopes,
+            hyst_inputs,
+            lookahead_minutes=zone["lookahead_minutes"],
+            hysteresis_decision=hyst_decision,
+        )
+        final_decision = predicted_decision if zone["learning_enabled"] else hyst_decision
 
         # Reschedule next-transition + override-expiry timers.
         self._schedule_next_transition(schedule_data)
@@ -340,12 +384,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             sched_high=sched_high,
             override_active=override_active,
             override_until=override_until,
-            decision=decision,
+            decision=final_decision,
+            predicted_decision=predicted_decision,
+            thermal_slopes=thermal_slopes,
         )
 
         # Apply in a follow-up task so this refresh returns immediately --
         # entities can render the new state without waiting on climate calls.
-        self.hass.async_create_task(self._maybe_apply_action(decision, zone["enabled"]))
+        self.hass.async_create_task(
+            self._maybe_apply_action(final_decision, zone["enabled"], decision_room=decision_room)
+        )
 
         return state
 
@@ -416,7 +464,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         seconds = max(delta.total_seconds(), 1.0)
         self._unsub_override_timer = async_call_later(self.hass, seconds, self._on_timer_fire)
 
-    async def _maybe_apply_action(self, decision: HysteresisDecision, enabled: bool) -> None:
+    async def _maybe_apply_action(
+        self,
+        decision: HysteresisDecision,
+        enabled: bool,
+        *,
+        decision_room: float | None,
+    ) -> None:
         """Translate the decision into climate.set_hvac_mode + set_temperature.
 
         Skipped entirely when `enabled=False` (shadow mode -- log only).
@@ -424,7 +478,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         cross-mode-cycle suppression blocks heat↔cool flips within a short
         dwell. Idle releases (heat→idle, cool→idle) pass through unchecked
         so a heat or cool cycle can always stop.
+
+        After applying (or holding), appends a sample to the v0.6 predictor
+        buffer reflecting the action the HVAC is actually in for the next
+        interval -- either the newly-committed `decision.action` (when
+        climate calls succeeded) or the prior `last_action` (when a gate
+        suppressed).
         """
+        now_utc = dt_util.utcnow()
         if not enabled:
             LOGGER.debug(
                 "%s: shadow mode -- would %s (target_mode=%s, target_temp=%s)",
@@ -433,14 +494,31 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 decision.target_mode,
                 decision.target_temp,
             )
+            # In shadow mode the HVAC may be user-controlled. Record samples
+            # under the decider's intent so the predictor learns idle drift;
+            # the climate-state listener flushes if the user actually moves
+            # the climate. There's an inherent window between a manual change
+            # and the listener firing during which sample labels can be wrong
+            # (e.g., labelled `idle` while the user is heating manually) --
+            # the flush corrects this after-the-fact and the README documents
+            # the limitation.
+            #
+            # Skip the append when there's no usable room reading: predictor
+            # decisions with target_mode=None pair with decision_room=None,
+            # and a sample with no temperature isn't a useful data point.
+            if decision_room is None or decision.target_mode is None:
+                return
+            await self._append_sample(decision_room, decision.action, now_utc)
             return
         if decision.target_mode is None:
+            # UNKNOWN_DECISION (room unavailable -- both hysteresis.decide and
+            # predictor.decide return UNKNOWN when inputs.room is None).
+            # decision_room is None at this point too, so no sample to append.
             return
 
         zone = self._store.get_zone(self.zone_name)
         last_action = zone["last_action"]
         last_action_at = _parse_iso(zone["last_action_at"])
-        now_utc = dt_util.utcnow()
         # `elapsed_s` is None for a fresh-from-restart zone (no action has
         # ever been committed). Both gates below short-circuit on `None`
         # via their `elapsed_s is not None` guards, so neither suppresses
@@ -456,6 +534,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             and elapsed_s is not None
             and elapsed_s < zone["min_cycle_minutes"] * 60
         ):
+            # Gate suppresses re-issue but the HVAC keeps doing `last_action`,
+            # which equals `decision.action` here -- record the sample so the
+            # predictor still learns the in-progress recovery slope.
+            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
             return
 
         # Cross-mode min-cycle: don't flip between heat and cool too quickly.
@@ -496,7 +578,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 elapsed_s,
                 zone["cross_mode_min_minutes"],
             )
+            # The HVAC keeps doing `last_action` (typically idle, since the
+            # decider releases through idle before the flip). Record under
+            # that action so the predictor's idle_slope reflects what's
+            # actually happening during the dwell.
+            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
             return
+
+        # About to issue climate commands: snapshot our intent so the
+        # climate-state listener can recognise the resulting echoes and
+        # avoid mistaking them for manual edits.
+        self._last_command_state = {
+            "hvac_mode": decision.target_mode,
+            "target_temp": decision.target_temp,
+        }
+        self._last_command_at = now_utc
 
         await self.hass.services.async_call(
             "climate",
@@ -514,6 +610,31 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 },
                 blocking=True,
             )
+        # Snapshot the climate's actual state after our commands settle. The
+        # service calls leave `decision.target_temp=None` for idle releases,
+        # but the climate often keeps a stale `temperature` attribute from
+        # the prior heat/cool setpoint. Without this snapshot the listener
+        # would mismatch (`None` vs the stale value) on any non-echo state
+        # event and spuriously flush the buffer. Reading the live state means
+        # the baseline reflects reality, not our incomplete intent.
+        #
+        # If the climate state isn't readable we KEEP the pre-call baseline
+        # (set just before the service calls above) -- an unreachable climate
+        # won't be emitting state-change events anyway, so there's nothing
+        # for the listener to compare against. Resetting to None here would
+        # silently disable manual-edit detection on the next event.
+        fresh = self.hass.states.get(self.climate_entity_id)
+        if fresh is not None:
+            self._last_command_state = {
+                "hvac_mode": fresh.state,
+                "target_temp": fresh.attributes.get("temperature"),
+            }
+            # Reuse the pre-call `now_utc` rather than calling utcnow() again:
+            # the small delta from slow climate calls would just slightly
+            # narrow the echo window without changing correctness, but staying
+            # in lockstep with `now_utc` matches the surrounding code's pattern
+            # of "one timestamp per refresh."
+            self._last_command_at = now_utc
         # Roll `previous_action` forward on real transitions; leave it alone
         # on same-mode re-commits (after the min-cycle window expires the
         # coordinator re-issues the same hvac_mode — that's a refresh, not
@@ -528,6 +649,123 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             last_action_at=now_utc.isoformat(),
             previous_action=new_previous_action,
         )
+        # Record a sample under the newly-committed action — the predictor's
+        # next refresh will see this sample in the trailing run for
+        # decision.action and compute the slope from it.
+        await self._append_sample(decision_room, decision.action, now_utc)
+
+    async def _append_sample(
+        self, decision_room: float | None, action: str, now_utc: datetime
+    ) -> None:
+        """Append a sample to the rolling buffer and (sometimes) persist it.
+
+        Skipped when `decision_room is None` (sensor unavailable -- no data
+        point worth recording). Rate-limit + age-cap logic lives in
+        `predictor.append_sample`; this method just wires it to the store
+        and updates the in-memory cache.
+
+        Disk persistence is throttled: every action transition writes
+        immediately (the slope segmenter needs the boundary on cold start),
+        but consecutive same-action samples persist at most once every
+        SAMPLE_PERSIST_INTERVAL_S. Without this, the integration would write
+        the full samples list to .storage every ~60 s and meaningfully
+        accelerate flash wear on SD-card-backed installs. Worst-case data
+        loss on crash is one persist interval of in-memory samples; the
+        predictor recovers in well under the WLS window.
+        """
+        if decision_room is None:
+            return
+        # `prior_action` is captured BEFORE the append so it reflects the
+        # buffer's last action, not the freshly-decided one. Used only to
+        # decide whether to persist immediately (transition) or throttle.
+        prior_action = self._samples_cache[-1].action if self._samples_cache else None
+        new_samples, appended = predictor.append_sample(
+            self._samples_cache, now=now_utc, temp=decision_room, action=action
+        )
+        if not appended:
+            return
+        self._samples_cache = new_samples
+
+        # Always persist on action transitions (the slope segmenter relies on
+        # the recorded boundary at cold start) and on the very first persist
+        # after install/restart/flush (_last_sample_persist_at is None).
+        # Otherwise rate-limit to SAMPLE_PERSIST_INTERVAL_S.
+        is_transition = prior_action is not None and prior_action != action
+        recently_persisted = (
+            self._last_sample_persist_at is not None
+            and (now_utc - self._last_sample_persist_at).total_seconds() < SAMPLE_PERSIST_INTERVAL_S
+        )
+        if not is_transition and recently_persisted:
+            return
+
+        await self._store.async_update_zone(
+            self.zone_name,
+            samples=[predictor.sample_to_dict(s) for s in new_samples],
+        )
+        self._last_sample_persist_at = now_utc
+
+    @callback
+    def _on_climate_state_change(self, event: Event[EventStateChangedData]) -> None:
+        """Flush the sample buffer when the climate entity changes outside our path.
+
+        Compares observed state to `_last_command_state` (what we last asked
+        the climate to be). Within the CLIMATE_ECHO_WINDOW_S window after our
+        own command the state may transition through intermediate values
+        (`set_hvac_mode` + `set_temperature` fire two state-change events
+        sequentially, and a slow climate can take many seconds to acknowledge
+        the second one) -- ignore those. Otherwise, a mismatch indicates a
+        manual edit; flush samples so the slope estimator doesn't fit stale
+        dynamics.
+        """
+        # `EventStateChangedData` declares both keys as required (`State | None`),
+        # so subscript access is the type-honest read; .get() would silently
+        # mask a future schema rename.
+        old_state = event.data["old_state"]
+        new_state = event.data["new_state"]
+        if old_state is None or new_state is None:
+            # Initial state-added or entity-removed -- not a manual edit.
+            return
+        observed = {
+            "hvac_mode": new_state.state,
+            "target_temp": new_state.attributes.get("temperature"),
+        }
+        now = dt_util.utcnow()
+        # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)
+        # doesn't trip the negative `< window` branch and suppress legitimate
+        # manual-edit detection indefinitely.
+        elapsed_s = (
+            (now - self._last_command_at).total_seconds()
+            if self._last_command_at is not None
+            else None
+        )
+        is_echo = elapsed_s is not None and 0 <= elapsed_s < CLIMATE_ECHO_WINDOW_S
+        if is_echo:
+            # Climate may emit one event per attribute change. Update the
+            # baseline to whatever the climate ended up at so the next
+            # non-echo change is compared against the latest stable state.
+            self._last_command_state = observed
+            return
+        if self._last_command_state is None:
+            # No baseline yet -- first observed state becomes the baseline
+            # without triggering a flush.
+            self._last_command_state = observed
+            return
+        if observed == self._last_command_state:
+            return
+        LOGGER.info(
+            "%s: manual climate edit detected (observed=%s, last_command=%s); "
+            "flushing sample buffer",
+            self.zone_name,
+            observed,
+            self._last_command_state,
+        )
+        self._samples_cache = []
+        self._last_command_state = observed
+        # Reset the persist throttle so the first sample after the flush
+        # writes immediately, matching the "transitions always persist"
+        # contract (a flush is functionally a forced segment boundary).
+        self._last_sample_persist_at = None
+        self.hass.async_create_task(self._store.async_update_zone(self.zone_name, samples=[]))
 
 
 def _parse_iso(value: str | None) -> datetime | None:

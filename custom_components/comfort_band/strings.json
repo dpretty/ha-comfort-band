@@ -75,6 +75,9 @@
       },
       "cross_mode_min_minutes": {
         "name": "Cross-mode minimum minutes"
+      },
+      "lookahead_minutes": {
+        "name": "Lookahead minutes"
       }
     },
     "select": {
@@ -100,6 +103,18 @@
       },
       "current_action": {
         "name": "Current action",
+        "state": {
+          "heating": "Heating",
+          "cooling": "Cooling",
+          "idle": "Idle",
+          "unknown": "Unknown"
+        }
+      },
+      "thermal_slope": {
+        "name": "Thermal slope"
+      },
+      "predicted_action": {
+        "name": "Predicted action",
         "state": {
           "heating": "Heating",
           "cooling": "Cooling",

@@ -24,6 +24,7 @@ from homeassistant.helpers.storage import Store
 
 __all__ = [
     "ComfortBandStore",
+    "SerializedSample",
     "StoredData",
     "StoredProfile",
     "StoredProfileSchedule",
@@ -36,6 +37,7 @@ from .const import (
     DEFAULT_CROSS_MODE_MIN_MINUTES,
     DEFAULT_DEADBAND_ABOVE,
     DEFAULT_DEADBAND_BELOW,
+    DEFAULT_LOOKAHEAD_MINUTES,
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PROFILE,
@@ -59,6 +61,18 @@ class StoredProfileSchedule(TypedDict):
     current: list[StoredTransition]
 
 
+class SerializedSample(TypedDict):
+    """On-disk shape for the v0.6 thermal sample buffer. Persisted in
+    `StoredZone["samples"]`. The `predictor` module consumes this via
+    `sample_from_dict`/`sample_to_dict`; the schema lives here so the
+    storage layer doesn't depend on the prediction layer.
+    """
+
+    t: str  # ISO-8601 UTC
+    temp: float
+    action: str
+
+
 class StoredZone(TypedDict):
     zone_name: str
     schedules: dict[str, StoredProfileSchedule]
@@ -78,10 +92,19 @@ class StoredZone(TypedDict):
     # since by the time the coordinator sees the flip-to-cool, the persisted
     # `last_action` is already `idle`.
     previous_action: str | None
+    # Rolling sample buffer for the v0.6 predictive controller. Capped to
+    # ~90 minutes of refreshes (see SAMPLE_WINDOW_MINUTES + SAMPLE_MAX_COUNT
+    # in const.py). Survives restart so the slope estimator doesn't need to
+    # warm up from scratch.
+    samples: list[SerializedSample]
+    # Horizon over which the predictor projects the current slope forward.
+    # Exposed as `number.{zone}_lookahead_minutes`. Default 5; range [2, 15].
+    lookahead_minutes: int
     enabled: bool
-    # Gate for the v0.4+ learning cluster (apparent-temp-aware nudges,
-    # predictive control). Not consumed by anything yet — wired so future
-    # PRs can read it without another storage migration.
+    # Gates the v0.6 predictive controller: when ON, `predictor.decide()`'s
+    # anticipated action replaces `hysteresis.decide()`'s reactive one as the
+    # final decision forwarded to climate. Default OFF; predicted_action
+    # sensor populates regardless so users can shadow-compare first.
     learning_enabled: bool
     # When True, hysteresis decisions consume the *apparent* temperature
     # instead of the raw room reading. Falls back to room temp automatically
@@ -139,6 +162,8 @@ def _default_zone(zone_name: str) -> StoredZone:
         "min_cycle_minutes": DEFAULT_MIN_CYCLE_MINUTES,
         "cross_mode_min_minutes": DEFAULT_CROSS_MODE_MIN_MINUTES,
         "previous_action": None,
+        "samples": [],
+        "lookahead_minutes": DEFAULT_LOOKAHEAD_MINUTES,
         "enabled": False,
         "learning_enabled": False,
         "use_apparent_temperature": False,
@@ -193,10 +218,9 @@ class ComfortBandStore:
         if raw.get("active_profile") not in raw.get("profiles", {}):
             raw["active_profile"] = raw["default_profile"]
             migrated = True
-        # v0.3 → v0.4 migration: backfill `learning_enabled` and
-        # `use_apparent_temperature` on every existing zone. Without this
-        # `async_update_zone` would KeyError when callers set these new
-        # fields, and entity reads of `zone["learning_enabled"]` would crash.
+        # Per-zone backfill: every new field added since v0.3 gets a safe
+        # default if absent. Each `if "field" not in zone` branch is
+        # independent so a single load can migrate v0.3 → v0.6 in one pass.
         #
         # STORAGE_VERSION intentionally stays at 1: field additions with
         # safe defaults are forward-compatible (old payload + missing
@@ -222,6 +246,15 @@ class ComfortBandStore:
                 migrated = True
             if "previous_action" not in zone:
                 zone["previous_action"] = None
+                migrated = True
+            # v0.5 → v0.6: predictive control. Buffer starts empty (warms up
+            # over the first ~90 min of refreshes); lookahead seeds to the
+            # conservative default. Both safe to backfill on every load.
+            if "samples" not in zone:
+                zone["samples"] = []
+                migrated = True
+            if "lookahead_minutes" not in zone:
+                zone["lookahead_minutes"] = DEFAULT_LOOKAHEAD_MINUTES
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

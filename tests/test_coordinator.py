@@ -7,12 +7,13 @@ pytest-freezer `freezer` fixture for time travel.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from custom_components.comfort_band.const import (
     ACTION_COOL,
@@ -660,4 +661,418 @@ async def test_cancel_override_immediately_clears_it(
     await coordinator.async_cancel_override()
     assert not coordinator.data.override_active
     assert coordinator.data.override_until is None
+    await coordinator.async_unload()
+
+
+# ----- predictive control (v0.6) -----
+
+
+def _seed_idle_drift(
+    coordinator: ZoneCoordinator, *, start_temp: float, slope_per_h: float, now: datetime
+) -> None:
+    """Pre-populate the coordinator's in-memory samples cache with an idle
+    drift segment. 16 samples at 120s spacing = 30 minutes of history.
+    """
+    from custom_components.comfort_band.const import ACTION_IDLE
+    from custom_components.comfort_band.predictor import Sample
+
+    slope_per_minute = slope_per_h / 60.0
+    samples: list[Sample] = []
+    for i in range(16):
+        t = now - timedelta(seconds=120 * (15 - i))
+        temp = start_temp + slope_per_minute * (120 * i / 60.0)
+        samples.append(Sample(t=t, temp=temp, action=ACTION_IDLE))
+    coordinator._samples_cache = samples
+
+
+async def test_predicted_action_populated_when_learning_off(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """With learning_enabled=False (default), the predictor still runs in
+    shadow mode: `predicted_decision` reflects what it would issue, but the
+    climate calls follow hysteresis."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Steep downward idle drift; room is inside band but projection drops
+    # below the deadband entry threshold.
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-10.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.5", {})  # at low, hysteresis says idle
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Predictor anticipates heat (projection: 19.5 - 0.833 = 18.67 < 19.2).
+    assert coordinator.data.predicted_decision.action == ACTION_HEAT
+    # But learning is OFF -> final decision follows hysteresis (idle: 19.5 not
+    # less than 19.2). No heat command issued.
+    assert coordinator.data.decision.action == ACTION_IDLE
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert all(c["hvac_mode"] != HVAC_MODE_HEAT for c in set_modes), set_modes
+    await coordinator.async_unload()
+
+
+async def test_learning_on_anticipatory_heat_drives_climate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """With learning_enabled=True, an anticipated heat reaches climate
+    earlier than hysteresis would issue it."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-10.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.predicted_decision.action == ACTION_HEAT
+    assert coordinator.data.decision.action == ACTION_HEAT
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == HVAC_MODE_HEAT for c in set_modes), set_modes
+    await coordinator.async_unload()
+
+
+async def test_learning_on_anticipatory_cool_drives_climate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Symmetric to the heat-startup test: with learning ON, a steep upward
+    idle drift fires anticipatory cool. Locks in the cool branch of the
+    `final_decision = predicted_decision` routing."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    _seed_idle_drift(coordinator, start_temp=20.0, slope_per_h=10.0, now=dt_util.utcnow())
+    # Room above manual_high (default 22.5) so projection (22.5 + 0.833 = 23.33)
+    # crosses the upper deadband threshold (22.5 + 0.5 = 23.0).
+    hass.states.async_set(TEMP_ENTITY, "22.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.predicted_decision.action == ACTION_COOL
+    assert coordinator.data.decision.action == ACTION_COOL
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == "cool" for c in set_modes), set_modes
+    await coordinator.async_unload()
+
+
+async def test_learning_on_anticipatory_shutoff_releases_climate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The shutoff branch is unit-tested in test_predictor.py; this test
+    locks in the coordinator's routing: with learning ON, an anticipated
+    idle release reaches climate.set_hvac_mode(fan_only). Without this,
+    a regression in `final_decision = predicted_decision` for the shutoff
+    path would only be caught by the unit test."""
+    from custom_components.comfort_band.predictor import Sample
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    # First fire heat normally so last_action=heat and the buffer has a heat run.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_HEAT
+    climate_calls.clear()
+
+    # Seed a steep heat recovery slope so the predictor anticipates overshoot.
+    # Build 10 heat samples at 120s intervals with slope +20 °C/h.
+    now = dt_util.utcnow()
+    slope_per_min = 20.0 / 60.0
+    samples: list[Sample] = []
+    for i in range(10):
+        t = now - timedelta(seconds=120 * (9 - i))
+        temp = 19.0 + slope_per_min * (120 * i / 60.0)
+        samples.append(Sample(t=t, temp=temp, action=ACTION_HEAT))
+    coordinator._samples_cache = samples
+    # Room still well below manual_low=19.5 so hysteresis would keep heating;
+    # projection 19.0 + 20/60*5 = 20.67 >= 19.5 -> predictor releases.
+    freezer.tick(timedelta(minutes=10))  # past min_cycle window
+    hass.states.async_set(TEMP_ENTITY, "19.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.predicted_decision.action == ACTION_IDLE
+    assert coordinator.data.decision.action == ACTION_IDLE
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert any(c["hvac_mode"] == HVAC_MODE_FAN_ONLY for c in set_modes), set_modes
+    await coordinator.async_unload()
+
+
+async def test_predictor_heat_suppressed_by_same_mode_gate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Composition with v0.4 gate: an anticipated heat within the same-mode
+    min-cycle window after a prior heat must still be suppressed. The
+    cross-mode test covers the v0.5 gate; this locks in the v0.4 gate
+    behaviour against predictor-issued decisions."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+
+    # Fire a heat normally so last_action=heat with a recent last_action_at.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_HEAT
+
+    # 3 minutes later (still within default min_cycle_minutes=8): seed a
+    # steep idle drift so the predictor would anticipate heat -- but
+    # current_action=ACTION_HEAT so predictor's idle/startup branch doesn't
+    # fire. Hysteresis would say keep heating (room=19.0 < low). Predictor
+    # decision is also heat. Same-mode gate must suppress the re-issue.
+    climate_calls.clear()
+    freezer.tick(timedelta(minutes=3))
+    hass.states.async_set(TEMP_ENTITY, "19.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert set_modes == [], f"same-mode gate should suppress re-issue: {set_modes}"
+    await coordinator.async_unload()
+
+
+async def test_predictor_cool_suppressed_by_cross_mode_gate(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Composition with v0.5 gate: an anticipated cool after a recent heat
+    release must still be suppressed by the cross-mode min-cycle gate."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+
+    # Run a heat → idle cycle so previous_action=heating, last_action=idle
+    # and last_action_at sits just a few minutes ago (within the default
+    # cross_mode_min_minutes=8).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_HEAT
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    zone = coordinator._store.get_zone("office")
+    assert zone["previous_action"] == "heating"
+
+    # Now seed a steep UPWARD idle drift so the predictor wants to cool,
+    # and try a refresh within the 8-min dwell window.
+    climate_calls.clear()
+    freezer.tick(timedelta(minutes=3))
+    _seed_idle_drift(coordinator, start_temp=20.0, slope_per_h=10.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "22.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Predictor wants cool, but the v0.5 cross-mode gate must suppress it.
+    assert coordinator.data.predicted_decision.action == ACTION_COOL
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert all(c["hvac_mode"] != "cool" for c in set_modes), set_modes
+    await coordinator.async_unload()
+
+
+async def test_samples_accumulate_and_persist(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A series of refreshes (with action transitions and time between them)
+    should leave the rolling buffer populated and persisted to the store."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Refresh again >60s later with same temp -> rate-limit holds, same action.
+    freezer.tick(timedelta(seconds=90))
+    hass.states.async_set(TEMP_ENTITY, "18.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Transition to idle (different action) -- always recorded.
+    freezer.tick(timedelta(seconds=10))
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    persisted = coordinator._store.get_zone("office")["samples"]
+    assert len(persisted) >= 2  # at least the first heat sample + the idle transition
+    actions = {s["action"] for s in persisted}
+    assert "heating" in actions
+    assert "idle" in actions
+    await coordinator.async_unload()
+
+
+async def test_manual_climate_edit_flushes_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A climate state change that doesn't match our last command (and isn't
+    within the 30 s echo window) is treated as a manual edit -- flush samples
+    to prevent slope-estimator poisoning."""
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # Establish a baseline command + buffer.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(coordinator._samples_cache) >= 1
+    assert coordinator._last_command_state is not None
+
+    # Simulate a manual edit well outside the echo window: someone sets
+    # hvac_mode=cool externally while we last commanded heat.
+    freezer.tick(timedelta(minutes=10))
+    old_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5})
+    new_state = State(CLIMATE_ENTITY, "cool", {"temperature": 23.0})
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {"entity_id": CLIMATE_ENTITY, "old_state": old_state, "new_state": new_state},
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache == []
+    assert coordinator._store.get_zone("office")["samples"] == []
+    await coordinator.async_unload()
+
+
+async def test_same_action_sample_throttled_after_first_persist(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Locks in the SD-card-wear mitigation: a same-action sample within
+    SAMPLE_PERSIST_INTERVAL_S of the last persist must NOT touch the store.
+    The in-memory cache still grows, but flash writes are bounded."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # First refresh persists immediately (no prior persist).
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    first_persisted = coordinator._store.get_zone("office")["samples"]
+    assert len(first_persisted) >= 1
+    assert coordinator._last_sample_persist_at is not None
+    in_memory_after_first = len(coordinator._samples_cache)
+
+    # Tick 2 minutes (well inside SAMPLE_PERSIST_INTERVAL_S=300) and refresh
+    # with same temp range -> same action (heating) continues, no transition.
+    # In-memory cache should grow but the persisted samples should not.
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "18.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    second_persisted = coordinator._store.get_zone("office")["samples"]
+    assert second_persisted == first_persisted  # store unchanged
+    assert len(coordinator._samples_cache) > in_memory_after_first  # cache grew
+    await coordinator.async_unload()
+
+
+async def test_action_unknown_refresh_appends_no_sample(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """When the room sensor is unavailable, hysteresis returns ACTION_UNKNOWN
+    and `_maybe_apply_action` returns without issuing climate calls OR
+    appending a sample (no useful temp value to record). Locks in the early-
+    return at the top of the function so future refactors don't accidentally
+    start recording unknown-action samples."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # No state ever set for TEMP_ENTITY → room is None → ACTION_UNKNOWN.
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_UNKNOWN
+    assert _calls_for(climate_calls, "set_hvac_mode") == []
+    assert coordinator._samples_cache == []
+    await coordinator.async_unload()
+
+
+async def test_shadow_mode_still_records_samples(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """With enabled=False (shadow mode) the integration does not command
+    climate, but it must still record samples so the predictor's buffer is
+    populated when the user later flips `enabled=True`. Without this, every
+    new install would face a ~90-min cold-start after enabling."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    # NOTE: not calling _setup_enabled_zone — leaving enabled=False.
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # No climate calls (shadow mode), but the buffer should have grown.
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert set_modes == []
+    assert len(coordinator._samples_cache) >= 1
+    await coordinator.async_unload()
+
+
+async def test_climate_state_echo_does_not_flush(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """State changes within 30 s of our last command are echoes of our own
+    write -- update the baseline but do NOT flush samples."""
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    samples_before = list(coordinator._samples_cache)
+    assert len(samples_before) >= 1
+
+    # Echo arrives 2 s after our command (well inside the 30 s window).
+    freezer.tick(timedelta(seconds=2))
+    old_state = State(CLIMATE_ENTITY, "off", {"temperature": None})
+    new_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5})
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {"entity_id": CLIMATE_ENTITY, "old_state": old_state, "new_state": new_state},
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache == samples_before
     await coordinator.async_unload()

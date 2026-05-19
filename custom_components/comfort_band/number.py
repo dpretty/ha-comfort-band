@@ -1,11 +1,11 @@
 """Per-zone number entities.
 
-Seven tunables are exposed as `number.{zone}_<key>`. Two of them
+Eight tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other five (`override_hours`, `deadband_below`, `deadband_above`,
-`min_cycle_minutes`, `cross_mode_min_minutes`) are simple persisted
-tunables.
+The other six (`override_hours`, `deadband_below`, `deadband_above`,
+`min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`) are
+simple persisted tunables.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from homeassistant.const import UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, TEMP_MAX, TEMP_MIN, TEMP_STEP
+from .const import DOMAIN, LOOKAHEAD_MAX, LOOKAHEAD_MIN, TEMP_MAX, TEMP_MIN, TEMP_STEP
 from .coordinator import ZoneCoordinator
 from .entity import ComfortBandZoneEntity
 
@@ -93,6 +93,14 @@ _SPECS: tuple[_NumberSpec, ...] = (
         field="cross_mode_min_minutes",
         min_value=0,
         max_value=60,
+        step=1,
+        unit=UnitOfTime.MINUTES,
+    ),
+    _NumberSpec(
+        key="lookahead_minutes",
+        field="lookahead_minutes",
+        min_value=LOOKAHEAD_MIN,
+        max_value=LOOKAHEAD_MAX,
         step=1,
         unit=UnitOfTime.MINUTES,
     ),

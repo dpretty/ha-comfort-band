@@ -1,0 +1,636 @@
+"""Tests for the predictive controller (slope estimator + anticipatory startup/shutoff)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from custom_components.comfort_band.const import (
+    ACTION_COOL,
+    ACTION_HEAT,
+    ACTION_IDLE,
+    ACTION_UNKNOWN,
+    HVAC_MODE_COOL,
+    HVAC_MODE_FAN_ONLY,
+    HVAC_MODE_HEAT,
+    SAMPLE_MAX_COUNT,
+    SAMPLE_MIN_INTERVAL_S,
+    SAMPLE_WINDOW_MINUTES,
+    SLOPE_MIN_SAMPLES,
+)
+from custom_components.comfort_band.hysteresis import (
+    HysteresisDecision,
+    HysteresisInputs,
+    cool_decision,
+    heat_decision,
+    idle_decision,
+)
+from custom_components.comfort_band.predictor import (
+    Sample,
+    ThermalSlopes,
+    append_sample,
+    decide,
+    estimate_slopes,
+    load_samples,
+    project,
+    sample_from_dict,
+    sample_to_dict,
+)
+
+_T0 = datetime(2026, 5, 19, 12, 0, 0, tzinfo=UTC)
+
+
+def _samples_at(
+    interval_s: float, count: int, *, action: str, start_temp: float, slope_per_h: float
+) -> list[Sample]:
+    """Build a synthetic segment: `count` samples at `interval_s` apart with
+    a linear temperature trend, starting from `_T0`. `slope_per_h` is °C/h.
+    """
+    slope_per_minute = slope_per_h / 60.0
+    out: list[Sample] = []
+    for i in range(count):
+        t = _T0 + timedelta(seconds=interval_s * i)
+        temp = start_temp + slope_per_minute * (interval_s * i / 60.0)
+        out.append(Sample(t=t, temp=temp, action=action))
+    return out
+
+
+def _inputs(
+    room: float | None,
+    *,
+    low: float = 20.0,
+    high: float = 23.0,
+    db_below: float = 0.3,
+    db_above: float = 0.5,
+    current: str = ACTION_IDLE,
+) -> HysteresisInputs:
+    return HysteresisInputs(
+        room=room,
+        low=low,
+        high=high,
+        deadband_below=db_below,
+        deadband_above=db_above,
+        current_action=current,
+    )
+
+
+def _hyst_idle() -> HysteresisDecision:
+    return idle_decision()
+
+
+def _hyst_heat(low: float = 20.0) -> HysteresisDecision:
+    return heat_decision(low)
+
+
+def _hyst_cool(high: float = 23.0) -> HysteresisDecision:
+    return cool_decision(high)
+
+
+def _decide_from_samples(
+    samples: list[Sample],
+    inputs: HysteresisInputs,
+    *,
+    lookahead_minutes: int,
+    hysteresis_decision: HysteresisDecision,
+    now: datetime,
+) -> HysteresisDecision:
+    """Test convenience: estimate slopes from samples, then call decide().
+    Mirrors what the coordinator does (compute slopes once, feed in).
+    """
+    slopes = estimate_slopes(samples, now=now)
+    return decide(
+        slopes,
+        inputs,
+        lookahead_minutes=lookahead_minutes,
+        hysteresis_decision=hysteresis_decision,
+    )
+
+
+# ----- estimate_slopes -----
+
+
+def test_flat_line_yields_zero_slope() -> None:
+    samples = _samples_at(120, 10, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.idle is not None
+    assert abs(slopes.idle) < 1e-6
+    assert slopes.recovery_heat is None
+    assert slopes.recovery_cool is None
+
+
+def test_monotone_idle_drift_recovered() -> None:
+    # -0.5 °C/h over 30 min (16 samples at 120s) — should recover to within 0.01 °C/h.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.idle is not None
+    slope_per_hour = slopes.idle * 60.0
+    assert slope_per_hour == pytest.approx(-0.5, abs=0.01)
+
+
+def test_recovery_heat_slope_distinct_from_idle() -> None:
+    # +2.5 °C/h while heating — distinct from passive drift.
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=19.5, slope_per_h=2.5)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.recovery_heat is not None
+    assert slopes.recovery_heat * 60.0 == pytest.approx(2.5, abs=0.01)
+    assert slopes.idle is None
+    assert slopes.recovery_cool is None
+
+
+def test_segment_below_min_samples_yields_none() -> None:
+    samples = _samples_at(
+        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.5
+    )
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.idle is None
+
+
+def test_recency_weights_actually_weight() -> None:
+    # Build a clean linear drift, then perturb the OLDEST sample by +1 °C.
+    # Recency weighting (τ=20min) should make that bend less than 10% vs.
+    # perturbing the NEWEST sample.
+    base = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    base_slope = estimate_slopes(base, now=base[-1].t).idle
+    assert base_slope is not None
+
+    # Perturb oldest
+    perturb_old = list(base)
+    perturb_old[0] = Sample(t=base[0].t, temp=base[0].temp + 1.0, action=ACTION_IDLE)
+    slope_old = estimate_slopes(perturb_old, now=base[-1].t).idle
+    assert slope_old is not None
+
+    # Perturb newest
+    perturb_new = list(base)
+    perturb_new[-1] = Sample(t=base[-1].t, temp=base[-1].temp + 1.0, action=ACTION_IDLE)
+    slope_new = estimate_slopes(perturb_new, now=base[-1].t).idle
+    assert slope_new is not None
+
+    bend_old = abs(slope_old - base_slope)
+    bend_new = abs(slope_new - base_slope)
+    # Old sample's effect should be substantially smaller than new sample's. The
+    # exact ratio depends on weight-by-leverage interaction in the WLS denominator
+    # (purely-uniform weights would give ~1.0 by endpoint symmetry); 0.5 catches
+    # a regression where recency weighting was disabled.
+    assert bend_old < 0.5 * bend_new
+
+
+def test_segmenting_isolates_trailing_run() -> None:
+    # idle samples (drift -0.5 °C/h), then a heat run (+3 °C/h), then idle again.
+    idle_before = _samples_at(120, 6, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-0.5)
+    heat_start_temp = idle_before[-1].temp
+    heat_t0 = idle_before[-1].t + timedelta(seconds=120)
+    heat_run = []
+    for i in range(6):
+        t = heat_t0 + timedelta(seconds=120 * i)
+        heat_run.append(Sample(t=t, temp=heat_start_temp + 0.05 * i, action=ACTION_HEAT))
+    idle_after_t0 = heat_run[-1].t + timedelta(seconds=120)
+    idle_after = []
+    for i in range(6):
+        t = idle_after_t0 + timedelta(seconds=120 * i)
+        idle_after.append(Sample(t=t, temp=heat_run[-1].temp - 0.02 * i, action=ACTION_IDLE))
+    samples = idle_before + heat_run + idle_after
+
+    slopes = estimate_slopes(samples, now=idle_after[-1].t)
+    # Trailing idle run is `idle_after`, NOT `idle_before` — different slope.
+    assert slopes.idle is not None
+    # idle_after is -0.02 °C / 2min = -0.6 °C/h
+    assert slopes.idle * 60.0 == pytest.approx(-0.6, abs=0.05)
+    # Heat run captured separately.
+    assert slopes.recovery_heat is not None
+    assert slopes.recovery_heat > 0
+
+
+def test_singular_system_returns_none() -> None:
+    # All samples at the same timestamp — denominator collapses to 0.
+    samples = [Sample(t=_T0, temp=21.0 + 0.1 * i, action=ACTION_IDLE) for i in range(6)]
+    slopes = estimate_slopes(samples, now=_T0)
+    assert slopes.idle is None
+
+
+def test_last_updated_reflects_most_recent_sample() -> None:
+    samples = _samples_at(120, 5, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.last_updated == samples[-1].t
+    assert slopes.sample_count == 5
+
+
+def test_window_minutes_spans_buffer() -> None:
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    # 15 intervals of 120s = 1800s = 30min
+    assert slopes.window_minutes == 30.0
+
+
+# ----- project -----
+
+
+def test_project_linear() -> None:
+    assert project(20.0, 0.05, 5) == pytest.approx(20.25)
+
+
+def test_project_none_slope_returns_none() -> None:
+    assert project(20.0, None, 5) is None
+
+
+# ----- ThermalSlopes.for_action -----
+
+
+def test_for_action_dispatch() -> None:
+    s = ThermalSlopes(
+        idle=0.001,
+        recovery_heat=0.05,
+        recovery_cool=-0.05,
+        sample_count=16,
+        window_minutes=30.0,
+        last_updated=_T0,
+    )
+    assert s.for_action(ACTION_HEAT) == 0.05
+    assert s.for_action(ACTION_COOL) == -0.05
+    assert s.for_action(ACTION_IDLE) == 0.001
+    # Fallback to idle for any unrecognised / None action -- the sensor calls
+    # this with zone["last_action"] which is None on fresh zones.
+    assert s.for_action(None) == 0.001
+    assert s.for_action(ACTION_UNKNOWN) == 0.001
+
+
+# ----- decide: startup -----
+
+
+def test_startup_heat_when_steep_idle_drift_down() -> None:
+    # Room at 20.4 (inside band), idle slope -3 °C/h, lookahead 5 min.
+    # Projection: 20.4 + (-3/60)*5 = 20.4 - 0.25 = 20.15 < (low - db_below = 19.7).
+    # Wait: 20.15 > 19.7. Need steeper drift.
+    # -6 °C/h → 20.4 - 0.5 = 19.9 > 19.7. Still no.
+    # -10 °C/h → 20.4 - 0.833 = 19.57 < 19.7. Triggers.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0)
+    # Build inputs with the *current* room being just slightly below the start_temp so it's
+    # inside the band but the projection drops below the deadband edge.
+    inputs = _inputs(20.4, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_HEAT
+    assert decision.target_mode == HVAC_MODE_HEAT
+    assert decision.target_temp == 20.0
+
+
+def test_startup_cool_when_steep_idle_drift_up() -> None:
+    # Hysteresis would say idle (22.8 < 23.5 deadband entry); predictor fires
+    # cool because projection 22.8 + 10/60*5 = 23.63 crosses the deadband.
+    from custom_components.comfort_band.hysteresis import decide as hysteresis_decide
+
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=10.0)
+    inputs = _inputs(22.8, current=ACTION_IDLE)
+    assert hysteresis_decide(inputs).action == ACTION_IDLE  # predictor must fire earlier
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_COOL
+    assert decision.target_mode == HVAC_MODE_COOL
+    assert decision.target_temp == 23.0
+
+
+def test_startup_falls_through_when_slope_flat() -> None:
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    inputs = _inputs(21.0, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_idle()
+
+
+def test_startup_falls_through_when_projection_inside_deadband() -> None:
+    # Drift -3 °C/h, room at 21.5, projection: 21.5 - 0.25 = 21.25 > 19.7. No trigger.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-3.0)
+    inputs = _inputs(21.5, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_idle()
+
+
+def test_startup_works_when_current_action_unknown() -> None:
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0)
+    inputs = _inputs(20.4, current=ACTION_UNKNOWN)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_HEAT
+
+
+def test_startup_cool_works_when_current_action_unknown() -> None:
+    # Symmetric to the heat case: ACTION_UNKNOWN routes through the same
+    # idle/unknown branch, so cool startup must fire too.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=10.0)
+    inputs = _inputs(22.8, current=ACTION_UNKNOWN)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_COOL
+
+
+# ----- decide: shutoff -----
+
+
+def test_shutoff_release_idle_when_heat_overshoot_predicted() -> None:
+    # Heating, room below low. Hysteresis would say "keep heating" (room < low).
+    # Predictor anticipates: room=19.0, slope +15 °C/h, lookahead 5min ->
+    # projected = 19.0 + 15/60*5 = 20.25 >= low (20.0). Release idle now so
+    # the room peaks at low instead of overshooting past it. This is the
+    # whole point of anticipatory shutoff: it must fire *before* hysteresis
+    # would release.
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=18.0, slope_per_h=15.0)
+    inputs = _inputs(19.0, current=ACTION_HEAT)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+    assert decision.target_mode == HVAC_MODE_FAN_ONLY
+    assert decision.target_temp is None
+
+
+def test_shutoff_release_idle_when_cool_undershoot_predicted() -> None:
+    # Symmetric to the heat test: cooling, room still above high. Hysteresis
+    # would keep cooling (room > high). Predictor: 24.0 + (-15/60)*5 = 22.75
+    # <= high (23.0). Release now so the room peaks at high, not below it.
+    from custom_components.comfort_band.hysteresis import decide as hysteresis_decide
+
+    samples = _samples_at(120, 10, action=ACTION_COOL, start_temp=25.0, slope_per_h=-15.0)
+    inputs = _inputs(24.0, current=ACTION_COOL)
+    assert hysteresis_decide(inputs).action == ACTION_COOL  # predictor must fire earlier
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_cool(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+
+
+def test_shutoff_falls_through_when_slope_shallow() -> None:
+    # Heating with shallow slope -- projection won't reach low in lookahead.
+    # room=18.0, slope 0.5 °C/h, lookahead 5min -> projected = 18.04 << 20.
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=18.0, slope_per_h=0.5)
+    inputs = _inputs(18.0, current=ACTION_HEAT)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_shutoff_falls_through_when_heat_slope_negative() -> None:
+    # Pathological: action is heat but temp is dropping (e.g., HVAC not
+    # responding). The shutoff predicate requires `recovery_heat > epsilon`;
+    # a negative slope must fall through.
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=22.0, slope_per_h=-1.0)
+    inputs = _inputs(19.5, current=ACTION_HEAT)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_heat()
+
+
+def test_shutoff_falls_through_when_cool_slope_positive() -> None:
+    # Symmetric: cool action but temp is rising. Must fall through.
+    samples = _samples_at(120, 10, action=ACTION_COOL, start_temp=21.0, slope_per_h=+1.0)
+    inputs = _inputs(24.0, current=ACTION_COOL)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_cool(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_cool()
+
+
+def test_shutoff_releases_before_hysteresis_would() -> None:
+    # The crucial behavioural claim: predictor fires the release BEFORE
+    # hysteresis would (i.e., when room is still below `low`). Without this
+    # test we could ship a "shutoff" branch that only ever agrees with
+    # hysteresis's own release decision, which is not anticipation at all.
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=18.0, slope_per_h=20.0)
+    inputs = _inputs(19.5, current=ACTION_HEAT)  # still below low=20 -> hysteresis would heat
+    # Hysteresis on these inputs would return heat (room < low).
+    from custom_components.comfort_band.hysteresis import decide as hysteresis_decide
+
+    hyst = hysteresis_decide(inputs)
+    assert hyst.action == ACTION_HEAT
+    # Predictor: projection = 19.5 + 20/60*5 = 21.17 >= 20 -> idle.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=hyst,
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+
+
+# ----- decide: fall-through -----
+
+
+def test_falls_through_when_buffer_empty() -> None:
+    inputs = _inputs(21.0, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        [],
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=_T0,
+    )
+    assert decision == _hyst_idle()
+
+
+def test_falls_through_when_segment_too_short() -> None:
+    samples = _samples_at(
+        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0
+    )
+    inputs = _inputs(20.4, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision == _hyst_idle()
+
+
+def test_unknown_decision_when_room_is_none() -> None:
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    decision = _decide_from_samples(
+        samples,
+        _inputs(None, current=ACTION_IDLE),
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_UNKNOWN
+    assert decision.target_mode is None
+
+
+# ----- append_sample -----
+
+
+def test_append_sample_first_always_appends() -> None:
+    new, appended = append_sample([], now=_T0, temp=21.0, action=ACTION_IDLE)
+    assert appended is True
+    assert len(new) == 1
+    assert new[0] == Sample(t=_T0, temp=21.0, action=ACTION_IDLE)
+
+
+def test_append_sample_rate_limited_same_action() -> None:
+    samples = [Sample(t=_T0, temp=21.0, action=ACTION_IDLE)]
+    next_t = _T0 + timedelta(seconds=SAMPLE_MIN_INTERVAL_S - 1)
+    new, appended = append_sample(samples, now=next_t, temp=21.1, action=ACTION_IDLE)
+    assert appended is False
+    assert new is samples  # same reference -- not even copied
+
+
+def test_append_sample_accepts_action_transition_within_rate_limit() -> None:
+    samples = [Sample(t=_T0, temp=21.0, action=ACTION_IDLE)]
+    next_t = _T0 + timedelta(seconds=10)
+    new, appended = append_sample(samples, now=next_t, temp=20.0, action=ACTION_HEAT)
+    assert appended is True
+    assert new[-1].action == ACTION_HEAT
+
+
+def test_append_sample_prunes_old_samples() -> None:
+    old = Sample(t=_T0, temp=20.0, action=ACTION_IDLE)
+    recent_t = _T0 + timedelta(minutes=SAMPLE_WINDOW_MINUTES + 5)
+    new, appended = append_sample([old], now=recent_t, temp=21.0, action=ACTION_IDLE)
+    assert appended is True
+    assert old not in new
+    assert len(new) == 1
+
+
+def test_append_sample_count_cap() -> None:
+    # Build a buffer beyond the cap, then append — expect cap enforcement.
+    samples = [
+        Sample(t=_T0 + timedelta(seconds=i), temp=21.0, action=ACTION_IDLE)
+        for i in range(SAMPLE_MAX_COUNT + 5)
+    ]
+    next_t = _T0 + timedelta(seconds=SAMPLE_MAX_COUNT + 5 + SAMPLE_MIN_INTERVAL_S)
+    new, appended = append_sample(samples, now=next_t, temp=21.0, action=ACTION_HEAT)
+    assert appended is True
+    assert len(new) == SAMPLE_MAX_COUNT
+
+
+# ----- serialization -----
+
+
+def test_sample_roundtrip() -> None:
+    s = Sample(t=_T0, temp=21.5, action=ACTION_HEAT)
+    restored = sample_from_dict(sample_to_dict(s))
+    assert restored == s
+
+
+def test_sample_from_dict_returns_none_on_corrupt_timestamp() -> None:
+    bad = {"t": "not a real timestamp", "temp": 21.0, "action": ACTION_IDLE}
+    assert sample_from_dict(bad) is None  # type: ignore[arg-type]
+
+
+def test_sample_from_dict_returns_none_on_naive_timestamp() -> None:
+    # `datetime.fromisoformat` parses naive timestamps (no tzinfo) as valid,
+    # but later WLS arithmetic `(now - sample.t)` would TypeError on
+    # naive-minus-aware. The explicit tzinfo guard prevents that.
+    bad = {"t": "2026-05-19T12:00:00", "temp": 21.0, "action": ACTION_IDLE}
+    assert sample_from_dict(bad) is None  # type: ignore[arg-type]
+
+
+def test_sample_from_dict_returns_none_on_non_numeric_temp() -> None:
+    # Hand-edited or corrupt `.storage` could yield a string/null `temp`;
+    # the predictor would crash on the first arithmetic op without this guard.
+    bad_string = {"t": _T0.isoformat(), "temp": "warm", "action": ACTION_IDLE}
+    bad_none = {"t": _T0.isoformat(), "temp": None, "action": ACTION_IDLE}
+    assert sample_from_dict(bad_string) is None  # type: ignore[arg-type]
+    assert sample_from_dict(bad_none) is None  # type: ignore[arg-type]
+
+
+def test_sample_from_dict_returns_none_on_nan_or_inf_temp() -> None:
+    # `float()` accepts "nan"/"inf" strings as well as float-NaN, which would
+    # otherwise poison the slope (NaN-propagation through WLS, sensor renders
+    # "nan" instead of "unknown"). All forms must be rejected at the boundary.
+    for bad in (float("nan"), float("inf"), float("-inf"), "nan", "inf"):
+        d = {"t": _T0.isoformat(), "temp": bad, "action": ACTION_IDLE}
+        assert sample_from_dict(d) is None, f"should reject temp={bad!r}"  # type: ignore[arg-type]
+
+
+def test_sample_from_dict_returns_none_on_missing_keys() -> None:
+    # A partially-written `.storage` entry can be missing any field. Without
+    # the KeyError guard, the resulting crash propagates up to async_setup
+    # and fails the whole config entry on what may be a single bad row.
+    assert sample_from_dict({"temp": 21.0, "action": ACTION_IDLE}) is None  # type: ignore[typeddict-item]
+    assert sample_from_dict({"t": _T0.isoformat(), "action": ACTION_IDLE}) is None  # type: ignore[typeddict-item]
+    assert sample_from_dict({"t": _T0.isoformat(), "temp": 21.0}) is None  # type: ignore[typeddict-item]
+    # Action present but wrong type (a future schema bug, or a hand-edit).
+    bad_action = {"t": _T0.isoformat(), "temp": 21.0, "action": 42}
+    assert sample_from_dict(bad_action) is None  # type: ignore[typeddict-item]
+
+
+def test_load_samples_drops_corrupt_entries() -> None:
+    good = sample_to_dict(Sample(t=_T0, temp=21.0, action=ACTION_IDLE))
+    bad = {"t": "bogus", "temp": 22.0, "action": ACTION_HEAT}
+    out = load_samples([good, bad, good])  # type: ignore[list-item]
+    assert len(out) == 2
+    assert all(s.action == ACTION_IDLE for s in out)
+
+
+# ----- epsilon boundary -----
+
+
+def test_startup_slope_at_epsilon_treated_as_flat() -> None:
+    # Build samples that yield a slope just at +epsilon (0.05 °C/h).
+    # The predicate is strict `> epsilon`, so we should fall through.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.5, slope_per_h=0.05)
+    inputs = _inputs(22.5, current=ACTION_IDLE)
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_idle(),
+        now=samples[-1].t,
+    )
+    # Floating-point: the recovered slope may be slightly above or below 0.05.
+    # Either way, with such a flat slope the projection (22.5 + 0.05/60*5 = 22.504)
+    # is nowhere near (high + deadband_above = 23.5), so the predicate fails.
+    assert decision == _hyst_idle()

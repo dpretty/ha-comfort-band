@@ -116,6 +116,82 @@ class CurrentActionSensor(ComfortBandZoneEntity, SensorEntity):
         return self.coordinator.data.decision.action
 
 
+class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
+    """Current learned thermal-response slope (°C/h, signed).
+
+    The state value is whichever per-action slope matches the zone's
+    *previously committed* `last_action` (idle when last_action is
+    idle/unknown). It lags the current refresh's decision by one cycle
+    because `last_action` is updated by `_maybe_apply_action` running as
+    a follow-up task -- after the snapshot the sensor reads. The lag is
+    intentional: the displayed slope corresponds to the action that
+    actually accumulated samples, not the one we just decided to take.
+
+    The per-action slopes (idle, recovery_heat, recovery_cool) plus buffer
+    bookkeeping are exposed via attributes for the card / debugging.
+
+    Returns None (HA "unknown") when the relevant segment has fewer than
+    SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
+    first ~5-10 min after install/restart is expected to be unknown.
+    """
+
+    # HA has no constant for °C/h (no device class covers rate quantities);
+    # the bare-string unit is the accepted pattern. Don't try to "fix" with
+    # a nonexistent UnitOfTemperature.CELSIUS_PER_HOUR -- it doesn't exist.
+    _attr_native_unit_of_measurement = "°C/h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "thermal_slope")
+
+    @property
+    def native_value(self) -> float | None:
+        slopes = self.coordinator.data.thermal_slopes
+        last_action = self.coordinator.data.zone["last_action"]
+        current = slopes.for_action(last_action)
+        return None if current is None else round(current * 60.0, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, float | int | str | None]:
+        s = self.coordinator.data.thermal_slopes
+        return {
+            "idle_slope": None if s.idle is None else round(s.idle * 60.0, 3),
+            "recovery_slope_heat": (
+                None if s.recovery_heat is None else round(s.recovery_heat * 60.0, 3)
+            ),
+            "recovery_slope_cool": (
+                None if s.recovery_cool is None else round(s.recovery_cool * 60.0, 3)
+            ),
+            "sample_count": s.sample_count,
+            "window_minutes": s.window_minutes,
+            "last_updated": None if s.last_updated is None else s.last_updated.isoformat(),
+        }
+
+
+class PredictedActionSensor(ComfortBandZoneEntity, SensorEntity):
+    """What the predictor would issue right now (always populated, regardless
+    of learning_enabled). Lets users shadow-compare against `current_action`
+    before flipping the learning switch on.
+
+    Marked DIAGNOSTIC because it's a debug/shadow signal, not the primary
+    "what's the HVAC doing" state (`current_action` plays that role and is
+    NOT diagnostic). Users opted into predictive control will see this
+    sensor under "Diagnostic" on the device card.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "predicted_action")
+        self._attr_options = [ACTION_HEAT, ACTION_COOL, ACTION_IDLE, ACTION_UNKNOWN]
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.data.predicted_decision.action
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -128,5 +204,7 @@ async def async_setup_entry(
             ApparentTemperatureSensor(coordinator),
             OverrideEndsSensor(coordinator),
             CurrentActionSensor(coordinator),
+            ThermalSlopeSensor(coordinator),
+            PredictedActionSensor(coordinator),
         ]
     )

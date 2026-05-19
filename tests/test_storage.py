@@ -42,6 +42,9 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["override_hours"] == 3
     assert zone["manual_low"] < zone["manual_high"]
     assert zone["schedules"] == {}
+    # v0.6 predictive control defaults: empty buffer, conservative horizon.
+    assert zone["samples"] == []
+    assert zone["lookahead_minutes"] == 5
 
 
 # ----- round-trip persistence -----
@@ -527,6 +530,95 @@ async def test_load_legacy_v0_4_zone_backfills_cross_mode_from_min_cycle(
     # And update_zone now works on the new field without KeyError.
     await store.async_update_zone("office", cross_mode_min_minutes=15)
     assert store.get_zone("office")["cross_mode_min_minutes"] == 15
+
+
+async def test_load_legacy_v0_5_zone_backfills_predictive_fields(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A v0.5 zone payload (has cross_mode_min_minutes / previous_action but
+    no `samples` / `lookahead_minutes`) must backfill both for the v0.6
+    predictive controller. Samples start empty (warms up over ~90 min);
+    lookahead seeds to the conservative default."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "cross_mode_min_minutes": 8,
+                    "previous_action": None,
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    # NB: no samples / lookahead_minutes.
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    zone = store.get_zone("office")
+    assert zone["samples"] == []
+    assert zone["lookahead_minutes"] == 5
+    # And update_zone now works on the new fields without KeyError.
+    await store.async_update_zone("office", lookahead_minutes=10)
+    assert store.get_zone("office")["lookahead_minutes"] == 10
+
+
+async def test_samples_persist_across_store_instances(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """The rolling sample buffer must survive a restart — that's the whole
+    point of putting it in StoredZone. Write some samples, re-instantiate
+    the store, read back."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    seeded = [
+        {"t": "2026-05-19T12:00:00+00:00", "temp": 21.0, "action": "idle"},
+        {"t": "2026-05-19T12:02:00+00:00", "temp": 21.1, "action": "idle"},
+    ]
+    await first.async_update_zone("office", samples=seeded)
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["samples"] == seeded
+
+
+async def test_zone_samples_deep_copy_isolation(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Mutating the returned samples list must not poison in-memory state."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    seeded = [{"t": "2026-05-19T12:00:00+00:00", "temp": 21.0, "action": "idle"}]
+    await store.async_update_zone("office", samples=seeded)
+
+    zone = store.get_zone("office")
+    zone["samples"].append({"t": "bogus", "temp": 99.0, "action": "heating"})
+    zone["samples"][0]["temp"] = -42.0
+
+    fresh = store.get_zone("office")
+    assert len(fresh["samples"]) == 1
+    assert fresh["samples"][0]["temp"] == 21.0
 
 
 async def test_clone_profile_without_source_schedule_creates_empty_target(
