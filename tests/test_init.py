@@ -20,6 +20,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "number.office_minimum_cycle_minutes",
     "number.office_cross_mode_minimum_minutes",
     "number.office_lookahead_minutes",
+    "number.office_passive_tolerance",
     "sensor.office_effective_low",
     "sensor.office_effective_high",
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror

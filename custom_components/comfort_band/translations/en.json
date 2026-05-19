@@ -78,6 +78,9 @@
       },
       "lookahead_minutes": {
         "name": "Lookahead minutes"
+      },
+      "passive_tolerance": {
+        "name": "Passive tolerance"
       }
     },
     "select": {

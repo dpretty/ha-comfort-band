@@ -68,6 +68,21 @@ SLOPE_MIN_SAMPLES: Final = 4
 SLOPE_WEIGHT_TAU_MINUTES: Final = 20.0
 SLOPE_EPSILON_PER_HOUR: Final = 0.05
 
+# Passive drift acceptance (v0.7+). When hysteresis would fire heat / cool
+# because the room has crossed the deadband, but the predictor's slope says
+# we'll return to band within `lookahead_minutes`, the predictor stays idle.
+# Two guards apply:
+#   - the forecast must move the room by at least
+#     PASSIVE_FORECAST_MOVEMENT_MIN_C toward the band (defends against
+#     false-positive suppression on sensor jitter, where a barely-non-flat
+#     slope would otherwise look like "recovery in progress"); and
+#   - the room must be within `passive_tolerance` °C of the band edge
+#     (per-zone comfort floor, surfaced as a `number` entity; 0 disables).
+PASSIVE_FORECAST_MOVEMENT_MIN_C: Final = 0.1
+DEFAULT_PASSIVE_TOLERANCE_C: Final = 0.5
+PASSIVE_TOLERANCE_MIN: Final = 0.0
+PASSIVE_TOLERANCE_MAX: Final = 2.0
+
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0
 TEMP_MAX: Final = 26.0

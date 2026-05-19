@@ -40,6 +40,7 @@ from .const import (
     DEFAULT_LOOKAHEAD_MINUTES,
     DEFAULT_MIN_CYCLE_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
+    DEFAULT_PASSIVE_TOLERANCE_C,
     DEFAULT_PROFILE,
     MAX_PROFILES,
     SIGNAL_ZONE_SCHEDULE_CHANGED,
@@ -100,6 +101,14 @@ class StoredZone(TypedDict):
     # Horizon over which the predictor projects the current slope forward.
     # Exposed as `number.{zone}_lookahead_minutes`. Default 5; range [2, 15].
     lookahead_minutes: int
+    # Comfort floor for the v0.7 passive drift acceptance. When the room is
+    # outside the band but the predictor's slope says we'll return within
+    # `lookahead_minutes`, the predictor suppresses heat / cool -- but only
+    # while the deviation is within `passive_tolerance` °C of the band edge.
+    # 0.0 disables the feature (predictor always defers to hysteresis when
+    # the room is already outside the band). Exposed as
+    # `number.{zone}_passive_tolerance`. Default 0.5; range [0.0, 2.0].
+    passive_tolerance: float
     enabled: bool
     # Gates the v0.6 predictive controller: when ON, `predictor.decide()`'s
     # anticipated action replaces `hysteresis.decide()`'s reactive one as the
@@ -164,6 +173,7 @@ def _default_zone(zone_name: str) -> StoredZone:
         "previous_action": None,
         "samples": [],
         "lookahead_minutes": DEFAULT_LOOKAHEAD_MINUTES,
+        "passive_tolerance": DEFAULT_PASSIVE_TOLERANCE_C,
         "enabled": False,
         "learning_enabled": False,
         "use_apparent_temperature": False,
@@ -220,7 +230,7 @@ class ComfortBandStore:
             migrated = True
         # Per-zone backfill: every new field added since v0.3 gets a safe
         # default if absent. Each `if "field" not in zone` branch is
-        # independent so a single load can migrate v0.3 → v0.6 in one pass.
+        # independent so a single load can migrate v0.3 → v0.7 in one pass.
         #
         # STORAGE_VERSION intentionally stays at 1: field additions with
         # safe defaults are forward-compatible (old payload + missing
@@ -255,6 +265,13 @@ class ComfortBandStore:
                 migrated = True
             if "lookahead_minutes" not in zone:
                 zone["lookahead_minutes"] = DEFAULT_LOOKAHEAD_MINUTES
+                migrated = True
+            # v0.6 → v0.7: passive drift acceptance. Conservative 0.5 °C floor
+            # so first-ship behaviour suppresses only marginal hysteresis trips;
+            # users can widen via `number.{zone}_passive_tolerance` or disable
+            # by setting it to 0.
+            if "passive_tolerance" not in zone:
+                zone["passive_tolerance"] = DEFAULT_PASSIVE_TOLERANCE_C
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)
