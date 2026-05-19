@@ -10,9 +10,11 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.5.0.** Adds **cross-mode min-cycle dwell** to suppress rapid `heat ↔ cool` mode flips ([#16](https://github.com/dpretty/ha-comfort-band/issues/16)). New per-zone `number.{zone}_cross_mode_min_minutes` defaults to the zone's current `min_cycle_minutes` (8 by default) — `heat → cool` and `cool → heat` transitions now wait that many minutes after the last action. Idle releases (`heat → idle`, `cool → idle`) still fire immediately so a heat or cool cycle can always stop. **Behaviour change for existing users:** mode flips previously fired instantly; set the new entity to `0` to restore that.
+**v0.6.0.** Adds **predictive control via a learned thermal slope** ([#11](https://github.com/dpretty/ha-comfort-band/issues/11)). Per-zone rolling-window slope estimator (segmented by HVAC action) projects room temperature forward by `lookahead_minutes` (default 5) and triggers heat/cool earlier when an idle drift will cross the deadband, or releases earlier when a recovery rate will overshoot the band. Three new entities per zone: `sensor.{zone}_thermal_slope` (°C/h with per-action slopes in attributes), `sensor.{zone}_predicted_action` (always populated for shadow-comparison against `current_action`), `number.{zone}_lookahead_minutes` (range 2-15). Gated by the existing `switch.{zone}_learning_enabled` — default OFF, so behaviour is unchanged unless you flip the switch. v0.5 cross-mode gate still applies on top of predictor decisions. A manual edit to the climate entity (outside our path) flushes the sample buffer so the slope estimator stays honest.
 
-**v0.4.0** added apparent-temperature support: a per-zone optional **humidity sensor** (configurable via ConfigFlow or a new OptionsFlow on existing zones), a new `sensor.{zone}_apparent_temperature` (Steadman 1994 simplified; equals room temp when no humidity is configured), and a per-zone `switch.{zone}_use_apparent_temperature` toggle that feeds the apparent value into hysteresis decisions instead of the raw room reading. Decisions fall back to the raw reading automatically when the humidity sensor is unavailable. Also adds `switch.{zone}_learning_enabled` — a master gate for the v0.4+ learning cluster (#9, #11); no decision effect today but the storage field is wired so future PRs read it directly.
+**v0.5.0** added **cross-mode min-cycle dwell** to suppress rapid `heat ↔ cool` mode flips ([#16](https://github.com/dpretty/ha-comfort-band/issues/16)). New per-zone `number.{zone}_cross_mode_min_minutes` defaults to the zone's current `min_cycle_minutes` (8 by default) — `heat → cool` and `cool → heat` transitions now wait that many minutes after the last action. Idle releases (`heat → idle`, `cool → idle`) still fire immediately so a heat or cool cycle can always stop. **Behaviour change for existing users:** mode flips previously fired instantly; set the new entity to `0` to restore that.
+
+**v0.4.0** added apparent-temperature support: a per-zone optional **humidity sensor** (configurable via ConfigFlow or a new OptionsFlow on existing zones), a new `sensor.{zone}_apparent_temperature` (Steadman 1994 simplified; equals room temp when no humidity is configured), and a per-zone `switch.{zone}_use_apparent_temperature` toggle that feeds the apparent value into hysteresis decisions instead of the raw room reading. Decisions fall back to the raw reading automatically when the humidity sensor is unavailable. Also adds `switch.{zone}_learning_enabled` — a master gate for the v0.4+ learning cluster (#9, #11); no decision effect at the v0.4.0 release (v0.6.0 activated it for predictive control).
 
 **v0.3.0** added full profile CRUD: four new services (`create_profile`, `clone_profile`, `rename_profile`, `delete_profile`) and a new `SIGNAL_PROFILE_LIST_CHANGED` dispatcher signal so the singleton select entity (and any subscribed cards) re-render on every profile mutation. The `default_profile` is now tracked per-store and survives renames — whatever profile holds that role cannot be deleted. Built-in profiles narrowed from `home / away / sleep` to **`home` + `away`**; existing installs keep any `sleep` profile they had as a normal user profile that can now be renamed or deleted.
 
@@ -46,19 +48,40 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | Platform | Entity | Notes |
 |---|---|---|
 | `number` | `manual_low`, `manual_high` | UI writes start an override |
-| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes` | Tunables |
+| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes` | Tunables |
 | `sensor` | `effective_low`, `effective_high` | Active band (override or schedule) |
 | `sensor` | `room_temperature` | Diagnostic mirror of the source sensor. Carries `humidity_sensor` (the configured entity_id, or null) as a state attribute. |
 | `sensor` | `apparent_temperature` | Steadman 1994 "feels like". Equals room temp when no humidity sensor is configured. |
 | `sensor` | `override_ends` | Timestamp; null when no override |
 | `sensor` | `current_action` | `heating` / `cooling` / `idle` / `unknown` |
+| `sensor` | `thermal_slope` | Current learned slope (°C/h). Attributes: `idle_slope`, `recovery_slope_heat`, `recovery_slope_cool`, `sample_count`, `window_minutes`, `last_updated`. None for the first ~5-10 min after install/restart. |
+| `sensor` | `predicted_action` | What the predictor would issue right now. Always populated; flip `learning_enabled` ON to forward to climate. |
 | `binary_sensor` | `override_active` | True while override is in effect |
 | `button` | `cancel_override` | Press to immediately end an override |
 | `switch` | `enabled` | Master kill — defaults OFF (shadow mode) |
-| `switch` | `learning_enabled` | Gate for the v0.4+ learning cluster (auto-nudges, predictive control). Default OFF; no effect today. |
+| `switch` | `learning_enabled` | Gates the v0.6 predictive controller. When ON, anticipated heat/cool decisions reach climate (subject to existing min-cycle and cross-mode gates). Anticipated idle releases bypass those gates so a cycle can always stop — same contract as v0.5. Default OFF. |
 | `switch` | `use_apparent_temperature` | When ON, hysteresis decisions use the apparent value instead of the raw room reading. Falls back to room temp automatically if humidity is unavailable. Default OFF. |
 
 Plus one global entity: `select.comfort_band_profiles_active_profile`.
+
+## Predictive control (v0.6)
+
+Each refresh, the integration appends a `(timestamp, decision_room, action)` sample to a per-zone rolling buffer (90 min, rate-limited to one sample per 60 s, persisted across restarts). It then computes three slopes via weighted least-squares regression with exponential recency weights (`τ = 20 min`):
+
+- **`idle_slope`** — passive drift while idle (the room cooling overnight, warming in the sun).
+- **`recovery_slope_heat`** — how fast the room rises while heat is running.
+- **`recovery_slope_cool`** — how fast the room falls while cool is running.
+
+When `switch.{zone}_learning_enabled` is ON, the predictor projects `decision_room + slope × lookahead_minutes` forward (where `decision_room` is the apparent temperature when `use_apparent_temperature` is ON, otherwise the raw room reading) and:
+
+- **Anticipates startup**: while idle, if the projection crosses the deadband edge (`low - deadband_below` or `high + deadband_above`), it triggers heat / cool *now* instead of waiting.
+- **Anticipates shutoff**: while heating or cooling, if the projection overshoots the band edge (`high` or `low`), it releases to idle *now* so the room peaks at the edge instead of past it.
+
+`sensor.{zone}_predicted_action` is populated *regardless* of `learning_enabled`, so you can shadow-compare against `sensor.{zone}_current_action` before flipping the switch on. Tune `number.{zone}_lookahead_minutes` (default 5, range 2-15): higher values trigger heat/cool sooner — useful for slow-responding systems (underfloor heating, large rooms) where temperature reacts to commands several minutes after the fact. Lower values are appropriate for fast-responding mini-splits, or if you find the predictor over-eager.
+
+Existing gates still apply on top: predictor-anticipated heat is still subject to `min_cycle_minutes`, and predictor-anticipated heat↔cool flips are still subject to `cross_mode_min_minutes`.
+
+**Known limitation:** if you manually change `hvac_mode` or `target_temp` on the climate entity (outside Comfort Band), the integration logs an INFO message and flushes the sample buffer — the slope estimator needs ~90 min of contiguous data to re-converge. Setting it back via a Comfort Band number entity is fine; the buffer is only flushed on external state changes.
 
 ### Profile manager entity attributes
 

@@ -33,6 +33,41 @@ DEFAULT_MIN_CYCLE_MINUTES: Final = 8
 DEFAULT_CROSS_MODE_MIN_MINUTES: Final = DEFAULT_MIN_CYCLE_MINUTES
 DEFAULT_OVERRIDE_HOURS: Final = 3
 
+# Predictive control (v0.6+): per-zone rolling-window thermal-slope estimator.
+# `lookahead_minutes` is the horizon over which the predictor projects the
+# current slope forward; conservative starting point matched to typical
+# HVAC time-to-effect.
+DEFAULT_LOOKAHEAD_MINUTES: Final = 5
+LOOKAHEAD_MIN: Final = 2
+LOOKAHEAD_MAX: Final = 15
+
+# Sample buffer: time-based cap, rate-limit for like-actioned appends, and a
+# count cap as defence-in-depth against clock skew filling the buffer.
+SAMPLE_WINDOW_MINUTES: Final = 90
+SAMPLE_MIN_INTERVAL_S: Final = 60
+SAMPLE_MAX_COUNT: Final = 200
+
+# How often the coordinator persists the in-memory sample buffer. The buffer
+# is appended ~1/min (SAMPLE_MIN_INTERVAL_S), but writing the whole sample
+# list to .storage every minute would amplify flash wear on SD-card-backed
+# HA installs (the majority on Pi / HAOS). Action transitions always persist
+# immediately (they are segment boundaries the slope estimator relies on);
+# same-action samples persist at most once per SAMPLE_PERSIST_INTERVAL_S.
+SAMPLE_PERSIST_INTERVAL_S: Final = 300
+
+# How long after our own `climate.set_*` calls we ignore observed climate
+# state changes. set_hvac_mode + set_temperature are two sequential awaits
+# and a slow climate (cloud-backed, mesh-routed, etc.) can take many seconds
+# to acknowledge the second one -- the listener needs to absorb both echoes.
+CLIMATE_ECHO_WINDOW_S: Final = 30
+
+# Slope estimator: minimum samples per segment before WLS produces a slope;
+# exponential recency weight time constant; epsilon below which a slope is
+# treated as "flat" (predictor falls through to hysteresis).
+SLOPE_MIN_SAMPLES: Final = 4
+SLOPE_WEIGHT_TAU_MINUTES: Final = 20.0
+SLOPE_EPSILON_PER_HOUR: Final = 0.05
+
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0
 TEMP_MAX: Final = 26.0
