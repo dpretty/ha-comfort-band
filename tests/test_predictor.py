@@ -521,11 +521,14 @@ def test_passive_falls_through_when_slope_wrong_sign() -> None:
 
 
 def test_passive_falls_through_when_projection_does_not_reach_band() -> None:
-    # Slope is positive but too shallow: projection still below low.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=1.0)
-    inputs = _inputs(19.0, current=ACTION_IDLE)  # within tolerance, but...
-    # Projection: 19.0 + 1/60*5 = 19.083 < low (20). Predictor can't promise
-    # we'll be back in band by then -- defer to hysteresis.
+    # Isolates the projection guard. Room is INSIDE the comfort tolerance
+    # (19.65 vs floor 19.5) and movement clears the jitter guard, but the
+    # slope is too shallow for the projection to actually reach the band
+    # within lookahead. Predictor must defer to hysteresis.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=19.3, slope_per_h=2.0)
+    inputs = _inputs(19.65, current=ACTION_IDLE)  # within tolerance 0.5
+    # Projection: 19.65 + 2/60*5 = 19.817 < low (20). Movement 0.167 > 0.1.
+    # Comfort floor: 19.65 >= low - 0.5 = 19.5. Only projection fails.
     decision = _decide_from_samples(
         samples,
         inputs,
@@ -596,6 +599,43 @@ def test_passive_falls_through_when_idle_slope_none() -> None:
         now=samples[-1].t,
     )
     assert decision == _hyst_heat()
+
+
+def test_passive_works_when_current_action_unknown() -> None:
+    # ACTION_UNKNOWN routes into the same elif arm as ACTION_IDLE, so passive
+    # suppression must apply when the previous action was unknown (boot from
+    # storage with last_action=None, sensor outage recovery, etc.). Room at
+    # 19.6 sits visibly *inside* the comfort tolerance (low - 0.5 = 19.5) so
+    # the test isn't sensitive to inclusive-vs-exclusive interpretation of
+    # the floor predicate.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=8.0)
+    inputs = _inputs(19.6, current=ACTION_UNKNOWN)
+    # Projection: 19.6 + 8/60*5 = 20.27 >= low (20.0); movement 0.67 >= 0.1.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_heat(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
+
+
+def test_passive_cool_works_when_current_action_unknown() -> None:
+    # Symmetric to the heat-side test above: hot room recovering on its own
+    # while last_action is unknown. Room 23.3 sits above the band edge
+    # (high=23.0) but inside the comfort tolerance (high + 0.5 = 23.5).
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=24.5, slope_per_h=-8.0)
+    inputs = _inputs(23.3, current=ACTION_UNKNOWN)
+    # Projection: 23.3 - 8/60*5 = 22.63 <= high (23.0); movement 0.67 >= 0.1.
+    decision = _decide_from_samples(
+        samples,
+        inputs,
+        lookahead_minutes=5,
+        hysteresis_decision=_hyst_cool(),
+        now=samples[-1].t,
+    )
+    assert decision.action == ACTION_IDLE
 
 
 def test_passive_tolerance_zero_disables_suppression() -> None:
