@@ -10,7 +10,9 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
-**v0.7.0.** Adds **passive drift acceptance** to the v0.6 predictive controller. When the room has crossed the deadband but the predictor's slope says we'll naturally return to band within `lookahead_minutes`, the predictor now suppresses the heat / cool call hysteresis would otherwise issue — letting the room recover on its own. Bounded by a per-zone comfort floor (`number.{zone}_passive_tolerance`, default 0.5 °C, set to 0 to disable): we'll never tolerate drift further than that from the band. Reuses the existing `learning_enabled` gate; default behaviour is unchanged for users who haven't opted into predictive control.
+**v0.7.1.** Docs and test-isolation polish on top of v0.7.0; no behaviour change.
+
+**v0.7.0** adds **passive drift acceptance** to the v0.6 predictive controller. When the room has crossed the deadband but the predictor's slope says we'll naturally return to band within `lookahead_minutes`, the predictor now suppresses the heat / cool call hysteresis would otherwise issue — letting the room recover on its own. Bounded by a per-zone comfort floor (`number.{zone}_passive_tolerance`, default 0.5 °C, set to 0 to disable): we'll never tolerate drift further than that from the band. Reuses the existing `learning_enabled` gate; default behaviour is unchanged for users who haven't opted into predictive control. **Behaviour change for existing v0.6 users with `learning_enabled = ON`:** the 0.5 °C default tolerance silently enables passive acceptance on next load; set `number.{zone}_passive_tolerance` to `0` to restore v0.6's "always defer to hysteresis on band exits" behaviour.
 
 **v0.6.0** added **predictive control via a learned thermal slope** ([#11](https://github.com/dpretty/ha-comfort-band/issues/11)). Per-zone rolling-window slope estimator (segmented by HVAC action) projects room temperature forward by `lookahead_minutes` (default 5) and triggers heat/cool earlier when an idle drift will cross the deadband, or releases earlier when a recovery rate will overshoot the band. Three new entities per zone: `sensor.{zone}_thermal_slope` (°C/h with per-action slopes in attributes), `sensor.{zone}_predicted_action` (always populated for shadow-comparison against `current_action`), `number.{zone}_lookahead_minutes` (range 2-15). Gated by the existing `switch.{zone}_learning_enabled` — default OFF, so behaviour is unchanged unless you flip the switch. v0.5 cross-mode gate still applies on top of predictor decisions. A manual edit to the climate entity (outside our path) flushes the sample buffer so the slope estimator stays honest.
 
@@ -66,7 +68,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 
 Plus one global entity: `select.comfort_band_profiles_active_profile`.
 
-## Predictive control (v0.6)
+## Predictive control (v0.6, extended in v0.7)
 
 Each refresh, the integration appends a `(timestamp, decision_room, action)` sample to a per-zone rolling buffer (90 min, rate-limited to one sample per 60 s, persisted across restarts). It then computes three slopes via weighted least-squares regression with exponential recency weights (`τ = 20 min`):
 
@@ -79,6 +81,8 @@ When `switch.{zone}_learning_enabled` is ON, the predictor projects `decision_ro
 - **Anticipates startup**: while idle, if the projection crosses the deadband edge (`low - deadband_below` or `high + deadband_above`), it triggers heat / cool *now* instead of waiting.
 - **Anticipates shutoff**: while heating or cooling, if the projection overshoots the band edge (`high` or `low`), it releases to idle *now* so the room peaks at the edge instead of past it.
 - **Passive drift acceptance** (v0.7): when the room has already crossed the deadband but the slope says it'll return to band within the lookahead window, the predictor stays idle and lets the room recover on its own (rather than firing heat / cool that would interrupt the natural drift). Bounded by `number.{zone}_passive_tolerance` (default 0.5 °C; 0 disables) — we'll never tolerate drift further than that from the band edge, even if the slope says recovery is "in progress". A second jitter guard requires the forecast to move the room by at least 0.1 °C toward the band, so a sensor-noise slope can't spuriously suppress a real heat call.
+  - Concrete example: with `low = 20 °C` and the defaults (`passive_tolerance = 0.5`, `deadband_below = 0.3`), heat is suppressed only when the room is at or above 19.5 °C and below 19.7 °C (`low - deadband_below`) AND the slope is positive enough that projection lands inside the band; below 19.5 °C hysteresis always fires.
+  - Caveat: the slope reflects the most recent ~90 min of samples. A sharp change in heat load (cold snap, opened window) won't show in the slope until the buffer catches up; passive acceptance may briefly suppress a legitimate heat call until the comfort floor is hit. The 0.5 °C default bounds the worst-case dip.
 
 `sensor.{zone}_predicted_action` is populated *regardless* of `learning_enabled`, so you can shadow-compare against `sensor.{zone}_current_action` before flipping the switch on. Tune `number.{zone}_lookahead_minutes` (default 5, range 2-15): higher values trigger heat/cool sooner — useful for slow-responding systems (underfloor heating, large rooms) where temperature reacts to commands several minutes after the fact. Lower values are appropriate for fast-responding mini-splits, or if you find the predictor over-eager.
 

@@ -1104,3 +1104,36 @@ async def test_passive_tolerance_threaded_to_predictor(
     set_modes = _calls_for(climate_calls, "set_hvac_mode")
     assert any(c["hvac_mode"] == HVAC_MODE_HEAT for c in set_modes), set_modes
     await coordinator.async_unload()
+
+
+async def test_passive_acceptance_suppresses_heat_end_to_end(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Positive-path coordinator test: with default `passive_tolerance=0.5`
+    and learning ON, a room just inside the comfort floor with a warming
+    idle slope should produce NO heat command -- the predictor's passive
+    branch propagates all the way to climate. Catches regressions where
+    the threading silently passes a hard-coded default."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    # Default low=19.5, deadband_below=0.3 -> hyst entry at 19.2. Room at
+    # 19.1 (0.1 °C inside the hyst-heat zone), warming slope, default
+    # passive_tolerance=0.5 (comfort floor at low-0.5=19.0; room 19.1 >=
+    # 19.0). Suppression should propagate end-to-end -> no heat command.
+    _seed_idle_drift(coordinator, start_temp=18.0, slope_per_h=15.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.1", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.predicted_decision.action == ACTION_IDLE
+    # final_decision should equal predicted_decision when learning_enabled=True.
+    # Asserting both fields catches a future refactor that accidentally breaks
+    # the routing (e.g., always passing hyst_decision regardless of the gate).
+    assert coordinator.data.decision.action == ACTION_IDLE
+    set_modes = _calls_for(climate_calls, "set_hvac_mode")
+    assert all(c["hvac_mode"] != HVAC_MODE_HEAT for c in set_modes), set_modes
+    await coordinator.async_unload()
