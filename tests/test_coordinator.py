@@ -1215,6 +1215,11 @@ async def test_three_way_gate_routes_to_mpc_when_enabled_and_ready(
     assert coordinator.data.mpc_decision.action == ACTION_HEAT
     # The gate routed to MPC's decision.
     assert coordinator.data.decision.action == ACTION_HEAT
+    # v0.8 contract: MPC's heat action targets the band's *high* edge (not
+    # `low`), so the climate keeps heating until MPC itself elects idle.
+    # Pin this end-to-end — `test_mpc.py` covers it at the unit level but
+    # only the integration path proves the high-edge value reaches climate.
+    assert coordinator.data.decision.target_temp == coordinator.data.effective_high
     await coordinator.async_unload()
 
 
@@ -1404,6 +1409,55 @@ async def test_target_temp_rounded_to_default_step_when_attribute_missing(
 
     set_temps = _calls_for(climate_calls, "set_temperature")
     # 19.7 rounded to 0.5 step → 19.5.
+    assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_passes_through_when_climate_reports_zero_step(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Defensive: a corrupt/0 climate attribute mustn't cause a divide-by-zero
+    in `_round_to_step`. The raw setpoint should pass through unchanged.
+    `step <= 0` is the explicit guard in `_round_to_step`; this pins it.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": 0})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # No rounding applied -- precise input value passes through.
+    assert any(abs(c["temperature"] - 19.7) < 1e-6 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_falls_back_to_default_step_on_nan_attribute(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A misbehaving climate platform could advertise `target_temp_step=nan`.
+    `float("nan")` succeeds, so without an explicit `math.isfinite` guard the
+    NaN propagates into `_round_to_step`, where `int(round(x / nan))` raises
+    ValueError and crashes `_maybe_apply_action` on every refresh.
+
+    Pins the `math.isfinite` guard in `_target_temp_step` — NaN must fall
+    back to the default 0.5 °C step.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": float("nan")})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # 19.7 rounded to the fallback 0.5 step -> 19.5. The key assertion is
+    # that we reach this point at all (no ValueError crash).
     assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
     await coordinator.async_unload()
 

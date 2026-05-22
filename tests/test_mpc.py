@@ -220,6 +220,48 @@ def test_simulate_midpoint_distance_uses_band_midpoint() -> None:
     assert score.midpoint_distance == pytest.approx(0.5)
 
 
+def test_simulate_returns_zero_score_when_action_slope_unavailable() -> None:
+    """Defensive branch: if a per-action slope is None when simulate is
+    called directly (bypassing `plan`'s `is_ready` gate), the score is zero
+    and end_temp falls back to the input room. Future-proofs against an
+    expanded action space (e.g., v0.9 fan-mode candidates) where some
+    candidates' slopes may legitimately be unavailable while others aren't.
+    """
+    score = simulate(
+        Action(ACTION_HEAT, 23.0),
+        _slopes(recovery_heat=None),
+        _inputs(21.5, low=20.0, high=23.0),
+        horizon_minutes=20,
+    )
+    assert score.time_in_band_minutes == 0.0
+    assert score.end_temp == 21.5  # falls back to input room
+    assert score.midpoint_distance == pytest.approx(0.0)  # 21.5 == midpoint
+
+
+def test_simulate_returns_zero_score_when_room_is_none() -> None:
+    """Symmetric defensive branch: `plan` already gates on `room is not None`
+    before calling simulate, but simulate must not raise when called
+    directly with room=None — preserves the "controller never crashes"
+    contract."""
+    inputs = HysteresisInputs(
+        room=None,
+        low=20.0,
+        high=23.0,
+        deadband_below=0.3,
+        deadband_above=0.5,
+        current_action=ACTION_IDLE,
+    )
+    score = simulate(
+        Action(ACTION_IDLE, None),
+        _slopes(idle=0.0),
+        inputs,
+        horizon_minutes=20,
+    )
+    assert score.time_in_band_minutes == 0.0
+    assert score.end_temp == 21.5  # falls back to midpoint
+    assert score.midpoint_distance == 0.0
+
+
 # ----- is_ready -----
 
 
@@ -348,6 +390,24 @@ def test_plan_tie_broken_by_midpoint_distance() -> None:
         predictor_decision=idle_decision(),
     )
     assert result.action == ACTION_HEAT
+
+
+def test_plan_tie_broken_by_midpoint_distance_cool_side() -> None:
+    """Symmetric to the heat tie-break: room at 22.0 (above midpoint 21.5);
+    idle (slope=0) ends at 22.0 → distance 0.5. Cool (slope=-0.025) ends at
+    21.5 → distance 0.0. Cool wins despite both scoring 20.0 min in band.
+
+    The `max` key sort is symmetric on `midpoint_distance`, but having both
+    sides explicitly tested protects against a future regression that picks
+    only one direction (e.g., a sign-flip in the key).
+    """
+    result = plan(
+        _slopes(idle=0.0, recovery_heat=0.025, recovery_cool=-0.025),
+        _inputs(22.0, low=20.0, high=23.0),
+        horizon_minutes=20,
+        predictor_decision=idle_decision(),
+    )
+    assert result.action == ACTION_COOL
 
 
 def test_plan_returns_idle_decision_with_fan_only_mode() -> None:

@@ -47,7 +47,7 @@ from .hysteresis import (
     heat_decision,
     idle_decision,
 )
-from .predictor import ThermalSlopes
+from .predictor import ThermalSlopes, project
 
 
 @dataclass(frozen=True)
@@ -97,17 +97,6 @@ def enumerate_actions(inputs: HysteresisInputs) -> list[Action]:
     ]
 
 
-def _slope_for(action: Action, slopes: ThermalSlopes) -> float | None:
-    """Pick the slope this action would produce. None when MPC isn't ready
-    (caller is expected to gate on `is_ready` first, but be defensive).
-    """
-    if action.kind == ACTION_HEAT:
-        return slopes.recovery_heat
-    if action.kind == ACTION_COOL:
-        return slopes.recovery_cool
-    return slopes.idle
-
-
 def simulate(
     action: Action,
     slopes: ThermalSlopes,
@@ -123,12 +112,24 @@ def simulate(
     Horizon <= 60 means at most 60 steps x 3 actions = 180 iterations per
     refresh — negligible.
 
-    `inputs.room` is asserted non-None by the caller (`plan` returns
-    UNKNOWN_DECISION before reaching here when room is None).
+    Defensive return when `inputs.room is None`: zero score, midpoint
+    distance 0. `plan` gates on `room is not None` before calling, so this
+    branch is a tripwire for future direct callers. Mirrors the rest of the
+    codebase's "return UNKNOWN / no-op rather than raise" convention.
     """
-    assert inputs.room is not None, "simulate called with room=None — caller bug"
+    midpoint = (inputs.low + inputs.high) / 2.0
+    if inputs.room is None:
+        return ActionScore(
+            action=action,
+            time_in_band_minutes=0.0,
+            end_temp=midpoint,
+            midpoint_distance=0.0,
+        )
 
-    slope = _slope_for(action, slopes)
+    # Reuse ThermalSlopes.for_action so the slope-pick logic lives in exactly
+    # one place (the sibling predictor sensor also uses it). Action.kind uses
+    # the same ACTION_* labels for_action expects.
+    slope = slopes.for_action(action.kind)
     if slope is None:
         # Caller is expected to gate on is_ready before reaching here; this
         # branch keeps simulate robust if the action space ever expands to
@@ -137,7 +138,7 @@ def simulate(
             action=action,
             time_in_band_minutes=0.0,
             end_temp=inputs.room,
-            midpoint_distance=abs(inputs.room - (inputs.low + inputs.high) / 2.0),
+            midpoint_distance=abs(inputs.room - midpoint),
         )
 
     step_min = MPC_SIMULATION_STEP_MINUTES
@@ -151,7 +152,14 @@ def simulate(
         # out of band (counts the in-band endpoint at 0.5 * step, not the
         # full step). Adequate for cost-function ranking; we're comparing
         # actions, not estimating absolute minutes-in-band exactly.
-        next_temp = temp + slope * step_min
+        # `project` is the shared single-step projector defined in predictor.py
+        # — using it keeps the slope-extrapolation formula in one place. The
+        # `is None` branch is unreachable (slope is None-checked above);
+        # narrow for mypy and serve as a tripwire if simulate ever loses its
+        # None-guard contract.
+        next_temp = project(temp, slope, step_min)
+        if next_temp is None:  # pragma: no cover — slope guaranteed non-None
+            next_temp = temp
         a_in = inputs.low <= temp <= inputs.high
         b_in = inputs.low <= next_temp <= inputs.high
         if a_in and b_in:
@@ -160,7 +168,6 @@ def simulate(
             time_in_band += step_min * 0.5
         temp = next_temp
 
-    midpoint = (inputs.low + inputs.high) / 2.0
     return ActionScore(
         action=action,
         time_in_band_minutes=time_in_band,
@@ -221,12 +228,18 @@ def plan(
     )
     if best.action.kind == ACTION_IDLE:
         return idle_decision()
+    # target_temp is non-None for heat / cool actions (enumerate_actions
+    # constructs them with inputs.high / inputs.low). The fallthrough below
+    # defends against a future enumerate_actions that introduces a heat or
+    # cool candidate without a target_temp — degrade to predictor's decision
+    # rather than crash, matching the rest of the module's no-raise contract.
+    if best.action.target_temp is None:
+        return predictor_decision
     if best.action.kind == ACTION_HEAT:
-        # target_temp is non-None for heat / cool actions (enumerate_actions
-        # constructs them with inputs.high / inputs.low). Assert keeps mypy
-        # honest and serves as a tripwire if enumerate_actions changes.
-        assert best.action.target_temp is not None
         return heat_decision(best.action.target_temp)
-    # best.action.kind == ACTION_COOL
-    assert best.action.target_temp is not None
-    return cool_decision(best.action.target_temp)
+    if best.action.kind == ACTION_COOL:
+        return cool_decision(best.action.target_temp)
+    # Explicit fallthrough: v0.9 may grow the action space (fan-mode
+    # candidates), and an unrecognised `kind` here should defer to the
+    # predictor rather than silently map to cool. Belt-and-suspenders.
+    return predictor_decision

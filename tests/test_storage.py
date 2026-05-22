@@ -47,6 +47,9 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["lookahead_minutes"] == 5
     # v0.7 passive drift acceptance: 0.5 °C comfort floor by default.
     assert zone["passive_tolerance"] == 0.5
+    # v0.8 MPC: off by default (layered on learning_enabled), 20-min horizon.
+    assert zone["mpc_enabled"] is False
+    assert zone["mpc_horizon_minutes"] == 20
 
 
 # ----- round-trip persistence -----
@@ -724,17 +727,9 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     assert store.get_zone("office")["mpc_horizon_minutes"] == 20
 
 
-async def test_default_zone_seeds_mpc_fields(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
-    """Fresh `add_zone` calls seed both v0.8 MPC fields. Pins the default
-    so a future change to DEFAULT_MPC_HORIZON_MINUTES gets noticed in tests
-    instead of silently shipping."""
-    store = ComfortBandStore(hass)
-    await store.async_load()
-    zone = await store.async_add_zone("kitchen")
-    assert zone["mpc_enabled"] is False
-    assert zone["mpc_horizon_minutes"] == 20
+# (Default-value assertions for the new v0.8 MPC fields live in
+# `test_default_zone_has_sane_initial_values` above — the canonical test for
+# new-install defaults.)
 
 
 async def test_legacy_v0_7_samples_load_with_fan_mode_none(

@@ -96,10 +96,6 @@ MPC_HORIZON_MAX: Final = 60
 # the simulation cheap (≤60 iterations per action per refresh) and matches the
 # resolution of the underlying slope estimator (which produces °C/minute).
 MPC_SIMULATION_STEP_MINUTES: Final = 1.0
-# Small bias toward midpoint when actions tie on `time_in_band_minutes`.
-# Used as the second sort key; resolves indeterminacy when e.g. idle with flat
-# slope and heat with mildly positive slope both stay in band the whole horizon.
-MPC_TIE_BREAK_EPSILON_C: Final = 0.001
 
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0

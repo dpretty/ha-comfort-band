@@ -14,6 +14,7 @@ via `climate.set_hvac_mode` + `set_temperature` -- but only if the per-zone
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -461,7 +462,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """Shared read path for any external numeric sensor: returns the
         float value, or None when the entity is missing, unavailable, or
         non-numeric. Used by both the room-temp and humidity readers (and
-        any future sensor input — predictive control / IAQ / etc.)."""
+        any future numeric sensor input — predictive control / IAQ / etc.).
+
+        Reads `state.state` only — not entity attributes. The v0.8 climate-
+        attribute readers (`_target_temp_step`, `_current_climate_fan_mode`)
+        intentionally don't reuse this path because their fallback semantics
+        (typed default vs None) and value-vs-attribute access differ.
+        """
         if entity_id is None:
             return None
         state = self.hass.states.get(entity_id)
@@ -486,11 +493,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """Read the climate entity's `target_temp_step` attribute.
 
         Falls back to `_DEFAULT_TEMP_STEP` (0.5 °C) when the entity is
-        missing, the attribute is absent, or the attribute is non-numeric.
-        Used to round MPC's heat target (band high edge) to a value the HVAC
-        will actually accept — otherwise the climate platform silently
-        coerces and our `_last_command_state` snapshot mismatches the
-        listener's observed state on every refresh.
+        missing, the attribute is absent, non-numeric, or non-finite (NaN /
+        +-inf). The non-finite guard matters because `float("nan")` succeeds
+        — passing NaN into `_round_to_step` would raise on `int(round(x/nan))`
+        and crash the apply path on every refresh for a misbehaving climate
+        platform.
         """
         state = self.hass.states.get(self.climate_entity_id)
         if state is None:
@@ -499,9 +506,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if raw is None:
             return _DEFAULT_TEMP_STEP
         try:
-            return float(raw)
+            step = float(raw)
         except (TypeError, ValueError):
             return _DEFAULT_TEMP_STEP
+        if not math.isfinite(step):
+            return _DEFAULT_TEMP_STEP
+        return step
 
     def _current_climate_fan_mode(self) -> str | None:
         """Read the climate entity's `fan_mode` attribute for sample capture.

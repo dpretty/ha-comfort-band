@@ -86,7 +86,7 @@
         "name": "Passive tolerance"
       },
       "mpc_horizon_minutes": {
-        "name": "MPC horizon"
+        "name": "MPC horizon minutes"
       }
     },
     "select": {
