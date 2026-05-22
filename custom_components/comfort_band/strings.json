@@ -47,6 +47,9 @@
     "binary_sensor": {
       "override_active": {
         "name": "Override active"
+      },
+      "mpc_ready": {
+        "name": "MPC ready"
       }
     },
     "button": {
@@ -81,6 +84,9 @@
       },
       "passive_tolerance": {
         "name": "Passive tolerance"
+      },
+      "mpc_horizon_minutes": {
+        "name": "MPC horizon"
       }
     },
     "select": {
@@ -124,6 +130,15 @@
           "idle": "Idle",
           "unknown": "Unknown"
         }
+      },
+      "mpc_action": {
+        "name": "MPC action",
+        "state": {
+          "heating": "Heating",
+          "cooling": "Cooling",
+          "idle": "Idle",
+          "unknown": "Unknown"
+        }
       }
     },
     "switch": {
@@ -132,6 +147,9 @@
       },
       "learning_enabled": {
         "name": "Learning enabled"
+      },
+      "mpc_enabled": {
+        "name": "MPC enabled"
       },
       "use_apparent_temperature": {
         "name": "Use apparent temperature"

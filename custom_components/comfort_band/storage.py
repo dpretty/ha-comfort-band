@@ -16,7 +16,7 @@ mutator method (which writes to disk before returning).
 from __future__ import annotations
 
 import copy
-from typing import Any, TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -39,6 +39,7 @@ from .const import (
     DEFAULT_DEADBAND_BELOW,
     DEFAULT_LOOKAHEAD_MINUTES,
     DEFAULT_MIN_CYCLE_MINUTES,
+    DEFAULT_MPC_HORIZON_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PASSIVE_TOLERANCE_C,
     DEFAULT_PROFILE,
@@ -67,11 +68,20 @@ class SerializedSample(TypedDict):
     `StoredZone["samples"]`. The `predictor` module consumes this via
     `sample_from_dict`/`sample_to_dict`; the schema lives here so the
     storage layer doesn't depend on the prediction layer.
+
+    `fan_mode` is captured from the climate entity's `fan_mode` attribute at
+    sample time. v0.8 records but does not consume it — slope estimation
+    still ignores fan_mode and produces one slope per `(action,)`. v0.9 will
+    partition the slope estimator by `(action, fan_mode)` so MPC's action
+    space can include per-fan-mode candidates. `NotRequired` keeps v0.7
+    payloads schema-valid on load; `sample_from_dict` treats a missing key
+    as `None`.
     """
 
     t: str  # ISO-8601 UTC
     temp: float
     action: str
+    fan_mode: NotRequired[str | None]
 
 
 class StoredZone(TypedDict):
@@ -109,6 +119,19 @@ class StoredZone(TypedDict):
     # the room is already outside the band). Exposed as
     # `number.{zone}_passive_tolerance`. Default 0.5; range [0.0, 2.0].
     passive_tolerance: float
+    # Gates the v0.8 model-predictive controller. When ON *and* learning is
+    # also ON *and* MPC has data for all three slopes (idle, recovery_heat,
+    # recovery_cool), `mpc.plan` replaces `predictor.decide` as the source of
+    # the final decision. Default OFF so existing v0.7 users see no
+    # behaviour change on upgrade; `sensor.{zone}_mpc_action` populates
+    # regardless so shadow-comparison is possible without flipping the gate.
+    mpc_enabled: bool
+    # Horizon over which `mpc.simulate` projects each candidate action's
+    # outcome (minutes). Exposed as `number.{zone}_mpc_horizon_minutes`.
+    # Default 20; range [10, 60]. Decoupled from `lookahead_minutes` (used
+    # by the predictor for single-decision anticipation): MPC scores whole
+    # cycles, predictor scores the next decision moment.
+    mpc_horizon_minutes: int
     enabled: bool
     # Gates the v0.6 predictive controller: when ON, `predictor.decide()`'s
     # anticipated action replaces `hysteresis.decide()`'s reactive one as the
@@ -174,6 +197,8 @@ def _default_zone(zone_name: str) -> StoredZone:
         "samples": [],
         "lookahead_minutes": DEFAULT_LOOKAHEAD_MINUTES,
         "passive_tolerance": DEFAULT_PASSIVE_TOLERANCE_C,
+        "mpc_enabled": False,
+        "mpc_horizon_minutes": DEFAULT_MPC_HORIZON_MINUTES,
         "enabled": False,
         "learning_enabled": False,
         "use_apparent_temperature": False,
@@ -230,7 +255,7 @@ class ComfortBandStore:
             migrated = True
         # Per-zone backfill: every new field added since v0.3 gets a safe
         # default if absent. Each `if "field" not in zone` branch is
-        # independent so a single load can migrate v0.3 → v0.7 in one pass.
+        # independent so a single load can migrate v0.3 → v0.8 in one pass.
         #
         # STORAGE_VERSION intentionally stays at 1: field additions with
         # safe defaults are forward-compatible (old payload + missing
@@ -272,6 +297,17 @@ class ComfortBandStore:
             # by setting it to 0.
             if "passive_tolerance" not in zone:
                 zone["passive_tolerance"] = DEFAULT_PASSIVE_TOLERANCE_C
+                migrated = True
+            # v0.7 → v0.8: MPC. Default OFF so existing learning_enabled users
+            # continue to see the v0.7 predictor's behaviour. Horizon seeds to
+            # the conservative 20-minute default; users tune via the
+            # `number.{zone}_mpc_horizon_minutes` entity. Sample-level fan_mode
+            # backfill is implicit via NotRequired + sample_from_dict.get().
+            if "mpc_enabled" not in zone:
+                zone["mpc_enabled"] = False
+                migrated = True
+            if "mpc_horizon_minutes" not in zone:
+                zone["mpc_horizon_minutes"] = DEFAULT_MPC_HORIZON_MINUTES
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

@@ -70,11 +70,25 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Sample:
-    """In-memory thermal sample. The coordinator holds these between refreshes."""
+    """In-memory thermal sample. The coordinator holds these between refreshes.
+
+    `fan_mode` is the climate entity's `fan_mode` attribute at sample time;
+    None when the entity does not expose one or when the attribute is unset.
+    v0.8 records but does not consume it — slope estimation still partitions
+    samples by `action` only. v0.9 will partition by `(action, fan_mode)` so
+    MPC's action space can include per-fan-mode variants without needing a
+    warm-up window after release (the buffer already contains the data).
+
+    Defaults to None so callers (legacy tests, future hand-constructed
+    samples) don't have to thread the field when they don't care about it;
+    the coordinator's `_append_sample` always passes the actually-observed
+    value.
+    """
 
     t: datetime
     temp: float
     action: str  # one of ACTION_*
+    fan_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +129,12 @@ _SLOPE_EPSILON_PER_MINUTE: Final = SLOPE_EPSILON_PER_HOUR / 60.0
 
 def sample_to_dict(s: Sample) -> SerializedSample:
     """Serialize a sample for the storage layer."""
-    return {"t": s.t.isoformat(), "temp": s.temp, "action": s.action}
+    return {
+        "t": s.t.isoformat(),
+        "temp": s.temp,
+        "action": s.action,
+        "fan_mode": s.fan_mode,
+    }
 
 
 def sample_from_dict(d: SerializedSample) -> Sample | None:
@@ -126,6 +145,12 @@ def sample_from_dict(d: SerializedSample) -> Sample | None:
     failure up to `async_setup`, which would mark the whole config entry
     failed. The bad entry is silently dropped and the rest of the buffer
     is preserved.
+
+    `fan_mode` is the v0.8 addition. Missing key → None (the legacy v0.7
+    case); explicit None → None; non-string-non-None → reject. The asymmetry
+    with `action` (which rejects missing) reflects intent: action has been
+    in the schema since v0.6 and any v0.6+ payload should have it, while
+    fan_mode is `NotRequired` and v0.7 payloads legitimately lack it.
     """
     try:
         parsed = datetime.fromisoformat(d["t"])
@@ -154,7 +179,12 @@ def sample_from_dict(d: SerializedSample) -> Sample | None:
     action_raw: object = d.get("action")
     if not isinstance(action_raw, str):
         return None
-    return Sample(t=parsed, temp=temp, action=action_raw)
+    # fan_mode: missing key or explicit None → None (v0.7 compat); else must
+    # be a string. Same type-widening pattern as `action_raw` above.
+    fan_mode_raw: object = d.get("fan_mode")
+    if fan_mode_raw is not None and not isinstance(fan_mode_raw, str):
+        return None
+    return Sample(t=parsed, temp=temp, action=action_raw, fan_mode=fan_mode_raw)
 
 
 def load_samples(serialized: list[SerializedSample]) -> list[Sample]:
@@ -177,6 +207,7 @@ def append_sample(
     now: datetime,
     temp: float,
     action: str,
+    fan_mode: str | None = None,
 ) -> tuple[list[Sample], bool]:
     """Append a new sample, applying rate-limit + age cap.
 
@@ -188,6 +219,10 @@ def append_sample(
     Rate-limit: skip the append if the previous sample was within
     SAMPLE_MIN_INTERVAL_S AND its action matches the incoming action.
     Action transitions are always recorded (the segmenter relies on them).
+    Fan-mode changes are NOT treated as transitions in v0.8 — slope
+    estimation ignores fan_mode, so a fan-mode change inside the rate-limit
+    window would only inflate the buffer without affecting any v0.8 control.
+    v0.9 (when slopes partition by fan_mode) will revisit this.
 
     Age cap: drop samples older than SAMPLE_WINDOW_MINUTES on every append.
     Count cap (SAMPLE_MAX_COUNT) defends against clock skew (e.g., a future-
@@ -205,7 +240,7 @@ def append_sample(
 
     cutoff = now - timedelta(minutes=SAMPLE_WINDOW_MINUTES)
     pruned = [s for s in samples if s.t >= cutoff]
-    pruned.append(Sample(t=now, temp=temp, action=action))
+    pruned.append(Sample(t=now, temp=temp, action=action, fan_mode=fan_mode))
     if len(pruned) > SAMPLE_MAX_COUNT:
         pruned = pruned[-SAMPLE_MAX_COUNT:]
     return pruned, True

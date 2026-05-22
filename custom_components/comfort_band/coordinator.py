@@ -31,7 +31,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import apparent_temp, hysteresis, predictor, schedule
+from . import apparent_temp, hysteresis, mpc, predictor, schedule
 from .const import (
     ACTION_COOL,
     ACTION_HEAT,
@@ -51,6 +51,24 @@ if TYPE_CHECKING:
 
 _DEBOUNCE_SECS = 2.0
 _MAX_NEXT_TRANSITION_SECS = 3600.0  # cap re-scheduling at 1 h
+
+# Fallback when the climate entity doesn't expose `target_temp_step`. 0.5 °C
+# matches the resolution of most consumer heat pumps (Daikin, Mitsubishi,
+# Fujitsu); a finer step here would mean set_temperature commands get silently
+# coerced by the climate platform and our control intent diverges from what
+# the HVAC actually pursues.
+_DEFAULT_TEMP_STEP = 0.5
+
+
+def _round_to_step(value: float, step: float) -> float:
+    """Round `value` to the nearest multiple of `step`. `step <= 0` returns the
+    value unchanged (defensive: a corrupt climate entity attribute might
+    yield zero or negative — better to issue the precise setpoint than to
+    divide-by-zero or invert the rounding).
+    """
+    if step <= 0:
+        return value
+    return round(value / step) * step
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,14 @@ class ZoneState:
     # current learned slopes for the thermal_slope sensor's attributes.
     predicted_decision: HysteresisDecision
     thermal_slopes: ThermalSlopes
+    # v0.8 model-predictive controller. `mpc_decision` is always populated
+    # (shadow mode), regardless of `mpc_enabled`. When MPC isn't ready
+    # (a slope is missing), `mpc.plan` returns `predicted_decision` so the
+    # shadow-comparison surface is still meaningful — users can watch
+    # `mpc_action` track `predicted_action` until enough data accumulates,
+    # then diverge. `mpc_ready` exposes the gate as a binary sensor.
+    mpc_decision: HysteresisDecision
+    mpc_ready: bool
 
     @property
     def enabled(self) -> bool:
@@ -190,8 +216,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_set_param(self, field: str, value: Any) -> None:
         """Update a tunable (deadband_*, override_hours, min_cycle_minutes,
-        cross_mode_min_minutes, lookahead_minutes, passive_tolerance)
-        without triggering an override.
+        cross_mode_min_minutes, lookahead_minutes, passive_tolerance,
+        mpc_horizon_minutes) without triggering an override.
 
         Uses `async_request_refresh` (queued + deduped) rather than
         `async_refresh` because Number entities can fire rapid-fire writes
@@ -241,6 +267,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_set_learning_enabled(self, learning_enabled: bool) -> None:
         await self._store.async_update_zone(self.zone_name, learning_enabled=learning_enabled)
+        await self.async_refresh()
+
+    async def async_set_mpc_enabled(self, mpc_enabled: bool) -> None:
+        """Flip the v0.8 MPC opt-in switch. Layered on top of learning_enabled —
+        MPC only takes effect when both are ON *and* MPC has the data it
+        needs (see `mpc.is_ready`). Mirrors `async_set_learning_enabled` so
+        the switch entity wiring stays uniform across the two gates.
+        """
+        await self._store.async_update_zone(self.zone_name, mpc_enabled=mpc_enabled)
         await self.async_refresh()
 
     async def async_set_use_apparent_temperature(self, use_apparent_temperature: bool) -> None:
@@ -365,7 +400,27 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             passive_tolerance=zone["passive_tolerance"],
             hysteresis_decision=hyst_decision,
         )
-        final_decision = predicted_decision if zone["learning_enabled"] else hyst_decision
+        # v0.8 MPC also runs every refresh (shadow mode). When ready, MPC plans
+        # over `mpc_horizon_minutes` and returns the highest-time-in-band
+        # action; when not ready it returns `predicted_decision` so the
+        # shadow-comparison sensor still produces a meaningful value.
+        mpc_ready = mpc.is_ready(thermal_slopes)
+        mpc_decision = mpc.plan(
+            thermal_slopes,
+            hyst_inputs,
+            horizon_minutes=zone["mpc_horizon_minutes"],
+            predictor_decision=predicted_decision,
+        )
+        # Three-way gate: each layer is opt-in by its own switch. learning_enabled
+        # is the v0.6 predictor gate (preserves v0.7 behaviour). mpc_enabled is
+        # the v0.8 MPC gate, layered on top — both must be ON, and MPC must
+        # have its required slopes, for MPC's decision to be the active one.
+        if zone["learning_enabled"] and zone["mpc_enabled"] and mpc_ready:
+            final_decision = mpc_decision
+        elif zone["learning_enabled"]:
+            final_decision = predicted_decision
+        else:
+            final_decision = hyst_decision
 
         # Reschedule next-transition + override-expiry timers.
         self._schedule_next_transition(schedule_data)
@@ -388,6 +443,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             decision=final_decision,
             predicted_decision=predicted_decision,
             thermal_slopes=thermal_slopes,
+            mpc_decision=mpc_decision,
+            mpc_ready=mpc_ready,
         )
 
         # Apply in a follow-up task so this refresh returns immediately --
@@ -424,6 +481,43 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """The apparent-temp formula treats None as "no adjustment", so a
         missing / offline humidity sensor degrades gracefully."""
         return self._read_numeric_sensor(self.humidity_entity_id)
+
+    def _target_temp_step(self) -> float:
+        """Read the climate entity's `target_temp_step` attribute.
+
+        Falls back to `_DEFAULT_TEMP_STEP` (0.5 °C) when the entity is
+        missing, the attribute is absent, or the attribute is non-numeric.
+        Used to round MPC's heat target (band high edge) to a value the HVAC
+        will actually accept — otherwise the climate platform silently
+        coerces and our `_last_command_state` snapshot mismatches the
+        listener's observed state on every refresh.
+        """
+        state = self.hass.states.get(self.climate_entity_id)
+        if state is None:
+            return _DEFAULT_TEMP_STEP
+        raw = state.attributes.get("target_temp_step")
+        if raw is None:
+            return _DEFAULT_TEMP_STEP
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return _DEFAULT_TEMP_STEP
+
+    def _current_climate_fan_mode(self) -> str | None:
+        """Read the climate entity's `fan_mode` attribute for sample capture.
+
+        Returns None when the entity is missing, the attribute is absent, or
+        the attribute is non-string. Stored alongside each sample so v0.9
+        can partition slope estimates by fan_mode without waiting on a
+        warm-up window.
+        """
+        state = self.hass.states.get(self.climate_entity_id)
+        if state is None:
+            return None
+        raw = state.attributes.get("fan_mode")
+        if isinstance(raw, str):
+            return raw
+        return None
 
     def _resolve_schedule(
         self,
@@ -586,12 +680,30 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
             return
 
+        # Round the decision's target_temp to the climate's step before
+        # issuing the service call: v0.8 MPC uses the band's upper edge as
+        # the heat target, and that value may not align to the climate's
+        # native resolution (e.g., 0.1 vs 0.5). The climate platform would
+        # silently coerce on receive, but pre-rounding here means our
+        # `_last_command_state` snapshot matches what the climate will end
+        # up at — keeping the manual-edit listener's comparison honest.
+        rounded_target_temp: float | None = None
+        if decision.target_temp is not None:
+            step = self._target_temp_step()
+            rounded_target_temp = _round_to_step(decision.target_temp, step)
+
         # About to issue climate commands: snapshot our intent so the
         # climate-state listener can recognise the resulting echoes and
-        # avoid mistaking them for manual edits.
+        # avoid mistaking them for manual edits. fan_mode is included since
+        # the listener also flushes on manual fan-mode changes (v0.8: even
+        # though fan_mode doesn't affect MPC's action space yet, it does
+        # change the room's thermal dynamics, so the slope estimator's prior
+        # data is no longer representative).
+        existing_fan_mode = self._current_climate_fan_mode()
         self._last_command_state = {
             "hvac_mode": decision.target_mode,
-            "target_temp": decision.target_temp,
+            "target_temp": rounded_target_temp,
+            "fan_mode": existing_fan_mode,
         }
         self._last_command_at = now_utc
 
@@ -601,13 +713,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
             blocking=True,
         )
-        if decision.target_temp is not None:
+        if rounded_target_temp is not None:
             await self.hass.services.async_call(
                 "climate",
                 "set_temperature",
                 {
                     "entity_id": self.climate_entity_id,
-                    "temperature": decision.target_temp,
+                    "temperature": rounded_target_temp,
                 },
                 blocking=True,
             )
@@ -629,6 +741,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._last_command_state = {
                 "hvac_mode": fresh.state,
                 "target_temp": fresh.attributes.get("temperature"),
+                "fan_mode": fresh.attributes.get("fan_mode"),
             }
             # Reuse the pre-call `now_utc` rather than calling utcnow() again:
             # the small delta from slow climate calls would just slightly
@@ -665,6 +778,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         `predictor.append_sample`; this method just wires it to the store
         and updates the in-memory cache.
 
+        v0.8 also captures the climate entity's current `fan_mode` attribute
+        and persists it with the sample. v0.8 doesn't *use* fan_mode (slope
+        estimation still partitions by action only), but v0.9's MPC
+        extension partitions by `(action, fan_mode)` — recording it now
+        means v0.9 ships with data already in the buffer.
+
         Disk persistence is throttled: every action transition writes
         immediately (the slope segmenter needs the boundary on cold start),
         but consecutive same-action samples persist at most once every
@@ -680,8 +799,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # buffer's last action, not the freshly-decided one. Used only to
         # decide whether to persist immediately (transition) or throttle.
         prior_action = self._samples_cache[-1].action if self._samples_cache else None
+        fan_mode = self._current_climate_fan_mode()
         new_samples, appended = predictor.append_sample(
-            self._samples_cache, now=now_utc, temp=decision_room, action=action
+            self._samples_cache,
+            now=now_utc,
+            temp=decision_room,
+            action=action,
+            fan_mode=fan_mode,
         )
         if not appended:
             return
@@ -717,6 +841,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         the second one) -- ignore those. Otherwise, a mismatch indicates a
         manual edit; flush samples so the slope estimator doesn't fit stale
         dynamics.
+
+        v0.8 also compares `fan_mode`. A manual fan-mode change doesn't
+        affect v0.8's control decisions (MPC's v0.8 action space ignores
+        fan_mode), but it does change the room's thermal dynamics — the
+        slope estimator's prior data is no longer representative of what's
+        happening now. Treating a fan-mode change as a flush keeps the
+        estimator honest under mixed control.
         """
         # `EventStateChangedData` declares both keys as required (`State | None`),
         # so subscript access is the type-honest read; .get() would silently
@@ -729,6 +860,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         observed = {
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
+            "fan_mode": new_state.attributes.get("fan_mode"),
         }
         now = dt_util.utcnow()
         # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)

@@ -10,6 +10,8 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
+**v0.8.0** adds a **model-predictive controller** as a third decision layer in the stack. Each refresh, MPC enumerates a small action space (`idle`, `heat → band's high edge`, `cool → band's low edge`), simulates each forward over `mpc_horizon_minutes` (default 20 min) using the v0.6 thermal slopes, and picks the action that maximises projected time-in-band. Where v0.7's predictor anticipates *individual decisions*, MPC scores *whole cycles* — so it can pick `idle` even when the predictor would fire heat, or fire `heat` early when the predictor would wait. Behind a new opt-in `switch.{zone}_mpc_enabled` (default OFF) layered on top of `learning_enabled`. New diagnostic surfaces: `sensor.{zone}_mpc_action` (always populated for shadow comparison), `binary_sensor.{zone}_mpc_ready` (True once enough data has accumulated — typically a few hours of normal operation), and `number.{zone}_mpc_horizon_minutes` (range 10-60). The v0.7 predictor and v0.5 min-cycle gates still apply on top of MPC. Samples now also record the climate's `fan_mode` attribute (recorded but unused in v0.8 — v0.9 will partition slopes by `(action, fan_mode)` so MPC's action space can grow to include fan-mode candidates and close [#17](https://github.com/dpretty/ha-comfort-band/issues/17)). `climate.set_temperature` calls are now rounded to the climate entity's `target_temperature_step` attribute (fallback 0.5 °C) so what we ask for matches what the HVAC actually pursues.
+
 **v0.7.1.** Docs and test-isolation polish on top of v0.7.0; no behaviour change.
 
 **v0.7.0** adds **passive drift acceptance** to the v0.6 predictive controller. When the room has crossed the deadband but the predictor's slope says we'll naturally return to band within `lookahead_minutes`, the predictor now suppresses the heat / cool call hysteresis would otherwise issue — letting the room recover on its own. Bounded by a per-zone comfort floor (`number.{zone}_passive_tolerance`, default 0.5 °C, set to 0 to disable): we'll never tolerate drift further than that from the band. Reuses the existing `learning_enabled` gate; default behaviour is unchanged for users who haven't opted into predictive control. **Behaviour change for existing v0.6 users with `learning_enabled = ON`:** the 0.5 °C default tolerance silently enables passive acceptance on next load; set `number.{zone}_passive_tolerance` to `0` to restore v0.6's "always defer to hysteresis on band exits" behaviour.
@@ -52,7 +54,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | Platform | Entity | Notes |
 |---|---|---|
 | `number` | `manual_low`, `manual_high` | UI writes start an override |
-| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`, `passive_tolerance` | Tunables |
+| `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`, `passive_tolerance`, `mpc_horizon_minutes` | Tunables |
 | `sensor` | `effective_low`, `effective_high` | Active band (override or schedule) |
 | `sensor` | `room_temperature` | Diagnostic mirror of the source sensor. Carries `humidity_sensor` (the configured entity_id, or null) as a state attribute. |
 | `sensor` | `apparent_temperature` | Steadman 1994 "feels like". Equals room temp when no humidity sensor is configured. |
@@ -60,10 +62,13 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | `sensor` | `current_action` | `heating` / `cooling` / `idle` / `unknown` |
 | `sensor` | `thermal_slope` | Current learned slope (°C/h). Attributes: `idle_slope`, `recovery_slope_heat`, `recovery_slope_cool`, `sample_count`, `window_minutes`, `last_updated`. None for the first ~5-10 min after install/restart. |
 | `sensor` | `predicted_action` | What the predictor would issue right now. Always populated; flip `learning_enabled` ON to forward to climate. |
+| `sensor` | `mpc_action` | What MPC would issue right now. Always populated (falls back to predictor's decision while `mpc_ready` is False); flip `mpc_enabled` ON (in addition to `learning_enabled`) to forward to climate. |
 | `binary_sensor` | `override_active` | True while override is in effect |
+| `binary_sensor` | `mpc_ready` | True when MPC has all three slopes (idle, recovery_heat, recovery_cool) available. Becomes True after the zone has logged at least one segment of each action — typically a few hours of normal operation. |
 | `button` | `cancel_override` | Press to immediately end an override |
 | `switch` | `enabled` | Master kill — defaults OFF (shadow mode) |
 | `switch` | `learning_enabled` | Gates the v0.6 predictive controller. When ON, anticipated heat/cool decisions reach climate (subject to existing min-cycle and cross-mode gates). Anticipated idle releases bypass those gates so a cycle can always stop — same contract as v0.5. Default OFF. |
+| `switch` | `mpc_enabled` | Gates the v0.8 model-predictive controller. Layered on `learning_enabled`: both must be ON, **and** `mpc_ready` must be True, for MPC's decision to reach climate. Default OFF. |
 | `switch` | `use_apparent_temperature` | When ON, hysteresis decisions use the apparent value instead of the raw room reading. Falls back to room temp automatically if humidity is unavailable. Default OFF. |
 
 Plus one global entity: `select.comfort_band_profiles_active_profile`.
@@ -88,7 +93,26 @@ When `switch.{zone}_learning_enabled` is ON, the predictor projects `decision_ro
 
 Existing gates still apply on top: predictor-anticipated heat is still subject to `min_cycle_minutes`, and predictor-anticipated heat↔cool flips are still subject to `cross_mode_min_minutes`.
 
-**Known limitation:** if you manually change `hvac_mode` or `target_temp` on the climate entity (outside Comfort Band), the integration logs an INFO message and flushes the sample buffer — the slope estimator needs ~90 min of contiguous data to re-converge. Setting it back via a Comfort Band number entity is fine; the buffer is only flushed on external state changes.
+**Known limitation:** if you manually change `hvac_mode`, `target_temp`, or `fan_mode` on the climate entity (outside Comfort Band), the integration logs an INFO message and flushes the sample buffer — the slope estimator needs ~90 min of contiguous data to re-converge. Setting it back via a Comfort Band number entity is fine; the buffer is only flushed on external state changes. (v0.8 added `fan_mode` to this list because fan-mode changes alter the room's thermal dynamics — the prior slope data isn't representative of the new fan setting.)
+
+## Model-predictive control (v0.8)
+
+Where the v0.7 predictor anticipates *individual decisions*, v0.8's MPC scores *whole cycles*. Each refresh, with both `learning_enabled` and `mpc_enabled` ON and `mpc_ready` True:
+
+1. **Enumerate** a small action space — currently `{idle, heat → inputs.high, cool → inputs.low}`. (v0.9 will grow this to include per-fan-mode candidates.)
+2. **Simulate** each candidate forward over `mpc_horizon_minutes` (default 20 min) by integrating at 1-minute steps using the matching learned slope (`idle`, `recovery_heat`, or `recovery_cool`).
+3. **Score** by minutes-in-band over the horizon, with a midpoint-distance tie-break to stabilise indeterminate cases.
+4. **Pick** the highest-scoring action.
+
+Why heat targets the band's **high** edge (not `low`): the target_temp value goes into `climate.set_temperature`. Aiming the climate at `low` lets its own internal hysteresis release heat as soon as the room reaches `low`, leaving the room oscillating across the band edge (the original v0.7 gym observation). Aiming higher means the climate keeps heating until *we* issue idle. The MPC's cost function re-evaluates idle every refresh and picks it once projected drift-down stays inside band longer than projected continued heating. Net effect: longer heat cycles, fewer compressor starts, and (usually) room oscillation that stays inside the band.
+
+**Cold-start gate.** MPC needs all three slopes (idle, recovery_heat, recovery_cool) to compare candidates honestly. Until each segment has logged at least `SLOPE_MIN_SAMPLES` (4) samples — typically a few hours into mixed operation — `binary_sensor.{zone}_mpc_ready` is `off` and the coordinator silently falls back to the v0.7 predictor. The `mpc_action` sensor still populates during the warm-up (it mirrors the predictor's decision while not ready) so you can flip `mpc_enabled` on whenever you're ready — MPC takes over the moment the gate flips.
+
+**Recommended rollout.** Enable `learning_enabled` first; watch `predicted_action` track `current_action` for a few days. Then enable `mpc_enabled` and compare `mpc_action` against `predicted_action` (visible in the device's diagnostic section). The two should agree most of the time but periodically diverge — MPC stays idle longer, fires heat earlier, cools to a different edge. Once the divergence pattern looks right, leave `mpc_enabled` on and tune `mpc_horizon_minutes` (longer horizon = more conservative).
+
+**Energy trade-off.** Targeting the band's opposite edge means heat / cool cycles run longer than in v0.7 — fewer cycles but more energy per cycle. v0.9's fan-mode extension will add a fan-speed penalty to the cost function so MPC can prefer "heat at fan_low for longer" over "heat at fan_high for shorter" when both score similar time-in-band.
+
+Existing gates still apply on top: MPC-anticipated heat is still subject to `min_cycle_minutes`, and MPC-anticipated heat↔cool flips are still subject to `cross_mode_min_minutes`. Setpoint commands are rounded to the climate entity's `target_temperature_step` (fallback 0.5 °C) before being issued so our `_last_command_state` snapshot matches what the climate will actually settle at.
 
 ### Profile manager entity attributes
 

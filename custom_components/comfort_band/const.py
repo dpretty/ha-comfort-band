@@ -83,6 +83,24 @@ DEFAULT_PASSIVE_TOLERANCE_C: Final = 0.5
 PASSIVE_TOLERANCE_MIN: Final = 0.0
 PASSIVE_TOLERANCE_MAX: Final = 2.0
 
+# Model-predictive control (v0.8+). At each refresh, MPC enumerates a small
+# action space ({idle, heat, cool} in v0.8; will grow to include fan modes in
+# v0.9), simulates each forward over `mpc_horizon_minutes` using the per-action
+# slopes from v0.6, and picks the action that maximises projected time-in-band.
+# See `mpc.py` for the planner. Strict cold-start gate: all three slopes must
+# be present, otherwise the coordinator falls back to the v0.7 predictor.
+DEFAULT_MPC_HORIZON_MINUTES: Final = 20
+MPC_HORIZON_MIN: Final = 10
+MPC_HORIZON_MAX: Final = 60
+# Time step used by `mpc.simulate` when integrating forward. 1.0 minute keeps
+# the simulation cheap (≤60 iterations per action per refresh) and matches the
+# resolution of the underlying slope estimator (which produces °C/minute).
+MPC_SIMULATION_STEP_MINUTES: Final = 1.0
+# Small bias toward midpoint when actions tie on `time_in_band_minutes`.
+# Used as the second sort key; resolves indeterminacy when e.g. idle with flat
+# slope and heat with mildly positive slope both stay in band the whole horizon.
+MPC_TIE_BREAK_EPSILON_C: Final = 0.001
+
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0
 TEMP_MAX: Final = 26.0

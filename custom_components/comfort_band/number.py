@@ -1,11 +1,11 @@
 """Per-zone number entities.
 
-Nine tunables are exposed as `number.{zone}_<key>`. Two of them
+Ten tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other seven (`override_hours`, `deadband_below`, `deadband_above`,
+The other eight (`override_hours`, `deadband_below`, `deadband_above`,
 `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`,
-`passive_tolerance`) are simple persisted tunables.
+`passive_tolerance`, `mpc_horizon_minutes`) are simple persisted tunables.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from .const import (
     DOMAIN,
     LOOKAHEAD_MAX,
     LOOKAHEAD_MIN,
+    MPC_HORIZON_MAX,
+    MPC_HORIZON_MIN,
     PASSIVE_TOLERANCE_MAX,
     PASSIVE_TOLERANCE_MIN,
     TEMP_MAX,
@@ -120,6 +122,14 @@ _SPECS: tuple[_NumberSpec, ...] = (
         max_value=PASSIVE_TOLERANCE_MAX,
         step=0.1,
         unit=UnitOfTemperature.CELSIUS,
+    ),
+    _NumberSpec(
+        key="mpc_horizon_minutes",
+        field="mpc_horizon_minutes",
+        min_value=MPC_HORIZON_MIN,
+        max_value=MPC_HORIZON_MAX,
+        step=1,
+        unit=UnitOfTime.MINUTES,
     ),
 )
 
