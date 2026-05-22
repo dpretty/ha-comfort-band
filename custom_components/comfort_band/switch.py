@@ -64,6 +64,33 @@ class LearningEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
         await self.coordinator.async_set_learning_enabled(False)
 
 
+class MpcEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
+    """Master gate for the v0.8 model-predictive controller. Default OFF.
+
+    Layered on top of `learning_enabled`: both must be ON for MPC's decision
+    to be used, AND MPC must have its required slopes (see
+    `mpc.is_ready`). The `mpc_action` sensor populates regardless so users
+    can shadow-compare against `predicted_action` and `current_action`
+    before flipping it. The `mpc_ready` binary sensor exposes the cold-start
+    gate so the user sees why MPC isn't firing during the warm-up window.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "mpc_enabled")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.zone["mpc_enabled"]
+
+    async def async_turn_on(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_mpc_enabled(True)
+
+    async def async_turn_off(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_mpc_enabled(False)
+
+
 class UseApparentTemperatureSwitch(ComfortBandZoneEntity, SwitchEntity):
     """When ON, hysteresis decisions consume the apparent (humidity-adjusted)
     temperature instead of the raw room reading. Falls back to room temp
@@ -96,6 +123,7 @@ async def async_setup_entry(
         [
             EnabledSwitch(coordinator),
             LearningEnabledSwitch(coordinator),
+            MpcEnabledSwitch(coordinator),
             UseApparentTemperatureSwitch(coordinator),
         ]
     )

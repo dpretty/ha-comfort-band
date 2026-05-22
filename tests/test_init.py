@@ -21,6 +21,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "number.office_cross_mode_minimum_minutes",
     "number.office_lookahead_minutes",
     "number.office_passive_tolerance",
+    "number.office_mpc_horizon_minutes",  # v0.8
     "sensor.office_effective_low",
     "sensor.office_effective_high",
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror
@@ -29,10 +30,13 @@ _EXPECTED_ZONE_ENTITIES = (
     "sensor.office_current_action",
     "sensor.office_thermal_slope",
     "sensor.office_predicted_action",
+    "sensor.office_mpc_action",  # v0.8
     "binary_sensor.office_override_active",
+    "binary_sensor.office_mpc_ready",  # v0.8
     "button.office_cancel_override",
     "switch.office_enabled",
     "switch.office_learning_enabled",
+    "switch.office_mpc_enabled",  # v0.8
     "switch.office_use_apparent_temperature",
 )
 

@@ -1137,3 +1137,400 @@ async def test_passive_acceptance_suppresses_heat_end_to_end(
     set_modes = _calls_for(climate_calls, "set_hvac_mode")
     assert all(c["hvac_mode"] != HVAC_MODE_HEAT for c in set_modes), set_modes
     await coordinator.async_unload()
+
+
+# ----- v0.8 MPC -----
+
+
+def _seed_full_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> None:
+    """Pre-populate samples covering idle / heat / cool trailing runs so MPC's
+    `is_ready` check returns True. Layout (oldest → newest):
+      - cool segment 60-50 min ago
+      - heat segment 40-30 min ago
+      - idle segment 20-10 min ago
+    `_latest_run_of` walks backwards by action class, so each segment is
+    recoverable independently. WLS recency weighting (τ=20 min) means the
+    most recent (idle) gets full weight; older segments still produce a
+    slope estimate.
+    """
+    from custom_components.comfort_band.const import ACTION_COOL, ACTION_HEAT, ACTION_IDLE
+    from custom_components.comfort_band.predictor import Sample
+
+    samples: list[Sample] = []
+    base = now - timedelta(minutes=60)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=22.0 - 0.02 * i,
+                action=ACTION_COOL,
+            )
+        )
+    base = now - timedelta(minutes=40)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=20.0 + 0.04 * i,
+                action=ACTION_HEAT,
+            )
+        )
+    base = now - timedelta(minutes=20)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=21.0,
+                action=ACTION_IDLE,
+            )
+        )
+    coordinator._samples_cache = samples
+
+
+async def test_three_way_gate_routes_to_mpc_when_enabled_and_ready(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """With learning_enabled=True, mpc_enabled=True, and full slope data,
+    the final decision must equal MPC's decision (not the predictor's).
+
+    Setup: room just above hyst deadband (no heat from hyst), positive heat
+    slope (MPC's heat candidate stays in band, idle drift stays flat).
+    Hyst+predictor both say idle; MPC picks heat. The divergence proves
+    the gate routed to MPC.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is True
+    # The shadow signals diverge: hyst+predictor say idle, MPC says heat.
+    assert coordinator.data.predicted_decision.action == ACTION_IDLE
+    assert coordinator.data.mpc_decision.action == ACTION_HEAT
+    # The gate routed to MPC's decision.
+    assert coordinator.data.decision.action == ACTION_HEAT
+    # v0.8 contract: MPC's heat action targets the band's *high* edge (not
+    # `low`), so the climate keeps heating until MPC itself elects idle.
+    # Pin this end-to-end — `test_mpc.py` covers it at the unit level but
+    # only the integration path proves the high-edge value reaches climate.
+    assert coordinator.data.decision.target_temp == coordinator.data.effective_high
+    await coordinator.async_unload()
+
+
+async def test_three_way_gate_routes_to_predictor_when_mpc_disabled(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """learning_enabled=True, mpc_enabled=False → final == predictor.
+    Even with full slope data available, MPC's decision is computed in
+    shadow but not used.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # mpc_ready stays exposed; MPC's shadow decision still populates.
+    assert coordinator.data.mpc_ready is True
+    # But the gate uses predictor (idle for this setup), not MPC (heat).
+    assert coordinator.data.decision.action == coordinator.data.predicted_decision.action
+    assert coordinator.data.decision.action != coordinator.data.mpc_decision.action
+    await coordinator.async_unload()
+
+
+async def test_three_way_gate_routes_to_predictor_when_mpc_enabled_but_not_ready(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """learning_enabled=True, mpc_enabled=True, but cold start (only idle
+    samples present, recovery_heat/cool missing) → MPC silently falls back
+    to predictor. Tests the cold-start UX: user opts in but MPC waits for
+    data without affecting behaviour.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
+    # Only idle samples — recovery_heat and recovery_cool slopes will be None.
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=0.0, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is False
+    # mpc_decision equals predictor_decision (the fallback path).
+    assert coordinator.data.mpc_decision == coordinator.data.predicted_decision
+    # And the gate's `elif learning_enabled` branch governs final_decision.
+    assert coordinator.data.decision == coordinator.data.predicted_decision
+    await coordinator.async_unload()
+
+
+async def test_three_way_gate_routes_to_hysteresis_when_learning_off(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """learning_enabled=False (default) → final == hysteresis, even if
+    mpc_enabled is True (mpc_enabled is layered on learning_enabled). Locks
+    in that flipping mpc_enabled alone doesn't bypass the master gate.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Deliberately set mpc_enabled=True but leave learning_enabled=False.
+    await coordinator._store.async_update_zone("office", mpc_enabled=True)
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # mpc_ready exposes the data state regardless of switches.
+    assert coordinator.data.mpc_ready is True
+    # But the gate ignores MPC because learning is off.
+    # Hyst says idle (room 19.3 > deadband entry 19.2).
+    assert coordinator.data.decision.action == ACTION_IDLE
+    await coordinator.async_unload()
+
+
+async def test_sample_records_fan_mode_from_climate_state(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """The coordinator reads the climate's current `fan_mode` attribute and
+    threads it into the appended sample. v0.9 partitions slopes by
+    `(action, fan_mode)`; the data has to be in the buffer to use later.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"fan_mode": "high"})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    fan_modes = [s.fan_mode for s in coordinator._samples_cache]
+    assert "high" in fan_modes, fan_modes
+    await coordinator.async_unload()
+
+
+async def test_sample_records_none_fan_mode_when_attribute_missing(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """When the climate entity is missing or its `fan_mode` attribute isn't
+    present, samples get fan_mode=None — they don't drop or raise. Some
+    climate platforms simply don't expose fan_mode at all.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Climate entity exists but no fan_mode attribute.
+    hass.states.async_set(CLIMATE_ENTITY, "off", {})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert len(coordinator._samples_cache) >= 1
+    assert all(s.fan_mode is None for s in coordinator._samples_cache)
+    await coordinator.async_unload()
+
+
+async def test_target_temp_rounded_to_climate_step_0_5(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A heat target that's not aligned to the climate's 0.5 °C step gets
+    rounded before the service call. Without this, the climate platform
+    coerces silently and our `_last_command_state` snapshot mismatches the
+    observed state on every refresh.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": 0.5})
+    # Custom manual_low that doesn't align to 0.5 (19.7).
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # 19.7 / 0.5 = 39.4 → banker's rounding gives 39 → 39 * 0.5 = 19.5.
+    assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_rounded_to_climate_step_0_1(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Climate entities advertising a finer step (e.g., 0.1 °C, common on
+    some Mitsubishi units) accept the precise value — no rounding loss."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": 0.1})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # 19.7 / 0.1 = 197 → 197 * 0.1 = 19.7 (modulo float epsilon).
+    assert any(abs(c["temperature"] - 19.7) < 1e-6 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_rounded_to_default_step_when_attribute_missing(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """When the climate entity lacks `target_temp_step`, fall back to 0.5 °C
+    (the most common HVAC resolution). Without this fallback, missing-
+    attribute climates would receive precise float setpoints they may
+    silently coerce.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Climate state set but no target_temp_step attribute.
+    hass.states.async_set(CLIMATE_ENTITY, "off", {})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # 19.7 rounded to 0.5 step → 19.5.
+    assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_passes_through_when_climate_reports_zero_step(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Defensive: a corrupt/0 climate attribute mustn't cause a divide-by-zero
+    in `_round_to_step`. The raw setpoint should pass through unchanged.
+    `step <= 0` is the explicit guard in `_round_to_step`; this pins it.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": 0})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # No rounding applied -- precise input value passes through.
+    assert any(abs(c["temperature"] - 19.7) < 1e-6 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_target_temp_falls_back_to_default_step_on_nan_attribute(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A misbehaving climate platform could advertise `target_temp_step=nan`.
+    `float("nan")` succeeds, so without an explicit `math.isfinite` guard the
+    NaN propagates into `_round_to_step`, where `int(round(x / nan))` raises
+    ValueError and crashes `_maybe_apply_action` on every refresh.
+
+    Pins the `math.isfinite` guard in `_target_temp_step` — NaN must fall
+    back to the default 0.5 °C step.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"target_temp_step": float("nan")})
+    await coordinator._store.async_update_zone("office", manual_low=19.7)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    set_temps = _calls_for(climate_calls, "set_temperature")
+    # 19.7 rounded to the fallback 0.5 step -> 19.5. The key assertion is
+    # that we reach this point at all (no ValueError crash).
+    assert any(c["temperature"] == 19.5 for c in set_temps), set_temps
+    await coordinator.async_unload()
+
+
+async def test_manual_fan_mode_change_flushes_sample_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Manual fan-mode changes alter the room's thermal dynamics — slope
+    estimator data from the prior fan_mode is no longer representative.
+    Detected by `_on_climate_state_change` comparing fan_mode and flushing
+    the buffer, same as for hvac_mode / temperature mismatches.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Establish a baseline command + buffer (with fan_mode=low at command time).
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"fan_mode": "low"})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(coordinator._samples_cache) >= 1
+    assert coordinator._last_command_state is not None
+    assert coordinator._last_command_state.get("fan_mode") == "low"
+
+    # Manual fan-mode change well outside the echo window.
+    freezer.tick(timedelta(minutes=10))
+    old_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "low"})
+    new_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "high"})
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {"entity_id": CLIMATE_ENTITY, "old_state": old_state, "new_state": new_state},
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache == []
+    await coordinator.async_unload()
+
+
+async def test_mpc_ready_false_with_empty_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Fresh install / fresh restart with empty buffer → mpc_ready False.
+    The binary sensor reflects this directly."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is False
+    await coordinator.async_unload()
+
+
+async def test_mpc_ready_true_with_full_slope_data(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Mirror of the above: with idle + heat + cool segments all having
+    enough samples, mpc_ready True."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is True
+    await coordinator.async_unload()

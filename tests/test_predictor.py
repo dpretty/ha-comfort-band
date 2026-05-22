@@ -745,6 +745,55 @@ def test_append_sample_count_cap() -> None:
     assert len(new) == SAMPLE_MAX_COUNT
 
 
+def test_append_sample_records_fan_mode() -> None:
+    """v0.8: the coordinator passes the climate's current fan_mode; the
+    appended sample must carry it through. v0.9's per-fan-mode slope
+    segmentation depends on this being recorded faithfully."""
+    new, appended = append_sample([], now=_T0, temp=21.0, action=ACTION_IDLE, fan_mode="med")
+    assert appended is True
+    assert new[0].fan_mode == "med"
+
+
+def test_append_sample_records_none_fan_mode() -> None:
+    """Climate entities that don't expose `fan_mode` (or transient missing
+    attribute) yield fan_mode=None. The sample still appends."""
+    new, appended = append_sample([], now=_T0, temp=21.0, action=ACTION_IDLE, fan_mode=None)
+    assert appended is True
+    assert new[0].fan_mode is None
+
+
+def test_append_sample_fan_mode_change_does_not_force_append() -> None:
+    """v0.8 doesn't treat fan_mode transitions as segment boundaries — slope
+    estimation ignores fan_mode here, so a fan-mode change inside the
+    rate-limit window would only inflate the buffer without affecting
+    control. (v0.9 may revisit when slopes partition by fan_mode.)
+    """
+    samples = [Sample(t=_T0, temp=21.0, action=ACTION_IDLE, fan_mode="low")]
+    next_t = _T0 + timedelta(seconds=SAMPLE_MIN_INTERVAL_S - 1)
+    _new, appended = append_sample(
+        samples, now=next_t, temp=21.1, action=ACTION_IDLE, fan_mode="high"
+    )
+    assert appended is False
+
+
+def test_estimate_slopes_ignores_fan_mode_in_v0_8() -> None:
+    """Mixed fan-mode samples within a single action segment still produce
+    one slope per action. v0.9 partitions by (action, fan_mode); v0.8 must
+    not pre-partition or the v0.7 estimator behaviour regresses.
+    """
+    samples = []
+    for i in range(8):
+        t = _T0 + timedelta(seconds=120 * i)
+        # Alternate fan_mode every other sample — would split into 4 segments
+        # if estimate_slopes did naive segmentation by (action, fan_mode).
+        fan = "low" if i % 2 == 0 else "high"
+        samples.append(Sample(t=t, temp=21.0 + 0.05 * i, action=ACTION_IDLE, fan_mode=fan))
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    # 0.05 °C / 120 s = 0.025 °C/min = 1.5 °C/h. One slope, all 8 samples used.
+    assert slopes.idle is not None
+    assert slopes.sample_count == 8
+
+
 # ----- serialization -----
 
 
@@ -752,6 +801,50 @@ def test_sample_roundtrip() -> None:
     s = Sample(t=_T0, temp=21.5, action=ACTION_HEAT)
     restored = sample_from_dict(sample_to_dict(s))
     assert restored == s
+
+
+def test_sample_roundtrip_preserves_fan_mode() -> None:
+    """v0.8 added fan_mode to Sample. Persisted samples must round-trip the
+    value so the v0.9 slope-by-fan-mode segmentation works on existing data.
+    """
+    s = Sample(t=_T0, temp=21.5, action=ACTION_HEAT, fan_mode="high")
+    restored = sample_from_dict(sample_to_dict(s))
+    assert restored == s
+    assert restored is not None
+    assert restored.fan_mode == "high"
+
+
+def test_sample_from_dict_accepts_missing_fan_mode_key() -> None:
+    """v0.7 payloads don't have `fan_mode` in the SerializedSample. After
+    upgrade, those samples must continue to load (with fan_mode=None) rather
+    than being dropped. `NotRequired` + `.get()` makes this work.
+    """
+    legacy = {"t": _T0.isoformat(), "temp": 21.0, "action": ACTION_IDLE}
+    restored = sample_from_dict(legacy)  # type: ignore[arg-type]
+    assert restored is not None
+    assert restored.fan_mode is None
+    assert restored.t == _T0
+    assert restored.temp == 21.0
+    assert restored.action == ACTION_IDLE
+
+
+def test_sample_from_dict_accepts_explicit_none_fan_mode() -> None:
+    """The v0.8 write path stores `fan_mode: None` when the climate entity
+    doesn't expose one. Distinct from the missing-key case above — both must
+    round-trip to a Sample with fan_mode=None."""
+    payload = {"t": _T0.isoformat(), "temp": 21.0, "action": ACTION_IDLE, "fan_mode": None}
+    restored = sample_from_dict(payload)  # type: ignore[arg-type]
+    assert restored is not None
+    assert restored.fan_mode is None
+
+
+def test_sample_from_dict_rejects_non_string_fan_mode() -> None:
+    """Hand-edited `.storage` could put a non-string under `fan_mode`. Same
+    strictness as the `action` field — drop the sample rather than crash the
+    consumer downstream.
+    """
+    bad = {"t": _T0.isoformat(), "temp": 21.0, "action": ACTION_IDLE, "fan_mode": 42}
+    assert sample_from_dict(bad) is None  # type: ignore[arg-type]
 
 
 def test_sample_from_dict_returns_none_on_corrupt_timestamp() -> None:

@@ -47,6 +47,9 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["lookahead_minutes"] == 5
     # v0.7 passive drift acceptance: 0.5 °C comfort floor by default.
     assert zone["passive_tolerance"] == 0.5
+    # v0.8 MPC: off by default (layered on learning_enabled), 20-min horizon.
+    assert zone["mpc_enabled"] is False
+    assert zone["mpc_horizon_minutes"] == 20
 
 
 # ----- round-trip persistence -----
@@ -630,6 +633,156 @@ async def test_load_legacy_v0_6_zone_backfills_passive_tolerance(
     # And update_zone now works on the new field without KeyError.
     await store.async_update_zone("office", passive_tolerance=1.0)
     assert store.get_zone("office")["passive_tolerance"] == 1.0
+
+
+async def test_load_legacy_v0_7_zone_backfills_mpc_enabled(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A v0.7 zone payload (has passive_tolerance but no `mpc_enabled`) must
+    backfill the v0.8 MPC switch field to False. Default-OFF preserves the
+    v0.7 predictor behaviour on upgrade."""
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "cross_mode_min_minutes": 8,
+                    "previous_action": None,
+                    "samples": [],
+                    "lookahead_minutes": 5,
+                    "passive_tolerance": 0.5,
+                    # NB: no mpc_enabled or mpc_horizon_minutes.
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.get_zone("office")["mpc_enabled"] is False
+
+
+async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.7 zone payload also lacks `mpc_horizon_minutes`. Backfill should
+    set it to the conservative default (20 min). Kept as a separate test
+    from the mpc_enabled backfill so each fails one guard.
+    """
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "cross_mode_min_minutes": 8,
+                    "previous_action": None,
+                    "samples": [],
+                    "lookahead_minutes": 5,
+                    "passive_tolerance": 0.5,
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.get_zone("office")["mpc_horizon_minutes"] == 20
+
+
+# (Default-value assertions for the new v0.8 MPC fields live in
+# `test_default_zone_has_sane_initial_values` above — the canonical test for
+# new-install defaults.)
+
+
+async def test_legacy_v0_7_samples_load_with_fan_mode_none(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.7 SerializedSample entries lack `fan_mode`. After upgrade they must
+    still load — backfill is implicit via NotRequired + `sample_from_dict`'s
+    `.get("fan_mode")` returning None. The sample becomes effectively
+    "unknown fan mode" until enough fresh samples accumulate post-upgrade.
+    """
+    legacy_samples = [
+        {"t": "2026-05-19T12:00:00+00:00", "temp": 21.0, "action": "idle"},
+        {"t": "2026-05-19T12:02:00+00:00", "temp": 21.1, "action": "idle"},
+    ]
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "cross_mode_min_minutes": 8,
+                    "previous_action": None,
+                    "samples": legacy_samples,
+                    "lookahead_minutes": 5,
+                    "passive_tolerance": 0.5,
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    "last_action_at": None,
+                    "last_action": None,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    # Samples persist unchanged on disk (NotRequired field); the predictor
+    # layer is responsible for converting on read.
+    assert store.get_zone("office")["samples"] == legacy_samples
 
 
 async def test_samples_persist_across_store_instances(

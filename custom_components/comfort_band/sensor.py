@@ -192,6 +192,27 @@ class PredictedActionSensor(ComfortBandZoneEntity, SensorEntity):
         return self.coordinator.data.predicted_decision.action
 
 
+class MpcActionSensor(ComfortBandZoneEntity, SensorEntity):
+    """What MPC would issue right now (always populated, regardless of
+    `mpc_enabled`). Mirrors `PredictedActionSensor` but for the v0.8
+    layer — same shadow-mode discipline so users can flip `mpc_enabled`
+    once the value tracks expectation. Falls back to the predictor's
+    decision when `mpc_ready` is False (cold start), so the sensor stays
+    meaningful during warm-up.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "mpc_action")
+        self._attr_options = [ACTION_HEAT, ACTION_COOL, ACTION_IDLE, ACTION_UNKNOWN]
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.data.mpc_decision.action
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -206,5 +227,6 @@ async def async_setup_entry(
             CurrentActionSensor(coordinator),
             ThermalSlopeSensor(coordinator),
             PredictedActionSensor(coordinator),
+            MpcActionSensor(coordinator),
         ]
     )
