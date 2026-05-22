@@ -17,10 +17,20 @@ issue idle. The MPC's cost function re-evaluates idle every refresh and
 picks it once projected drift-down stays inside band longer than projected
 continued heating.
 
-Strict cold-start gate: requires all three slopes (idle, recovery_heat,
-recovery_cool) to be present. Falls back to the v0.7 predictor decision
-silently when any slope is None — the caller (coordinator) exposes the gate
-state via the `mpc_ready` binary sensor so users see why MPC isn't firing.
+Cold-start gate (v0.8.1+): requires `idle_slope` (the cost-function
+baseline) plus at least one recovery slope. Heat-only zones (winter / fresh
+install in cold months) activate MPC once `idle` + `recovery_heat` slopes
+accumulate; cool-only zones once `idle` + `recovery_cool` are available;
+fully-equipped zones get the richest decision surface (all three
+candidates). Falls back to the v0.7 predictor silently when not ready —
+the caller (coordinator) exposes the gate state via the `mpc_ready` binary
+sensor so users see why MPC isn't firing.
+
+When ready but the room is clearly outside band on a side whose recovery
+slope hasn't accumulated (e.g. a heat-only zone suddenly needs cooling),
+`plan` defers to the predictor for that refresh — the predictor's
+hysteresis fires the correct direction reactively. Silent fallback, same
+posture as the not-ready path.
 
 The planner is pure: state in / decision out, no IO. `simulate` does its
 own 1-minute integration so the cost function tracks any nonlinearities the
@@ -177,19 +187,26 @@ def simulate(
 
 
 def is_ready(slopes: ThermalSlopes) -> bool:
-    """True when all three slopes are available; gates MPC activation.
+    """True when MPC has the slope data to compare at least two candidates.
 
-    Stricter than the v0.7 predictor (which falls through per-branch on
-    missing slopes) — MPC enumerates the full action space, so partial data
-    would lead to non-comparable scores. A zone that has only ever heated
-    will have `recovery_cool=None` indefinitely (correct, not a bug); the
-    coordinator silently uses the v0.7 predictor for those zones until the
-    first cool segment accumulates SLOPE_MIN_SAMPLES samples.
+    Requires `idle_slope` (the cost-function baseline — every refresh scores
+    "stay idle" against the alternatives) and at least one recovery slope
+    (otherwise there's only one candidate and nothing to compare against).
+
+    Heat-only zones (winter use, or fresh install in cold months) reach this
+    state after the first idle and heat segments accumulate; cool-only zones
+    after the first idle and cool segments. Fully-equipped zones (both
+    recoveries) get the richest decision surface — `plan` will pick from
+    `{idle, heat, cool}` rather than `{idle, heat}` or `{idle, cool}`.
+
+    v0.8.0 required all three slopes; that locked unilateral-mode zones
+    (heat-only / cool-only) out of MPC entirely because the unused direction's
+    slope would never accumulate. v0.8.1 relaxes the gate and handles the
+    rare "wrong-direction-needed" case via a per-refresh safety bail-out in
+    `plan`.
     """
-    return (
-        slopes.idle is not None
-        and slopes.recovery_heat is not None
-        and slopes.recovery_cool is not None
+    return slopes.idle is not None and (
+        slopes.recovery_heat is not None or slopes.recovery_cool is not None
     )
 
 
@@ -216,10 +233,25 @@ def plan(
     if not is_ready(slopes):
         return predictor_decision
 
-    scores = [
-        simulate(a, slopes, inputs, horizon_minutes=horizon_minutes)
-        for a in enumerate_actions(inputs)
-    ]
+    # Safety bail-out: the room is clearly outside band on a side whose
+    # recovery slope we don't have. MPC's "best of available" would likely
+    # pick idle (the only meaningful candidate when the matching recovery
+    # is missing), leaving the room out of band. The predictor's per-branch
+    # fallback (and hysteresis behind it) will fire the right direction
+    # reactively — defer cleanly. Silent fallback consistent with the
+    # not-ready path above.
+    if inputs.room < inputs.low and slopes.recovery_heat is None:
+        return predictor_decision
+    if inputs.room > inputs.high and slopes.recovery_cool is None:
+        return predictor_decision
+
+    # Drop candidates whose matching recovery slope is unavailable.
+    # `ThermalSlopes.for_action` is the single dispatch point for "which
+    # slope does this action produce" — reusing it keeps this filter and
+    # `simulate`'s slope-pick consistent. Idle (slopes.idle) is guaranteed
+    # available by `is_ready` above, so idle always survives the filter.
+    candidates = [a for a in enumerate_actions(inputs) if slopes.for_action(a.kind) is not None]
+    scores = [simulate(a, slopes, inputs, horizon_minutes=horizon_minutes) for a in candidates]
     # Larger time_in_band wins; on ties, smaller midpoint_distance wins
     # (closer to band centre).
     best = max(

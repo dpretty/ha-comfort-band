@@ -23,6 +23,7 @@ from custom_components.comfort_band.const import (
 from custom_components.comfort_band.hysteresis import (
     UNKNOWN_DECISION,
     HysteresisInputs,
+    cool_decision,
     heat_decision,
     idle_decision,
 )
@@ -270,15 +271,28 @@ def test_is_ready_true_when_all_slopes_present() -> None:
 
 
 def test_is_ready_false_when_idle_slope_missing() -> None:
+    # `idle_slope` is the cost-function baseline — every refresh scores
+    # "stay idle" against alternatives. Without it MPC can't act.
     assert is_ready(_slopes(idle=None, recovery_heat=0.05, recovery_cool=-0.05)) is False
 
 
-def test_is_ready_false_when_recovery_heat_missing() -> None:
-    assert is_ready(_slopes(idle=0.0, recovery_heat=None, recovery_cool=-0.05)) is False
+def test_is_ready_true_when_only_recovery_heat_present() -> None:
+    """v0.8.1: heat-only zones activate MPC once idle + heat slopes
+    accumulate. The unused cool slope never accumulating shouldn't block
+    MPC from running at all (the v0.8.0 behaviour)."""
+    assert is_ready(_slopes(idle=0.0, recovery_heat=0.05, recovery_cool=None)) is True
 
 
-def test_is_ready_false_when_recovery_cool_missing() -> None:
-    assert is_ready(_slopes(idle=0.0, recovery_heat=0.05, recovery_cool=None)) is False
+def test_is_ready_true_when_only_recovery_cool_present() -> None:
+    """Symmetric: cool-only zones (summer installs) activate MPC once idle
+    + cool slopes accumulate."""
+    assert is_ready(_slopes(idle=0.0, recovery_heat=None, recovery_cool=-0.05)) is True
+
+
+def test_is_ready_false_when_only_idle_present() -> None:
+    """Idle alone isn't enough — there's only one candidate to score, and
+    no meaningful comparison. Defer to the predictor in this state."""
+    assert is_ready(_slopes(idle=0.0, recovery_heat=None, recovery_cool=None)) is False
 
 
 # ----- plan -----
@@ -308,10 +322,12 @@ def test_plan_falls_back_to_predictor_when_idle_slope_missing() -> None:
     assert result == predictor_decision
 
 
-def test_plan_falls_back_to_predictor_when_recovery_heat_missing() -> None:
+def test_plan_falls_back_to_predictor_when_both_recovery_slopes_missing() -> None:
+    """v0.8.1: idle-only zones can't compare candidates meaningfully. Defer
+    to the predictor regardless of room position."""
     predictor_decision = idle_decision()
     result = plan(
-        _slopes(recovery_heat=None),
+        _slopes(recovery_heat=None, recovery_cool=None),
         _inputs(21.5),
         horizon_minutes=20,
         predictor_decision=predictor_decision,
@@ -319,11 +335,67 @@ def test_plan_falls_back_to_predictor_when_recovery_heat_missing() -> None:
     assert result == predictor_decision
 
 
-def test_plan_falls_back_to_predictor_when_recovery_cool_missing() -> None:
-    predictor_decision = idle_decision()
+def test_plan_in_band_heat_only_zone_picks_from_idle_and_heat() -> None:
+    """v0.8.1: heat-only zone (cool slope missing) with room inside band.
+    MPC scores {idle, heat} only — the cool candidate is filtered out
+    before simulate. With idle drifting down and heat keeping the room in
+    band, heat should win or idle should win cleanly without cool's
+    midpoint_distance polluting the tie-break.
+    """
+    # Room mid-band, idle slope flat (full horizon in band → 20 min), heat
+    # slope mild positive (also full horizon in band → 20 min). Tie-break:
+    # heat ends at 21.5 (midpoint) → distance 0; idle ends at 21.0 →
+    # distance 0.5. Heat wins.
     result = plan(
-        _slopes(recovery_cool=None),
-        _inputs(21.5),
+        _slopes(idle=0.0, recovery_heat=0.025, recovery_cool=None),
+        _inputs(21.0, low=20.0, high=23.0),
+        horizon_minutes=20,
+        predictor_decision=idle_decision(),
+    )
+    assert result.action == ACTION_HEAT
+    assert result.target_temp == 23.0
+
+
+def test_plan_in_band_cool_only_zone_picks_from_idle_and_cool() -> None:
+    """Symmetric: cool-only zone, room mid-band. MPC scores {idle, cool}."""
+    # Room at 22.0, idle slope flat, cool slope mild negative. Idle ends
+    # at 22.0 (distance 0.5 from midpoint 21.5); cool ends at 21.5
+    # (distance 0). Cool wins the tie-break.
+    result = plan(
+        _slopes(idle=0.0, recovery_heat=None, recovery_cool=-0.025),
+        _inputs(22.0, low=20.0, high=23.0),
+        horizon_minutes=20,
+        predictor_decision=idle_decision(),
+    )
+    assert result.action == ACTION_COOL
+    assert result.target_temp == 20.0
+
+
+def test_plan_defers_to_predictor_when_room_below_band_without_heat_slope() -> None:
+    """v0.8.1 safety bail-out: cool-only zone, but room has dropped below
+    band. MPC can't model heating, so it shouldn't pick "best of idle / cool"
+    (which would likely be idle and leave the room cold). Defer to the
+    predictor — the hysteresis fallback will fire heat reactively.
+    """
+    predictor_decision = heat_decision(20.0)  # what the predictor would say
+    result = plan(
+        _slopes(idle=-0.05, recovery_heat=None, recovery_cool=-0.05),
+        # Room at 19.5 — below low=20.0.
+        _inputs(19.5, low=20.0, high=23.0),
+        horizon_minutes=20,
+        predictor_decision=predictor_decision,
+    )
+    assert result == predictor_decision
+
+
+def test_plan_defers_to_predictor_when_room_above_band_without_cool_slope() -> None:
+    """Symmetric to the above: heat-only zone, room rose above band.
+    MPC defers; the predictor / hysteresis fires cool reactively.
+    """
+    predictor_decision = cool_decision(23.0)
+    result = plan(
+        _slopes(idle=0.05, recovery_heat=0.05, recovery_cool=None),
+        _inputs(23.5, low=20.0, high=23.0),
         horizon_minutes=20,
         predictor_decision=predictor_decision,
     )
