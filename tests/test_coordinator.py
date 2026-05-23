@@ -1670,9 +1670,7 @@ async def test_three_way_gate_routes_to_mpc_with_heat_only_slopes(
     """
     freezer.move_to("2026-05-19 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone(
-        "office", learning_enabled=True, mpc_enabled=True
-    )
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
     _seed_heat_only_slope_data(coordinator, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "19.4", {})
     await coordinator.async_refresh()
@@ -1705,9 +1703,7 @@ async def test_safety_bailout_routes_through_predictor_when_room_outside_band(
     """
     freezer.move_to("2026-05-19 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone(
-        "office", learning_enabled=True, mpc_enabled=True
-    )
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
     # Cool-only zone (recovery_heat=None). Room below low (default 19.5).
     _seed_cool_only_slope_data(coordinator, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "18.5", {})
