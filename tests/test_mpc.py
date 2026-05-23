@@ -402,6 +402,46 @@ def test_plan_defers_to_predictor_when_room_above_band_without_cool_slope() -> N
     assert result == predictor_decision
 
 
+def test_plan_defers_at_exact_low_edge_without_heat_slope() -> None:
+    """v0.8.1 boundary: when room sits EXACTLY at the band's low edge in a
+    cool-only zone, the bail-out's inclusive `<=` triggers and defers to
+    the predictor. Without this, MPC could score idle vs cool and pick
+    idle on tie-break (idle's midpoint-distance fallback to abs(room - mid))
+    for one refresh before `room < low` flips True next cycle. Matches
+    simulate's inclusive band-membership check.
+
+    `predictor_decision` here is an arbitrary token — what matters is that
+    plan() returns it unchanged, proving the bail-out fired. The token's
+    specific action is irrelevant to this test's invariant; we use
+    heat_decision purely to make the assertion distinct from the
+    enumerate_actions output.
+    """
+    predictor_decision = heat_decision(20.0)
+    result = plan(
+        _slopes(idle=-0.05, recovery_heat=None, recovery_cool=-0.05),
+        _inputs(20.0, low=20.0, high=23.0),  # exactly at low edge
+        horizon_minutes=20,
+        predictor_decision=predictor_decision,
+    )
+    assert result == predictor_decision
+
+
+def test_plan_defers_at_exact_high_edge_without_cool_slope() -> None:
+    """Symmetric inclusive bail-out at the upper edge for heat-only zones.
+
+    Same caveat as the low-edge test: `predictor_decision` is an arbitrary
+    token — the invariant under test is that plan() returns it unchanged.
+    """
+    predictor_decision = cool_decision(23.0)
+    result = plan(
+        _slopes(idle=0.05, recovery_heat=0.05, recovery_cool=None),
+        _inputs(23.0, low=20.0, high=23.0),  # exactly at high edge
+        horizon_minutes=20,
+        predictor_decision=predictor_decision,
+    )
+    assert result == predictor_decision
+
+
 def test_plan_picks_idle_when_idle_stays_in_band_longer_than_heat_or_cool() -> None:
     """Synthetic scenario: room at midpoint, idle slope flat (full horizon in
     band), heat slope drives out the top, cool slope drives out the bottom.

@@ -66,7 +66,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | `sensor` | `predicted_action` | What the predictor would issue right now. Always populated; flip `learning_enabled` ON to forward to climate. |
 | `sensor` | `mpc_action` | What MPC would issue right now. Always populated (falls back to predictor's decision while `mpc_ready` is False); flip `mpc_enabled` ON (in addition to `learning_enabled`) to forward to climate. |
 | `binary_sensor` | `override_active` | True while override is in effect |
-| `binary_sensor` | `mpc_ready` | True when MPC has all three slopes (idle, recovery_heat, recovery_cool) available. Becomes True after the zone has logged at least one segment of each action — typically a few hours of normal operation. |
+| `binary_sensor` | `mpc_ready` | True when MPC has `idle_slope` and at least one recovery slope. Heat-only zones reach this after idle + heat segments accumulate; cool-only zones after idle + cool; fully-equipped zones after all three. Typically a few hours of normal operation. (v0.8.0 required all three slopes — the v0.8.1 relaxation lets unilateral-mode zones activate MPC.) |
 | `button` | `cancel_override` | Press to immediately end an override |
 | `switch` | `enabled` | Master kill — defaults OFF (shadow mode) |
 | `switch` | `learning_enabled` | Gates the v0.6 predictive controller. When ON, anticipated heat/cool decisions reach climate (subject to existing min-cycle and cross-mode gates). Anticipated idle releases bypass those gates so a cycle can always stop — same contract as v0.5. Default OFF. |

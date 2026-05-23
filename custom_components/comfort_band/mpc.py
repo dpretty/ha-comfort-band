@@ -26,11 +26,13 @@ candidates). Falls back to the v0.7 predictor silently when not ready —
 the caller (coordinator) exposes the gate state via the `mpc_ready` binary
 sensor so users see why MPC isn't firing.
 
-When ready but the room is clearly outside band on a side whose recovery
+When ready but the room is at or outside band on a side whose recovery
 slope hasn't accumulated (e.g. a heat-only zone suddenly needs cooling),
 `plan` defers to the predictor for that refresh — the predictor's
-hysteresis fires the correct direction reactively. Silent fallback, same
-posture as the not-ready path.
+hysteresis fires the correct direction reactively. The bail-out's boundary
+is inclusive (`<=` / `>=`) to match `simulate`'s band-membership check
+and close a single-refresh edge case where MPC could pick idle at the
+exact band edge. Silent fallback, same posture as the not-ready path.
 
 The planner is pure: state in / decision out, no IO. `simulate` does its
 own 1-minute integration so the cost function tracks any nonlinearities the
@@ -98,7 +100,13 @@ def enumerate_actions(inputs: HysteresisInputs) -> list[Action]:
 
     v0.9 will expand this to include per-fan-mode variants by reading the
     climate entity's `fan_modes` attribute (passed in via HysteresisInputs at
-    that point). For v0.8 the action space is fixed at three.
+    that point). For v0.8 the structural action space is fixed at three.
+
+    Note: v0.8.1+ `plan` filters this list by available recovery slopes
+    before scoring — unilateral-mode zones (heat-only or cool-only) end up
+    with two effective candidates at runtime. `enumerate_actions` itself
+    stays fixed so the structural action space is independent of the
+    current slope state.
     """
     return [
         Action(ACTION_IDLE, None),
@@ -233,16 +241,22 @@ def plan(
     if not is_ready(slopes):
         return predictor_decision
 
-    # Safety bail-out: the room is clearly outside band on a side whose
+    # Safety bail-out: the room is at or outside band on a side whose
     # recovery slope we don't have. MPC's "best of available" would likely
     # pick idle (the only meaningful candidate when the matching recovery
-    # is missing), leaving the room out of band. The predictor's per-branch
-    # fallback (and hysteresis behind it) will fire the right direction
-    # reactively — defer cleanly. Silent fallback consistent with the
-    # not-ready path above.
-    if inputs.room < inputs.low and slopes.recovery_heat is None:
+    # is missing), leaving the room drifting further out of band. The
+    # predictor's per-branch fallback (and hysteresis behind it) will fire
+    # the right direction reactively — defer cleanly. Silent fallback
+    # consistent with the not-ready path above.
+    #
+    # Inclusive `<=` / `>=` matches `simulate`'s band-membership check
+    # (`low <= temp <= high`) — when room sits exactly at the edge, the
+    # idle candidate scores indeterminately on the missing-recovery side
+    # and the tie-break could pick idle for one refresh before the next
+    # round catches it. Inclusive bail-out closes that 1-refresh gap.
+    if inputs.room <= inputs.low and slopes.recovery_heat is None:
         return predictor_decision
-    if inputs.room > inputs.high and slopes.recovery_cool is None:
+    if inputs.room >= inputs.high and slopes.recovery_cool is None:
         return predictor_decision
 
     # Drop candidates whose matching recovery slope is unavailable.

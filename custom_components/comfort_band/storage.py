@@ -120,11 +120,12 @@ class StoredZone(TypedDict):
     # `number.{zone}_passive_tolerance`. Default 0.5; range [0.0, 2.0].
     passive_tolerance: float
     # Gates the v0.8 model-predictive controller. When ON *and* learning is
-    # also ON *and* MPC has data for all three slopes (idle, recovery_heat,
-    # recovery_cool), `mpc.plan` replaces `predictor.decide` as the source of
-    # the final decision. Default OFF so existing v0.7 users see no
-    # behaviour change on upgrade; `sensor.{zone}_mpc_action` populates
-    # regardless so shadow-comparison is possible without flipping the gate.
+    # also ON *and* MPC has `idle_slope` plus at least one recovery slope
+    # (v0.8.1 relaxed gate; v0.8.0 required all three), `mpc.plan` replaces
+    # `predictor.decide` as the source of the final decision. Default OFF
+    # so existing v0.7 users see no behaviour change on upgrade;
+    # `sensor.{zone}_mpc_action` populates regardless so shadow-comparison
+    # is possible without flipping the gate.
     mpc_enabled: bool
     # Horizon over which `mpc.simulate` projects each candidate action's
     # outcome (minutes). Exposed as `number.{zone}_mpc_horizon_minutes`.

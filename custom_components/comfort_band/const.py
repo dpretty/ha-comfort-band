@@ -87,8 +87,9 @@ PASSIVE_TOLERANCE_MAX: Final = 2.0
 # action space ({idle, heat, cool} in v0.8; will grow to include fan modes in
 # v0.9), simulates each forward over `mpc_horizon_minutes` using the per-action
 # slopes from v0.6, and picks the action that maximises projected time-in-band.
-# See `mpc.py` for the planner. Strict cold-start gate: all three slopes must
-# be present, otherwise the coordinator falls back to the v0.7 predictor.
+# See `mpc.py` for the planner. Cold-start gate (v0.8.1+): requires
+# `idle_slope` and at least one recovery slope. Otherwise the coordinator
+# falls back to the v0.7 predictor silently.
 DEFAULT_MPC_HORIZON_MINUTES: Final = 20
 MPC_HORIZON_MIN: Final = 10
 MPC_HORIZON_MAX: Final = 60

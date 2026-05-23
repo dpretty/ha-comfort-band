@@ -1534,3 +1534,195 @@ async def test_mpc_ready_true_with_full_slope_data(
 
     assert coordinator.data.mpc_ready is True
     await coordinator.async_unload()
+
+
+def _seed_heat_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> None:
+    """v0.8.1 helper: pre-populate samples covering idle + heat only, leaving
+    `recovery_cool` unestablished. Models a heat-only zone (winter, or fresh
+    install in cold months) at the point where MPC should be eligible to
+    activate under the relaxed v0.8.1 gate.
+    """
+    from custom_components.comfort_band.const import ACTION_HEAT, ACTION_IDLE
+    from custom_components.comfort_band.predictor import Sample
+
+    samples: list[Sample] = []
+    base = now - timedelta(minutes=40)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=20.0 + 0.04 * i,
+                action=ACTION_HEAT,
+            )
+        )
+    base = now - timedelta(minutes=20)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=21.0,
+                action=ACTION_IDLE,
+            )
+        )
+    coordinator._samples_cache = samples
+
+
+async def test_mpc_ready_true_with_only_idle_and_heat_slopes(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.8.1 integration: a heat-only zone (no cool segment in the buffer)
+    must reach `mpc_ready=True` at the coordinator level — not just at the
+    `mpc.is_ready` unit-test level. Catches a regression where the
+    coordinator's `is_ready` call site (e.g. passing stale slopes) could
+    silently keep MPC off for unilateral-mode zones.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    _seed_heat_only_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is True
+    # And the recovery_cool slope is genuinely absent (proves the relaxation,
+    # not that we accidentally generated cool data).
+    assert coordinator.data.thermal_slopes.recovery_cool is None
+    await coordinator.async_unload()
+
+
+def _seed_cool_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> None:
+    """Symmetric to `_seed_heat_only_slope_data`: idle + cool segments, no
+    heat data. Models a cool-only zone (summer install) at the point where
+    v0.8.1's relaxed gate should activate MPC.
+    """
+    from custom_components.comfort_band.const import ACTION_COOL, ACTION_IDLE
+    from custom_components.comfort_band.predictor import Sample
+
+    samples: list[Sample] = []
+    base = now - timedelta(minutes=40)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=22.0 - 0.04 * i,
+                action=ACTION_COOL,
+            )
+        )
+    base = now - timedelta(minutes=20)
+    for i in range(6):
+        samples.append(
+            Sample(
+                t=base + timedelta(minutes=2 * i),
+                temp=21.0,
+                action=ACTION_IDLE,
+            )
+        )
+    coordinator._samples_cache = samples
+
+
+async def test_mpc_ready_true_with_only_idle_and_cool_slopes(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Symmetric to the heat-only integration test: cool-only zone (summer
+    install) must reach `mpc_ready=True` at the coordinator level. The
+    heat-only test on its own only proves one direction of the symmetric
+    `is_ready` logic.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    _seed_cool_only_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is True
+    assert coordinator.data.thermal_slopes.recovery_heat is None
+    await coordinator.async_unload()
+
+
+async def test_three_way_gate_routes_to_mpc_with_heat_only_slopes(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.8.1 end-to-end: with `learning_enabled=True`, `mpc_enabled=True`,
+    and heat-only slope data, the coordinator's three-way gate must route
+    the final decision through MPC — not just expose `mpc_ready=True`.
+
+    Pins the interaction the heat-only `mpc_ready` test alone doesn't cover:
+    a future refactor that silently kept the gate falling through to
+    predictor for partial-slope zones would pass the readiness assertion
+    but fail this one.
+
+    Setup: room at 19.4 (above hyst deadband entry 19.2 so hyst says idle;
+    below low=19.5 but recovery_heat IS available so the room-below-band
+    bail-out doesn't fire — the bail-out's `recovery_heat is None` clause
+    is False). Idle slope flat; heat slope positive. MPC sees heat
+    candidate scoring more time-in-band than idle drifting flat through
+    low, and picks heat.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone(
+        "office", learning_enabled=True, mpc_enabled=True
+    )
+    _seed_heat_only_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "19.4", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.mpc_ready is True
+    # mpc_decision diverges from predictor — proves MPC ran, not the predictor.
+    assert coordinator.data.predicted_decision.action == ACTION_IDLE
+    assert coordinator.data.mpc_decision.action == ACTION_HEAT
+    # Final decision routed through MPC, not predictor.
+    assert coordinator.data.decision.action == ACTION_HEAT
+    await coordinator.async_unload()
+
+
+async def test_safety_bailout_routes_through_predictor_when_room_outside_band(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.8.1 end-to-end for the safety bail-out path: cool-only zone with
+    `mpc_ready=True`, but the room has dropped below band where MPC can't
+    model heating. `mpc.plan` returns the predictor's decision unchanged;
+    the gate forwards that to climate, so `decision == predicted_decision`.
+
+    Pins that the bail-out (the main risk surface of v0.8.1) is wired
+    correctly end-to-end. The unit test in test_mpc.py covers `plan`'s
+    return; this one covers the coordinator's threading of that return
+    through the gate.
+    """
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone(
+        "office", learning_enabled=True, mpc_enabled=True
+    )
+    # Cool-only zone (recovery_heat=None). Room below low (default 19.5).
+    _seed_cool_only_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "18.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # mpc_ready stays True — MPC is equipped to act in general, just not
+    # for this specific out-of-band scenario.
+    assert coordinator.data.mpc_ready is True
+    assert coordinator.data.thermal_slopes.recovery_heat is None
+    # Bail-out fired: mpc_decision == predicted_decision.
+    assert coordinator.data.mpc_decision == coordinator.data.predicted_decision
+    # And the gate forwarded that to the final decision (which the
+    # coordinator hands to climate). Predictor's hysteresis fallback sees
+    # room < low - deadband_below (18.5 < 19.2), so it fires heat.
+    assert coordinator.data.decision == coordinator.data.predicted_decision
+    assert coordinator.data.decision.action == ACTION_HEAT
+    await coordinator.async_unload()
