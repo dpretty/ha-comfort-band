@@ -47,9 +47,10 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["lookahead_minutes"] == 5
     # v0.7 passive drift acceptance: 0.5 °C comfort floor by default.
     assert zone["passive_tolerance"] == 0.5
-    # v0.8 MPC: off by default (layered on learning_enabled), 20-min horizon.
+    # v0.8 MPC: off by default (layered on learning_enabled). v0.9.0
+    # bumped the default horizon from 20 → 60 min.
     assert zone["mpc_enabled"] is False
-    assert zone["mpc_horizon_minutes"] == 20
+    assert zone["mpc_horizon_minutes"] == 60
 
 
 # ----- round-trip persistence -----
@@ -684,9 +685,13 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_enabled(
 async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
-    """v0.7 zone payload also lacks `mpc_horizon_minutes`. Backfill should
-    set it to the conservative default (20 min). Kept as a separate test
-    from the mpc_enabled backfill so each fails one guard.
+    """v0.7 zone payload lacks `mpc_horizon_minutes`. Backfill should
+    set it to the current default. v0.9.0 bumped the default 20 → 60
+    to give MPC enough lookahead for pre-heat / pre-cool ramps; only
+    NEW or UPGRADED-without-explicit-value zones pick up the new
+    default, so this test reflects the v0.9.0 default for legacy
+    upgrades. Existing zones with an explicit `mpc_horizon_minutes`
+    keep their value (no test needed — backfill is `not in zone` keyed).
     """
     hass_storage["comfort_band.data"] = {
         "version": 1,
@@ -724,7 +729,58 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     }
     store = ComfortBandStore(hass)
     await store.async_load()
-    assert store.get_zone("office")["mpc_horizon_minutes"] == 20
+    assert store.get_zone("office")["mpc_horizon_minutes"] == 60
+
+
+async def test_load_v0_8_zone_with_explicit_mpc_horizon_preserves_user_value(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.9.0: bumping `DEFAULT_MPC_HORIZON_MINUTES` 20 → 60 must NOT
+    silently overwrite a user's explicit choice from v0.8.x. The
+    backfill is keyed on `"mpc_horizon_minutes" not in zone` — present
+    keys keep their stored value. Pins the contract so a future
+    "always reset to default on load" regression is caught.
+    """
+    hass_storage["comfort_band.data"] = {
+        "version": 1,
+        "data": {
+            "zones": {
+                "office": {
+                    "zone_name": "office",
+                    "schedules": {},
+                    "manual_low": 19.5,
+                    "manual_high": 22.5,
+                    "override_hours": 3,
+                    "override_until": None,
+                    "deadband_below": 0.3,
+                    "deadband_above": 0.5,
+                    "min_cycle_minutes": 8,
+                    "cross_mode_min_minutes": 8,
+                    "previous_action": None,
+                    "samples": [],
+                    "lookahead_minutes": 5,
+                    "passive_tolerance": 0.5,
+                    "enabled": False,
+                    "learning_enabled": False,
+                    "use_apparent_temperature": False,
+                    "last_action_at": None,
+                    "last_action": None,
+                    # Explicit user value from v0.8 — must be preserved.
+                    "mpc_enabled": True,
+                    "mpc_horizon_minutes": 25,
+                }
+            },
+            "profiles": {
+                "home": {"name": "home", "description": ""},
+                "away": {"name": "away", "description": ""},
+            },
+            "active_profile": "home",
+            "default_profile": "home",
+        },
+    }
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    assert store.get_zone("office")["mpc_horizon_minutes"] == 25
 
 
 # (Default-value assertions for the new v0.8 MPC fields live in

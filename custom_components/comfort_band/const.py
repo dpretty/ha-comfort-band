@@ -85,12 +85,23 @@ PASSIVE_TOLERANCE_MAX: Final = 2.0
 
 # Model-predictive control (v0.8+). At each refresh, MPC enumerates a small
 # action space ({idle, heat, cool} in v0.8; will grow to include fan modes in
-# v0.9), simulates each forward over `mpc_horizon_minutes` using the per-action
-# slopes from v0.6, and picks the action that maximises projected time-in-band.
-# See `mpc.py` for the planner. Cold-start gate (v0.8.1+): requires
-# `idle_slope` and at least one recovery slope. Otherwise the coordinator
-# falls back to the v0.7 predictor silently.
-DEFAULT_MPC_HORIZON_MINUTES: Final = 20
+# v0.9.x), simulates each forward over `mpc_horizon_minutes` using the
+# per-action slopes from v0.6, and picks the action that maximises projected
+# time-in-band. See `mpc.py` for the planner. Cold-start gate (v0.8.1+):
+# requires `idle_slope` and at least one recovery slope. Otherwise the
+# coordinator falls back to the v0.7 predictor silently.
+#
+# v0.9.0: default horizon bumped 20 → 60 to give MPC enough lookahead for
+# pre-heat / pre-cool decisions before scheduled band transitions (paired
+# with the `bands_per_step` schedule lookahead in `mpc.plan`). 20 min was
+# too short — typical pre-heat needs 30-60 min of foresight even when the
+# schedule transition itself is visible. MAX stays at 60: slopes are
+# estimated from a 90-minute sample window (`SAMPLE_WINDOW_MINUTES`); a
+# longer horizon would extrapolate beyond the data window and compound
+# slope-estimation error in the cost function. Existing zones keep their
+# explicit `mpc_horizon_minutes` value via `storage.py`'s presence-keyed
+# backfill — only freshly-created zones pick up the new default.
+DEFAULT_MPC_HORIZON_MINUTES: Final = 60
 MPC_HORIZON_MIN: Final = 10
 MPC_HORIZON_MAX: Final = 60
 # Time step used by `mpc.simulate` when integrating forward. 1.0 minute keeps

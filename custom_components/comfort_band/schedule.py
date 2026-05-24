@@ -52,6 +52,56 @@ def resolve(transitions: Sequence[Transition], now_local: time) -> tuple[float, 
     return chosen.low, chosen.high
 
 
+def upcoming_bands(
+    transitions: Sequence[Transition],
+    start_local: time,
+    horizon_minutes: int,
+    step_minutes: float,
+) -> list[tuple[float, float]]:
+    """Return per-step ``(low, high)`` for ``horizon_minutes`` ahead.
+
+    Output length is ``round(horizon_minutes / step_minutes)``. Each entry
+    is the band active at ``start_local + i * step_minutes``, wrapping
+    past midnight via the same logic as ``resolve`` (the wall clock loops
+    back to 00:00 after 24:00, so a schedule with transitions only in the
+    morning still defines a band for evening steps that overflow).
+
+    Used by ``mpc.plan`` to feed the cost-function band check per step,
+    so the MPC can anticipate upcoming schedule transitions (e.g.
+    pre-heating before the morning band rises) rather than seeing the
+    current band frozen across the whole horizon — a v0.8.1 limitation
+    the user observed when the morning room temp ramped up only AFTER
+    the band rose, not before.
+
+    Falls back to repeated ``resolve`` calls (one per step) rather than a
+    pointer walk through ``transitions``: typical MPC horizon is 60 steps
+    x O(log transitions=24) ~ 270 comparisons per refresh — negligible
+    on any HA host. The simpler implementation reads more clearly and
+    reuses the same midnight-wrap behaviour as the single-time resolver.
+    """
+    if not transitions:
+        raise ValueError("Cannot resolve an empty schedule")
+    if step_minutes <= 0:
+        raise ValueError(f"step_minutes must be positive, got {step_minutes}")
+    steps = round(horizon_minutes / step_minutes)
+    start_min = start_local.hour * 60 + start_local.minute
+    out: list[tuple[float, float]] = []
+    for i in range(steps):
+        offset = (start_min + i * step_minutes) % (24 * 60)
+        # `time` only carries integer hour/minute, so we truncate. For
+        # non-negative `offset` (always, after the mod above) the form
+        # below is equivalent to `int(offset) // 60` / `int(offset) % 60`
+        # — Python's `int()` on a positive float floors. The `//` and
+        # `%` first preserves the intent at the source level (mod within
+        # 60-minute hour first, then convert to int), which reads more
+        # cleanly if a future caller chooses fractional `step_minutes`
+        # and someone wonders whether the truncation order matters.
+        h = int(offset // 60)
+        m = int(offset % 60)
+        out.append(resolve(transitions, time(hour=h, minute=m)))
+    return out
+
+
 def schedule_to_dict(transitions: Sequence[Transition]) -> list[dict[str, object]]:
     """Serialize a schedule to a list of dicts suitable for JSON storage."""
     return [{"at": t.at.strftime("%H:%M"), "low": t.low, "high": t.high} for t in transitions]

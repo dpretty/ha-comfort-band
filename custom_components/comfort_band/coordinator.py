@@ -39,6 +39,7 @@ from .const import (
     ACTION_UNKNOWN,
     CLIMATE_ECHO_WINDOW_S,
     LOGGER,
+    MPC_SIMULATION_STEP_MINUTES,
     SAMPLE_PERSIST_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
@@ -405,12 +406,37 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # over `mpc_horizon_minutes` and returns the highest-time-in-band
         # action; when not ready it returns `predicted_decision` so the
         # shadow-comparison sensor still produces a meaningful value.
+        #
+        # v0.9.0+: `bands_per_step` is the per-minute (low, high) the
+        # schedule resolves to over the horizon. When set, `mpc.plan`
+        # feeds it to `simulate` so the cost function can anticipate
+        # upcoming schedule transitions — closes the "MPC didn't
+        # pre-heat before the morning band rise" report. Skipped when
+        # an override is active OR when the schedule parse fails
+        # (None → MPC falls back to the snapshot path).
+        #
+        # Override edge case: if the override expires WITHIN the
+        # horizon (e.g. 30 min remaining, 60 min horizon), the snapshot
+        # path treats the whole horizon as the override band — the
+        # post-expiry minutes are mis-scored against the manual band
+        # rather than the schedule. Acceptable for now: the
+        # override-expiry timer fires at expiry and triggers a fresh
+        # refresh that picks up the schedule band, bounding the
+        # mis-scoring to at most one refresh cycle. A future
+        # improvement could splice scheduled bands into the post-expiry
+        # tail of the list.
         mpc_ready = mpc.is_ready(thermal_slopes)
+        bands_per_step = (
+            None
+            if override_active
+            else self._compute_bands_per_step(schedule_data, zone["mpc_horizon_minutes"])
+        )
         mpc_decision = mpc.plan(
             thermal_slopes,
             hyst_inputs,
             horizon_minutes=zone["mpc_horizon_minutes"],
             predictor_decision=predicted_decision,
+            bands_per_step=bands_per_step,
         )
         # Three-way gate: each layer is opt-in by its own switch. learning_enabled
         # is the v0.6 predictor gate (preserves v0.7 behaviour). mpc_enabled is
@@ -544,6 +570,41 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             )
             return fallback
         return schedule.resolve(transitions, dt_util.now().time())
+
+    def _compute_bands_per_step(
+        self,
+        schedule_data: StoredProfileSchedule | None,
+        horizon_minutes: int,
+    ) -> list[tuple[float, float]] | None:
+        """Build per-step ``(low, high)`` over the MPC horizon for lookahead.
+
+        Returns ``None`` when the schedule is missing, empty, or fails to
+        parse — MPC falls back to its snapshot path in that case (uses
+        ``inputs.low / inputs.high`` for every step, the v0.8.x
+        behaviour). Doesn't log on parse failure: ``_resolve_schedule``
+        already warned for the same input in the same refresh cycle, so
+        a second warning would just duplicate noise.
+
+        Parses the schedule a third time per refresh (after
+        ``_resolve_schedule`` and ``_schedule_next_transition``). The
+        re-parse cost is microseconds and the alternative — threading
+        a normalized list through five call sites — is more change
+        surface than it's worth for the integration's current scale.
+        """
+        if schedule_data is None or not schedule_data.get("current"):
+            return None
+        try:
+            transitions = normalize_schedule(schedule_from_dict(schedule_data["current"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not transitions:
+            return None
+        return schedule.upcoming_bands(
+            transitions,
+            dt_util.now().time(),
+            horizon_minutes,
+            MPC_SIMULATION_STEP_MINUTES,
+        )
 
     def _schedule_next_transition(self, schedule_data: StoredProfileSchedule | None) -> None:
         if self._unsub_transition_timer is not None:
