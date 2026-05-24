@@ -115,12 +115,27 @@ def _decide_from_samples(
 
 
 def test_flat_line_yields_zero_slope() -> None:
+    """Truly flat data produces slope = 0 with method = "wls".
+
+    v0.9.1 adds the diagnostic fields (`method_*`, `sample_count_*`,
+    `std_dev_*`) so the sensor can surface what's behind the estimate.
+    For genuinely constant samples, WLS produces 0 and tags "wls" —
+    honest report that we used WLS and it found no slope, vs a "none"
+    tag which would mean we had no slope to compute at all.
+    """
     samples = _samples_at(120, 10, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is not None
     assert abs(slopes.idle) < 1e-6
     assert slopes.recovery_heat is None
     assert slopes.recovery_cool is None
+    # v0.9.1 diagnostic fields populated.
+    assert slopes.method_idle == "wls"
+    assert slopes.sample_count_idle == 10
+    assert slopes.method_recovery_heat == "none"
+    assert slopes.method_recovery_cool == "none"
+    assert slopes.sample_count_recovery_heat == 0
+    assert slopes.sample_count_recovery_cool == 0
 
 
 def test_monotone_idle_drift_recovered() -> None:
@@ -917,3 +932,140 @@ def test_startup_slope_at_epsilon_treated_as_flat() -> None:
     # Either way, with such a flat slope the projection (22.5 + 0.05/60*5 = 22.504)
     # is nowhere near (high + deadband_above = 23.5), so the predicate fails.
     assert decision == _hyst_idle()
+
+
+# ----- v0.9.1: per-segment diagnostics (sample counts, std_dev, method) -----
+
+
+def _quantized_samples(
+    plateaus: list[tuple[float, int]], *, action: str, interval_s: float = 600
+) -> list[Sample]:
+    """Build samples that simulate a low-resolution sensor sitting at the
+    same quantized value for stretches. `plateaus = [(value, count), ...]`
+    means `count` samples at `value`, all `interval_s` apart, then the
+    next plateau. Mimics the real-world overnight gym scenario where a
+    0.5 °C sensor reads 21.0 for 2 hours, then 20.5 for 2 hours, etc.
+    """
+    out: list[Sample] = []
+    t = _T0
+    for value, count in plateaus:
+        for _ in range(count):
+            out.append(Sample(t=t, temp=value, action=action))
+            t = t + timedelta(seconds=interval_s)
+    return out
+
+
+def test_per_segment_sample_counts_populated() -> None:
+    """Per-segment counts surface separately from the aggregate
+    `sample_count`. Construct a buffer with one each of idle / heat /
+    cool runs and assert each per-segment count matches its run length
+    while `sample_count` reflects the union.
+    """
+    idle_run = _samples_at(120, 6, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    # Splice in a heat run after the idle stretch (shift timestamps so
+    # they don't overlap with idle).
+    heat_start_t = idle_run[-1].t + timedelta(seconds=120)
+    heat_run: list[Sample] = []
+    for i in range(5):
+        heat_run.append(
+            Sample(
+                t=heat_start_t + timedelta(seconds=120 * i),
+                temp=20.0 + i * 0.5,
+                action=ACTION_HEAT,
+            )
+        )
+    cool_start_t = heat_run[-1].t + timedelta(seconds=120)
+    cool_run: list[Sample] = []
+    for i in range(4):
+        cool_run.append(
+            Sample(
+                t=cool_start_t + timedelta(seconds=120 * i),
+                temp=23.0 - i * 0.5,
+                action=ACTION_COOL,
+            )
+        )
+    all_samples = idle_run + heat_run + cool_run
+
+    slopes = estimate_slopes(all_samples, now=all_samples[-1].t)
+    assert slopes.sample_count == 15
+    assert slopes.sample_count_idle == 6
+    assert slopes.sample_count_recovery_heat == 5
+    assert slopes.sample_count_recovery_cool == 4
+
+
+def test_std_dev_near_zero_for_quantized_plateau() -> None:
+    """The signature diagnostic: samples plateau at one quantized value
+    → std_dev ≈ 0. A user looking at the sensor attributes can see
+    `std_dev_idle = 0.0` over many samples and recognise that the
+    slope (also 0) reflects a sensor that's reporting one value
+    throughout the window, NOT a genuinely stable room. The slope
+    can't be trusted in this regime.
+    """
+    samples = _quantized_samples([(20.5, 10)], action=ACTION_IDLE, interval_s=600)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.std_dev_idle == pytest.approx(0.0)
+    assert slopes.sample_count_idle == 10
+
+
+def test_std_dev_positive_for_clean_drift() -> None:
+    """Counterpart: a sample series with real variance produces a
+    non-zero std_dev. Distinguishes "stable room" from "stable sensor"
+    in the diagnostic — when std_dev is positive, the slope estimate
+    is informed by real temperature variance, not just one quantized
+    plateau.
+    """
+    # -0.5 °C/h over 30 min (16 samples, 120s apart) → temp ranges over
+    # ~0.25 °C. std_dev should be a sizable fraction of that range.
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.std_dev_idle > 0.05
+
+
+def test_method_none_when_segment_has_too_few_samples() -> None:
+    """Method tag distinguishes "no slope because no data" (none) from
+    "slope = 0 because data is flat" (wls). Important for diagnostics:
+    a "none" method should not be misread as "the room is stable".
+    """
+    samples = _samples_at(
+        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.5
+    )
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.idle is None
+    assert slopes.method_idle == "none"
+    # Per-segment count still reports the actual run length even when
+    # the slope itself couldn't be computed.
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES - 1
+
+
+def test_method_wls_when_slope_computed() -> None:
+    """When WLS produces a slope, method is tagged "wls". Reserved
+    string field — v0.9.1 only emits "wls" or "none", but the schema
+    is in place for future fallback methods.
+    """
+    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.method_idle == "wls"
+
+
+def test_thermal_slopes_back_compat_positional_constructor() -> None:
+    """v0.9.1 added new fields to ThermalSlopes with defaults. Existing
+    test/code that constructed instances positionally with only the
+    original fields should still work — defaults preserve the contract.
+    """
+    s = ThermalSlopes(
+        idle=0.01,
+        recovery_heat=None,
+        recovery_cool=None,
+        sample_count=5,
+        window_minutes=10.0,
+        last_updated=_T0,
+    )
+    assert s.sample_count_idle == 0
+    assert s.sample_count_recovery_heat == 0
+    assert s.sample_count_recovery_cool == 0
+    assert s.std_dev_idle == 0.0
+    assert s.std_dev_recovery_heat == 0.0
+    assert s.std_dev_recovery_cool == 0.0
+    assert s.method_idle == "none"
+    assert s.method_recovery_heat == "none"
+    assert s.method_recovery_cool == "none"

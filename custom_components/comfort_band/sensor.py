@@ -166,6 +166,25 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             "sample_count": s.sample_count,
             "window_minutes": s.window_minutes,
             "last_updated": None if s.last_updated is None else s.last_updated.isoformat(),
+            # v0.9.1 diagnostics. The aggregate `sample_count` above
+            # spans all three actions; per-segment fields below show how
+            # many samples are actually behind each slope estimate.
+            # `std_dev_*` is the population standard deviation (°C) of
+            # the segment's temperature samples — a value near 0 over
+            # many samples signals the sensor is reporting one quantized
+            # value throughout the window (the slope estimate is then
+            # unreliable, regardless of sample count). `method_*` records
+            # which estimator produced the slope; currently always "wls"
+            # or "none", reserved string for future fallback methods.
+            "sample_count_idle": s.sample_count_idle,
+            "sample_count_recovery_heat": s.sample_count_recovery_heat,
+            "sample_count_recovery_cool": s.sample_count_recovery_cool,
+            "std_dev_idle": s.std_dev_idle,
+            "std_dev_recovery_heat": s.std_dev_recovery_heat,
+            "std_dev_recovery_cool": s.std_dev_recovery_cool,
+            "method_idle": s.method_idle,
+            "method_recovery_heat": s.method_recovery_heat,
+            "method_recovery_cool": s.method_recovery_cool,
         }
 
 
