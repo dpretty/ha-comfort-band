@@ -98,6 +98,28 @@ class ThermalSlopes:
     Slopes are °C/minute internally; the sensor multiplies by 60 for display
     in °C/h. Each slope may be None when its segment has fewer than
     SLOPE_MIN_SAMPLES samples or the WLS denominator is singular.
+
+    v0.9.1 adds per-segment diagnostic fields so users can spot when an
+    estimate is unreliable due to resolution-limited sensors:
+
+      - ``sample_count_*``: number of samples in each per-action segment.
+        Existing ``sample_count`` is the aggregate across all actions —
+        the new per-segment counts let a user check that idle has, say,
+        10 samples behind its slope estimate (not just inheriting from
+        the heat/cool totals).
+      - ``std_dev_*``: population standard deviation of sample
+        temperatures in each segment (°C). When ``std_dev_idle ≈ 0``
+        over many samples, the sensor reported the same quantized value
+        throughout the window — the slope estimate is unreliable
+        regardless of sample count. Distinguishes "stable room" from
+        "stable-looking sensor that's masking real drift".
+      - ``method_*``: which slope-estimator produced each value
+        (currently always "wls" or "none"; reserved string field for
+        future fallback methods without changing the attribute shape).
+
+    Defaults on the new fields preserve backward compatibility with any
+    tests that construct ThermalSlopes positionally (additions at the end
+    don't shift existing arg positions).
     """
 
     idle: float | None
@@ -106,6 +128,15 @@ class ThermalSlopes:
     sample_count: int
     window_minutes: float
     last_updated: datetime | None
+    sample_count_idle: int = 0
+    sample_count_recovery_heat: int = 0
+    sample_count_recovery_cool: int = 0
+    std_dev_idle: float = 0.0
+    std_dev_recovery_heat: float = 0.0
+    std_dev_recovery_cool: float = 0.0
+    method_idle: str = "none"
+    method_recovery_heat: str = "none"
+    method_recovery_cool: str = "none"
 
     def for_action(self, action: str | None) -> float | None:
         """Return the slope matching `action`, falling back to idle.
@@ -299,6 +330,51 @@ def _wls_slope(segment: list[Sample], *, now: datetime) -> float | None:
     return (s_w * s_wxy - s_wx * s_wy) / denom
 
 
+def _segment_std_dev(segment: list[Sample]) -> float:
+    """Population standard deviation of sample temperatures (°C).
+
+    Surfaced as a sensor attribute so users can spot resolution-limited
+    data: a `std_dev_idle` near 0 over many samples means the sensor
+    reported the same value throughout the window — the slope estimate
+    is therefore unreliable (a 0.5 °C-resolution sensor on a slowly
+    drifting room can read the same value for hours, masking the
+    drift). Distinguishes "slope = 0 because the room is genuinely
+    stable" from "slope = 0 because the sensor can't see the drift".
+    Returns 0.0 for <2 samples (no variance to measure).
+    """
+    if len(segment) < 2:
+        return 0.0
+    mean = sum(s.temp for s in segment) / len(segment)
+    return math.sqrt(sum((s.temp - mean) ** 2 for s in segment) / len(segment))
+
+
+def _segment_slope(segment: list[Sample], *, now: datetime) -> tuple[float | None, str]:
+    """Per-segment slope estimate with method bookkeeping.
+
+    Returns ``(slope_per_minute, method)`` where ``method`` is one of:
+
+      - ``"wls"``: WLS produced a slope; used as-is.
+      - ``"none"``: no slope could be computed (too few samples or
+        singular WLS denominator).
+
+    The v0.9.1 diagnostic was originally going to include a
+    baseline-fallback method for resolution-limited sensors, but
+    investigation showed the fallback didn't help the realistic
+    scenarios: when the window has no quantization crossings (the
+    user's overnight gym case), both WLS and a first-to-last baseline
+    return 0; when the window has a crossing, WLS detects it (with
+    biased magnitude but correct direction). The honest answer is
+    that fixing this requires a wider sample retention than the
+    current 90 min, deferred to v1.0. The ``method`` field stays as
+    a forward-compatible string so future fallback methods can be
+    added without changing the attribute shape.
+    """
+    wls = _wls_slope(segment, now=now)
+    if wls is None:
+        return None, "none"
+    return wls, "wls"
+
+
 def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
     """Compute per-action slopes over the most recent contiguous run of each
     action class, plus buffer bookkeeping for the sensor's attributes.
@@ -313,13 +389,26 @@ def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
         last_updated = samples[-1].t
         window_min = (samples[-1].t - samples[0].t).total_seconds() / 60.0
 
+    idle_slope, idle_method = _segment_slope(idle_run, now=now)
+    heat_slope, heat_method = _segment_slope(heat_run, now=now)
+    cool_slope, cool_method = _segment_slope(cool_run, now=now)
+
     return ThermalSlopes(
-        idle=_wls_slope(idle_run, now=now),
-        recovery_heat=_wls_slope(heat_run, now=now),
-        recovery_cool=_wls_slope(cool_run, now=now),
+        idle=idle_slope,
+        recovery_heat=heat_slope,
+        recovery_cool=cool_slope,
         sample_count=len(samples),
         window_minutes=round(window_min, 1),
         last_updated=last_updated,
+        sample_count_idle=len(idle_run),
+        sample_count_recovery_heat=len(heat_run),
+        sample_count_recovery_cool=len(cool_run),
+        std_dev_idle=round(_segment_std_dev(idle_run), 4),
+        std_dev_recovery_heat=round(_segment_std_dev(heat_run), 4),
+        std_dev_recovery_cool=round(_segment_std_dev(cool_run), 4),
+        method_idle=idle_method,
+        method_recovery_heat=heat_method,
+        method_recovery_cool=cool_method,
     )
 
 
