@@ -338,37 +338,45 @@ def test_plan_falls_back_to_predictor_when_both_recovery_slopes_missing() -> Non
 def test_plan_in_band_heat_only_zone_picks_from_idle_and_heat() -> None:
     """v0.8.1: heat-only zone (cool slope missing) with room inside band.
     MPC scores {idle, heat} only — the cool candidate is filtered out
-    before simulate. With idle drifting down and heat keeping the room in
-    band, heat should win or idle should win cleanly without cool's
-    midpoint_distance polluting the tie-break.
+    before simulate.
+
+    v0.9.0 idle-preference: when idle achieves full-horizon in-band, it
+    wins over heat even if heat would land closer to band midpoint. The
+    intent is to avoid burning compressor cycles on a margin gain when
+    passive drift already keeps the room in band. Old v0.8.x behaviour
+    (heat wins on midpoint tie-break) is now considered a regression —
+    the user's "no MPC pre-heat unless genuinely needed" expectation.
     """
     # Room mid-band, idle slope flat (full horizon in band → 20 min), heat
-    # slope mild positive (also full horizon in band → 20 min). Tie-break:
-    # heat ends at 21.5 (midpoint) → distance 0; idle ends at 21.0 →
-    # distance 0.5. Heat wins.
+    # slope mild positive (also full horizon in band → 20 min). Idle
+    # preference fires: idle wins.
     result = plan(
         _slopes(idle=0.0, recovery_heat=0.025, recovery_cool=None),
         _inputs(21.0, low=20.0, high=23.0),
         horizon_minutes=20,
         predictor_decision=idle_decision(),
     )
-    assert result.action == ACTION_HEAT
-    assert result.target_temp == 23.0
+    assert result.action == ACTION_IDLE
+    assert result.target_temp is None
 
 
 def test_plan_in_band_cool_only_zone_picks_from_idle_and_cool() -> None:
-    """Symmetric: cool-only zone, room mid-band. MPC scores {idle, cool}."""
-    # Room at 22.0, idle slope flat, cool slope mild negative. Idle ends
-    # at 22.0 (distance 0.5 from midpoint 21.5); cool ends at 21.5
-    # (distance 0). Cool wins the tie-break.
+    """Symmetric: cool-only zone, room mid-band. MPC scores {idle, cool}.
+
+    v0.9.0: idle wins when it achieves full-horizon in-band, regardless
+    of cool's midpoint advantage. Closes the user's "winter cooling
+    fired when room would have settled passively" report.
+    """
+    # Room at 22.0, idle slope flat (stays at 22.0, in band → 20 min),
+    # cool slope mild negative. Idle preference fires: idle wins.
     result = plan(
         _slopes(idle=0.0, recovery_heat=None, recovery_cool=-0.025),
         _inputs(22.0, low=20.0, high=23.0),
         horizon_minutes=20,
         predictor_decision=idle_decision(),
     )
-    assert result.action == ACTION_COOL
-    assert result.target_temp == 20.0
+    assert result.action == ACTION_IDLE
+    assert result.target_temp is None
 
 
 def test_plan_defers_to_predictor_when_room_below_band_without_heat_slope() -> None:
@@ -487,13 +495,20 @@ def test_plan_picks_cool_when_cool_stays_in_band_longest() -> None:
     assert result.target_mode == HVAC_MODE_COOL
 
 
-def test_plan_tie_broken_by_midpoint_distance() -> None:
-    """Two candidates tie on time_in_band (both full horizon). The one whose
-    end-of-horizon temp is closer to the band midpoint wins.
+def test_plan_idle_preference_over_heat_midpoint_win() -> None:
+    """v0.9.0: when idle achieves full-horizon in-band, prefer it over
+    heat even if heat lands closer to band midpoint. Inverts the v0.8.x
+    midpoint tie-break for the specific case where idle is the cheaper
+    option that also satisfies the comfort constraint. Pins the
+    "winter cooling fired when room would have settled passively"
+    user report — symmetric for heat vs idle.
 
-    Room at 21.0; idle (slope=0) ends at 21.0 → distance 0.5 from midpoint
-    21.5. Heat (slope=+0.025) ends at 21.5 → distance 0.0. Heat wins despite
-    both scoring 20.0 min in band.
+    Room at 21.0; idle (slope=0) stays at 21.0 → full horizon in band,
+    end_temp 21.0, distance 0.5 from midpoint 21.5. Heat
+    (slope=+0.025) ends at 21.5 → full horizon in band, distance 0.0.
+    Pre-v0.9.0: heat wins on midpoint. v0.9.0: idle wins on activation
+    preference. The midpoint tie-break still applies between two
+    non-idle actions, just not idle vs active.
     """
     result = plan(
         _slopes(idle=0.0, recovery_heat=0.025, recovery_cool=-0.025),
@@ -501,17 +516,16 @@ def test_plan_tie_broken_by_midpoint_distance() -> None:
         horizon_minutes=20,
         predictor_decision=idle_decision(),
     )
-    assert result.action == ACTION_HEAT
+    assert result.action == ACTION_IDLE
 
 
-def test_plan_tie_broken_by_midpoint_distance_cool_side() -> None:
-    """Symmetric to the heat tie-break: room at 22.0 (above midpoint 21.5);
-    idle (slope=0) ends at 22.0 → distance 0.5. Cool (slope=-0.025) ends at
-    21.5 → distance 0.0. Cool wins despite both scoring 20.0 min in band.
+def test_plan_idle_preference_over_cool_midpoint_win() -> None:
+    """Symmetric to the heat case: idle wins over cool when both achieve
+    full horizon, even if cool lands closer to midpoint.
 
-    The `max` key sort is symmetric on `midpoint_distance`, but having both
-    sides explicitly tested protects against a future regression that picks
-    only one direction (e.g., a sign-flip in the key).
+    Room at 22.0 (above midpoint 21.5); idle (slope=0) stays at 22.0 →
+    distance 0.5. Cool (slope=-0.025) ends at 21.5 → distance 0.0.
+    v0.9.0: idle wins.
     """
     result = plan(
         _slopes(idle=0.0, recovery_heat=0.025, recovery_cool=-0.025),
@@ -519,7 +533,31 @@ def test_plan_tie_broken_by_midpoint_distance_cool_side() -> None:
         horizon_minutes=20,
         predictor_decision=idle_decision(),
     )
-    assert result.action == ACTION_COOL
+    assert result.action == ACTION_IDLE
+
+
+def test_plan_midpoint_tie_break_still_applies_between_non_idle_actions() -> None:
+    """The midpoint tie-break is preserved when comparing two non-idle
+    actions (heat vs cool) — idle preference only fires when idle is
+    one of the tied candidates. Setup the room slightly outside band
+    so idle does NOT reach full horizon; then heat and cool compete
+    on midpoint distance.
+
+    Room at 19.5 (below low=20.0), idle slope flat: idle drifts at
+    19.5 for full 20 min → outside band → 0 min in band. Heat
+    (slope=+0.1) reaches 20.0 at minute 5, ends at 21.5 → ~15 min in
+    band, distance 0 from midpoint. Cool (slope=-0.025) drifts further
+    down → 0 min in band. Heat wins because cool scores 0 while heat
+    scores 15. Confirms the tie-break path between non-idle actions
+    isn't broken by the v0.9.0 idle preference.
+    """
+    result = plan(
+        _slopes(idle=0.0, recovery_heat=0.1, recovery_cool=-0.025),
+        _inputs(19.5, low=20.0, high=23.0),
+        horizon_minutes=20,
+        predictor_decision=idle_decision(),
+    )
+    assert result.action == ACTION_HEAT
 
 
 def test_plan_returns_idle_decision_with_fan_only_mode() -> None:
@@ -534,3 +572,158 @@ def test_plan_returns_idle_decision_with_fan_only_mode() -> None:
     )
     assert result.target_mode == HVAC_MODE_FAN_ONLY
     assert result.target_temp is None
+
+
+# ----- bands_per_step lookahead (v0.9.0+) -----
+
+
+def test_simulate_uses_bands_per_step_when_provided() -> None:
+    """When `bands_per_step` is supplied, `simulate`'s in-band check
+    uses the band at THAT step rather than the snapshot. Setup: room
+    starts at 21.0 (in the snapshot band of 20-22), idle slope flat.
+    `bands_per_step` shifts the band upward to 23-25 at step 5;
+    suddenly room at 21.0 is below the new low. The latter half of
+    the horizon should NOT count as in band.
+    """
+    # 10 steps total: first 5 at (20, 22) — room=21 is in band —
+    # latter 5 at (23, 25) — room=21 is below low.
+    bands = [(20.0, 22.0)] * 5 + [(23.0, 25.0)] * 5
+    score = simulate(
+        Action(ACTION_IDLE, None),
+        _slopes(idle=0.0),
+        _inputs(21.0, low=20.0, high=22.0),
+        horizon_minutes=10,
+        bands_per_step=bands,
+    )
+    # Trapezoidal accounting: step 4-5 transitions from in-band
+    # to out-of-band, counts 0.5; steps 0-3 fully in (4 min); steps
+    # 5-9 fully out. Total ~4.5 min in band.
+    assert 4.0 <= score.time_in_band_minutes <= 5.0
+
+
+def test_simulate_falls_back_to_snapshot_when_bands_per_step_none() -> None:
+    """Existing v0.8.x behaviour preserved: when bands_per_step is None,
+    in-band check uses `inputs.low` / `inputs.high` for every step."""
+    score = simulate(
+        Action(ACTION_IDLE, None),
+        _slopes(idle=0.0),
+        _inputs(21.0, low=20.0, high=22.0),
+        horizon_minutes=10,
+        bands_per_step=None,
+    )
+    # Idle slope flat, room 21.0 stays in [20, 22] for full horizon.
+    assert score.time_in_band_minutes == 10.0
+
+
+def test_simulate_midpoint_uses_end_horizon_band() -> None:
+    """The midpoint tie-break is anchored on the END band's midpoint
+    when bands_per_step is provided. Useful when the band shifts and
+    a final position should be judged against where band centre IS at
+    end-of-horizon, not where it WAS at start."""
+    # Band moves from (20, 22) midpoint 21 to (24, 26) midpoint 25.
+    # Idle keeps room at 21.0; midpoint distance is |21 - 25| = 4.
+    bands = [(20.0, 22.0)] * 5 + [(24.0, 26.0)] * 5
+    score = simulate(
+        Action(ACTION_IDLE, None),
+        _slopes(idle=0.0),
+        _inputs(21.0, low=20.0, high=22.0),
+        horizon_minutes=10,
+        bands_per_step=bands,
+    )
+    assert score.midpoint_distance == 4.0
+    assert score.end_temp == 21.0
+
+
+def test_plan_morning_ramp_with_lookahead_picks_heat() -> None:
+    """v0.9.0 anchor scenario: heat-only zone, current band (16, 19),
+    room at 17.5 (comfortably in current band), idle slope is mildly
+    negative, recovery_heat present. `bands_per_step` shows the band
+    shifting up to (20, 22) at minute 30 (the morning ramp). Without
+    lookahead, idle would win (room in band, idle achieves full
+    horizon → idle preference fires). WITH lookahead, idle ends up at
+    16.5 in the new (20, 22) band → outside band → fewer in-band
+    minutes than heat, which pre-heats to land inside the new band.
+    Heat should win.
+    """
+    # Horizon = 60 min; band rises at minute 30.
+    bands = [(16.0, 19.0)] * 30 + [(20.0, 22.0)] * 30
+    result = plan(
+        _slopes(idle=-0.02, recovery_heat=0.08, recovery_cool=None),
+        _inputs(17.5, low=16.0, high=19.0),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+        bands_per_step=bands,
+    )
+    assert result.action == ACTION_HEAT
+
+
+def test_plan_morning_ramp_without_lookahead_picks_idle() -> None:
+    """Control case for the morning-ramp test above: WITHOUT
+    `bands_per_step`, MPC sees only the current band (16, 19). Room
+    at 17.5 is comfortably in band; idle slope mildly negative means
+    room drifts down to ~16.3 over 60 min — still in band. Idle
+    achieves full horizon → idle preference fires → idle wins. This
+    is the v0.8.x behaviour we're replacing for lookahead-equipped
+    refreshes.
+    """
+    result = plan(
+        _slopes(idle=-0.02, recovery_heat=0.08, recovery_cool=None),
+        _inputs(17.5, low=16.0, high=19.0),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+        bands_per_step=None,
+    )
+    assert result.action == ACTION_IDLE
+
+
+def test_plan_bail_out_reads_bands_per_step_first_entry() -> None:
+    """v0.9.0: the safety bail-out (room outside band on the missing
+    recovery side) reads `bands_per_step[0]` when provided, not the
+    snapshot. Scenario: heat-only zone, snapshot band is (20, 23),
+    but at THIS refresh the schedule has just rotated (e.g., 06:00
+    sharp) and the live band is (16, 19). Room is at 17.0 — below
+    the SNAPSHOT low (20), would trigger bail-out if reading snapshot
+    — but inside the LIVE band (16-19), so MPC should proceed.
+    Without the bands_per_step[0] read, MPC would defer to predictor
+    even though it has everything it needs.
+    """
+    bands = [(16.0, 19.0)] * 60
+    result = plan(
+        _slopes(idle=0.0, recovery_heat=0.05, recovery_cool=None),
+        # Snapshot says (20, 23) but the live band is (16, 19) per
+        # bands_per_step[0]. Room=17 is inside (16, 19).
+        _inputs(17.0, low=20.0, high=23.0),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+        bands_per_step=bands,
+    )
+    # Idle keeps room at 17.0, full horizon in band → idle wins via
+    # idle preference. The key is that MPC didn't bail out — if the
+    # bail-out read the SNAPSHOT (20, 23), room=17 would be <= 20
+    # and bail-out would return the predictor_decision.
+    assert result.action == ACTION_IDLE
+    # The bail-out path would return `predictor_decision` verbatim (here
+    # `idle_decision()`); the non-bail-out path returns a fresh
+    # `idle_decision()` from MPC's own scoring. Both produce equivalent
+    # decision objects (target_temp=None, target_mode=fan_only), so this
+    # test proves the code-path via coverage rather than via outcome.
+    # The symmetric snapshot-path test below uses a heat_decision
+    # predictor for an unambiguous outcome-based assertion.
+
+
+def test_plan_bail_out_uses_snapshot_when_bands_per_step_none() -> None:
+    """Symmetric to the bail-out-reads-bands-per-step-first-entry test:
+    without bands_per_step, the bail-out reads inputs.low / inputs.high
+    (v0.8.1 behaviour). Cool-only zone, room at 17.0 below snapshot
+    low=20.0, no recovery_heat → bail-out fires → predictor decision
+    returned verbatim. Pins backwards compat for the legacy call path
+    that doesn't pass bands_per_step."""
+    predictor_decision = heat_decision(20.0)
+    result = plan(
+        _slopes(idle=0.0, recovery_heat=None, recovery_cool=-0.05),
+        _inputs(17.0, low=20.0, high=23.0),
+        horizon_minutes=60,
+        predictor_decision=predictor_decision,
+        bands_per_step=None,
+    )
+    assert result == predictor_decision

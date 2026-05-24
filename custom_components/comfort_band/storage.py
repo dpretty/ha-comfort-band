@@ -129,7 +129,8 @@ class StoredZone(TypedDict):
     mpc_enabled: bool
     # Horizon over which `mpc.simulate` projects each candidate action's
     # outcome (minutes). Exposed as `number.{zone}_mpc_horizon_minutes`.
-    # Default 20; range [10, 60]. Decoupled from `lookahead_minutes` (used
+    # Default 60 (v0.9.0+, was 20 in v0.8.x); range [10, 60]. Decoupled
+    # from `lookahead_minutes` (used
     # by the predictor for single-decision anticipation): MPC scores whole
     # cycles, predictor scores the next decision moment.
     mpc_horizon_minutes: int
@@ -300,9 +301,11 @@ class ComfortBandStore:
                 zone["passive_tolerance"] = DEFAULT_PASSIVE_TOLERANCE_C
                 migrated = True
             # v0.7 → v0.8: MPC. Default OFF so existing learning_enabled users
-            # continue to see the v0.7 predictor's behaviour. Horizon seeds to
-            # the conservative 20-minute default; users tune via the
-            # `number.{zone}_mpc_horizon_minutes` entity. Sample-level fan_mode
+            # continue to see the v0.7 predictor's behaviour. Horizon seeds
+            # to `DEFAULT_MPC_HORIZON_MINUTES` (60 from v0.9.0, was 20 in
+            # v0.8.x); users tune via the `number.{zone}_mpc_horizon_minutes`
+            # entity. Backfill is presence-keyed (`not in zone`) so explicit
+            # values from older versions are preserved. Sample-level fan_mode
             # backfill is implicit via NotRequired + sample_from_dict.get().
             if "mpc_enabled" not in zone:
                 zone["mpc_enabled"] = False

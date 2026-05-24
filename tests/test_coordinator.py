@@ -1722,3 +1722,143 @@ async def test_safety_bailout_routes_through_predictor_when_room_outside_band(
     assert coordinator.data.decision == coordinator.data.predicted_decision
     assert coordinator.data.decision.action == ACTION_HEAT
     await coordinator.async_unload()
+
+
+# ----- schedule lookahead via bands_per_step (v0.9.0+) -----
+
+
+async def test_mpc_receives_bands_per_step_when_schedule_present(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.9.0 integration: when a zone has a scheduled profile, the
+    coordinator computes per-step (low, high) over the MPC horizon and
+    passes it to `mpc.plan` as `bands_per_step`. Spy on `mpc.plan` to
+    confirm the wiring; assert the captured list length matches the
+    horizon and that the first entry is the band active NOW.
+    """
+    from unittest.mock import patch
+
+    freezer.move_to("2026-05-19 05:30:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Install a morning-ramp schedule on the home profile: overnight band
+    # (16, 19) until 07:00, then morning band (20, 22) until 22:00, then
+    # back to overnight.
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+            {"at": "22:00", "low": 16.0, "high": 19.0},
+        ],
+    )
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        mpc_enabled=True,
+        mpc_horizon_minutes=60,
+    )
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "17.5", {})
+
+    with patch(
+        "custom_components.comfort_band.coordinator.mpc.plan",
+        wraps=__import__("custom_components.comfort_band.mpc", fromlist=["plan"]).plan,
+    ) as plan_spy:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert plan_spy.called
+    call_kwargs = plan_spy.call_args.kwargs
+    bands_per_step = call_kwargs["bands_per_step"]
+    assert bands_per_step is not None
+    assert len(bands_per_step) == 60  # MPC_HORIZON / 1-min step
+    # First entry is the band active right now (05:30 → overnight band).
+    assert bands_per_step[0] == (16.0, 19.0)
+    # An entry past 07:00 (e.g. minute 95 from 05:30) would be the
+    # morning band; but our horizon is 60 min (covers 05:30 - 06:30),
+    # entirely within the overnight band.
+    assert bands_per_step[-1] == (16.0, 19.0)
+    await coordinator.async_unload()
+
+
+async def test_mpc_bands_per_step_none_when_override_active(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Override active → snapshot semantics are correct (the manual
+    band holds until expiry, no schedule transitions to anticipate).
+    Coordinator passes `bands_per_step=None`, MPC falls back to its
+    snapshot path using `inputs.low / inputs.high`. Pins the design
+    choice to keep the code path simple in the override case.
+    """
+    from unittest.mock import patch
+
+    freezer.move_to("2026-05-19 05:30:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Install a schedule + activate an override; bands_per_step should
+    # be None because the manual band overrides the schedule.
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+        ],
+    )
+    override_until = dt_util.utcnow() + timedelta(hours=2)
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        mpc_enabled=True,
+        override_until=override_until.isoformat(),
+    )
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+
+    with patch(
+        "custom_components.comfort_band.coordinator.mpc.plan",
+        wraps=__import__("custom_components.comfort_band.mpc", fromlist=["plan"]).plan,
+    ) as plan_spy:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert plan_spy.called
+    assert plan_spy.call_args.kwargs["bands_per_step"] is None
+    await coordinator.async_unload()
+
+
+async def test_mpc_bands_per_step_none_when_no_schedule(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """No schedule configured (default install state) → bands_per_step
+    is None; MPC uses the snapshot manual_low / manual_high. Symmetric
+    with the override case — both are "no schedule transitions to
+    anticipate" paths.
+    """
+    from unittest.mock import patch
+
+    freezer.move_to("2026-05-19 05:30:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+
+    with patch(
+        "custom_components.comfort_band.coordinator.mpc.plan",
+        wraps=__import__("custom_components.comfort_band.mpc", fromlist=["plan"]).plan,
+    ) as plan_spy:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert plan_spy.called
+    assert plan_spy.call_args.kwargs["bands_per_step"] is None
+    await coordinator.async_unload()
