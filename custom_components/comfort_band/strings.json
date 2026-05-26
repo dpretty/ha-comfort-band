@@ -35,10 +35,11 @@
   "options": {
     "step": {
       "init": {
-        "title": "Configure zone",
-        "description": "Attach, change, or clear the humidity sensor used to compute apparent temperature for this zone.",
+        "title": "Configure zone sensors",
+        "description": "Change the room-temperature sensor or attach / clear the humidity sensor. Swapping the temperature sensor clears this zone's sample buffer and triggers an MPC warm-up period.",
         "data": {
-          "humidity_sensor": "Humidity sensor (optional)"
+          "temp_sensor": "Room-temperature sensor",
+          "humidity_sensor": "Humidity sensor (optional, enables apparent temperature)"
         }
       }
     }
