@@ -31,6 +31,11 @@ from .const import (
 
 _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
+# Shared selectors: same filters as the initial zone-add schema below, so
+# the OptionsFlow form offers exactly the same entity choices for edits.
+_TEMP_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=["sensor"], device_class=["temperature"])
+)
 _HUMIDITY_SELECTOR = selector.EntitySelector(
     selector.EntitySelectorConfig(domain=["sensor"], device_class=["humidity"])
 )
@@ -41,9 +46,7 @@ _ZONE_SCHEMA = vol.Schema(
         vol.Required(CONF_CLIMATE_ENTITY): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["climate"])
         ),
-        vol.Required(CONF_TEMP_SENSOR): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=["sensor"], device_class=["temperature"])
-        ),
+        vol.Required(CONF_TEMP_SENSOR): _TEMP_SELECTOR,
         vol.Optional(CONF_HUMIDITY_SENSOR): _HUMIDITY_SELECTOR,
     }
 )
@@ -115,37 +118,83 @@ class ComfortBandConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class ZoneOptionsFlow(OptionsFlow):
-    """Single-field flow: attach / change / clear the optional humidity sensor.
+    """Edit a zone's sensor wiring after creation: room temperature
+    (required, swapping flushes the sample buffer) and humidity (optional,
+    clearable).
 
-    Resolution order at read time is `entry.options[CONF_HUMIDITY_SENSOR]`
-    falling back to `entry.data[CONF_HUMIDITY_SENSOR]` — so existing zones
-    that picked a humidity sensor at first-setup keep working, and an
-    OptionsFlow edit wins thereafter. Submitting an empty form normalises
-    to `{CONF_HUMIDITY_SENSOR: None}` so a user can clear a previously-set
-    sensor.
+    Resolution order at read time is `entry.options[KEY]` falling back to
+    `entry.data[KEY]` — so existing zones that set sensors at first-setup
+    keep working, and an OptionsFlow edit wins thereafter. The same
+    pattern is used by `__init__.py` when wiring the coordinator.
+
+    Submitting the form persists BOTH sensors into options (so a user
+    clearing a previously-set humidity sensor produces `{humidity: None}`
+    rather than silently reverting to the data field). When the temp
+    sensor changes vs the current effective value, the zone's sample
+    buffer is cleared before persisting — mixing samples from two
+    sensors at different resolutions / placements would bias the slope
+    estimator. The change also pairs with v0.9.1's diagnostics: if
+    `sensor.{zone}_thermal_slope`'s `std_dev_idle` sits near 0 across
+    many samples, the sensor is masking drift and bumping it via this
+    flow is the recommended remedy.
 
     Uses the modern HA convention: `self.config_entry` is resolved by the
     base class from `self.hass`, no `__init__` override required.
     """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        entry = self.config_entry
+        current_temp = entry.options.get(CONF_TEMP_SENSOR, entry.data[CONF_TEMP_SENSOR])
+        current_humidity = entry.options.get(
+            CONF_HUMIDITY_SENSOR, entry.data.get(CONF_HUMIDITY_SENSOR)
+        )
         if user_input is not None:
-            # Voluptuous omits the key when the EntitySelector is left empty.
-            # Normalise to None so the resolution below sees a value (not a
-            # missing key that falls through to entry.data — which would
-            # silently re-apply the previously-saved sensor).
+            new_temp = user_input[CONF_TEMP_SENSOR]
+            # String equality on the EntitySelector's output is sufficient
+            # — the widget returns the entity_id verbatim from the entity
+            # registry (always lowercase, no whitespace), so there's no
+            # casing / formatting ambiguity for "did the user change the
+            # sensor?".
+            if new_temp != current_temp:
+                # Sensor swap: clear samples so the new sensor's data
+                # isn't mixed with old-sensor samples at a different
+                # resolution / offset. Correctness depends on the
+                # reload-on-options-change listener firing before any
+                # other refresh; the order is: persist samples=[] to
+                # store → return async_create_entry → HA fires the
+                # update listener → entry reload tears down the old
+                # coordinator (clearing its _samples_cache) and
+                # instantiates a fresh one that `load_samples` from
+                # the now-empty store. MPC's `mpc_ready` then goes
+                # False until the slope estimator accumulates fresh
+                # samples (typically a few hours of normal operation,
+                # per v0.8.0 README).
+                #
+                # `hass.data[DOMAIN].store` raises KeyError if the
+                # integration's shared data wasn't initialised — HA
+                # blocks the OptionsFlow when the entry failed setup,
+                # so this is unreachable in practice. No defensive
+                # guard for consistency with the rest of the codebase.
+                store = self.hass.data[DOMAIN].store
+                await store.async_update_zone(entry.data[CONF_ZONE_NAME], samples=[])
             return self.async_create_entry(
                 title="",
-                data={CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR)},
+                # Voluptuous omits the humidity key when its EntitySelector
+                # is left empty. Normalise to None so the resolution above
+                # sees a value (not a missing key that falls through to
+                # entry.data — which would silently re-apply the
+                # previously-saved sensor).
+                data={
+                    CONF_TEMP_SENSOR: new_temp,
+                    CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR),
+                },
             )
-        current = self.config_entry.options.get(
-            CONF_HUMIDITY_SENSOR, self.config_entry.data.get(CONF_HUMIDITY_SENSOR)
-        )
         schema = vol.Schema(
             {
+                vol.Required(CONF_TEMP_SENSOR, default=current_temp): _TEMP_SELECTOR,
                 vol.Optional(
                     CONF_HUMIDITY_SENSOR,
-                    description={"suggested_value": current},
+                    description={"suggested_value": current_humidity},
                 ): _HUMIDITY_SELECTOR,
             }
         )

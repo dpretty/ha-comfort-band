@@ -82,6 +82,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not data.store.has_zone(zone_name):
             await data.store.async_add_zone(zone_name)
 
+        # Room-temp sensor (required) — v0.9.2 extended the OptionsFlow to
+        # let users swap it on an existing zone. Resolution: options-first
+        # (OptionsFlow edit) falling back to data (original add-time
+        # choice). Unlike humidity below, the temp key is always present
+        # in either options OR data so a plain `.get(..., data[...])`
+        # fallback is safe.
+        temp_entity_id = entry.options.get(CONF_TEMP_SENSOR, entry.data[CONF_TEMP_SENSOR])
         # Humidity sensor is optional; OptionsFlow can also set / clear it
         # post-hoc. The OptionsFlow always writes the key (possibly None)
         # so "key present in options" means "user has edited this", even
@@ -97,14 +104,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             data.store,
             zone_name,
             entry.data[CONF_CLIMATE_ENTITY],
-            entry.data[CONF_TEMP_SENSOR],
+            temp_entity_id,
             humidity_entity_id=humidity_entity_id,
         )
         await coordinator.async_setup()
         data.zone_coordinators[entry.entry_id] = coordinator
         data.zone_slug_to_entry_id[zone_name] = entry.entry_id
-        # Reload on OptionsFlow save so a humidity-sensor change picks up
-        # without a HA restart.
+        # Reload on OptionsFlow save so a sensor change (temp or humidity)
+        # picks up without a HA restart.
         entry.async_on_unload(entry.add_update_listener(_async_reload_on_options_change))
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS_ZONE)
         return True
