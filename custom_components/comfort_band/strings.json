@@ -88,6 +88,9 @@
       },
       "mpc_horizon_minutes": {
         "name": "MPC horizon minutes"
+      },
+      "band_ramp_minutes": {
+        "name": "Band ramp minutes"
       }
     },
     "select": {

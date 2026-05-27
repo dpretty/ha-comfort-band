@@ -51,6 +51,10 @@ async def test_default_zone_has_sane_initial_values(
     # bumped the default horizon from 20 → 60 min.
     assert zone["mpc_enabled"] is False
     assert zone["mpc_horizon_minutes"] == 60
+    # v0.10.0 band-ramp smoothing: 0 by default (stepped transitions,
+    # the v0.9.x behaviour). Users opt in by raising via
+    # `number.{zone}_band_ramp_minutes`.
+    assert zone["band_ramp_minutes"] == 0
 
 
 # ----- round-trip persistence -----
@@ -730,6 +734,8 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     store = ComfortBandStore(hass)
     await store.async_load()
     assert store.get_zone("office")["mpc_horizon_minutes"] == 60
+    # v0.10.0: band_ramp_minutes also backfilled to 0 for legacy zones.
+    assert store.get_zone("office")["band_ramp_minutes"] == 0
 
 
 async def test_load_v0_8_zone_with_explicit_mpc_horizon_preserves_user_value(

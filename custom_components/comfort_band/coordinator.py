@@ -347,7 +347,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             default_profile
         )
         sched_low, sched_high = self._resolve_schedule(
-            schedule_data, fallback=(zone["manual_low"], zone["manual_high"])
+            schedule_data,
+            fallback=(zone["manual_low"], zone["manual_high"]),
+            ramp_minutes=zone["band_ramp_minutes"],
         )
 
         if override_active:
@@ -429,7 +431,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         bands_per_step = (
             None
             if override_active
-            else self._compute_bands_per_step(schedule_data, zone["mpc_horizon_minutes"])
+            else self._compute_bands_per_step(
+                schedule_data,
+                zone["mpc_horizon_minutes"],
+                ramp_minutes=zone["band_ramp_minutes"],
+            )
         )
         mpc_decision = mpc.plan(
             thermal_slopes,
@@ -449,8 +455,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         else:
             final_decision = hyst_decision
 
-        # Reschedule next-transition + override-expiry timers.
-        self._schedule_next_transition(schedule_data)
+        # Reschedule next-transition + override-expiry timers. Pass the
+        # ramp so the timer wakes us at the ramp's leading edge instead of
+        # at the bare transition, which would otherwise forfeit the leading
+        # half of the smoothing in quiet rooms (no sensor activity between
+        # this refresh and the next transition).
+        self._schedule_next_transition(schedule_data, ramp_minutes=zone["band_ramp_minutes"])
         if override_until is not None and override_active:
             self._schedule_override_expiry(override_until - now_utc)
 
@@ -559,6 +569,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self,
         schedule_data: StoredProfileSchedule | None,
         fallback: tuple[float, float],
+        *,
+        ramp_minutes: float = 0,
     ) -> tuple[float, float]:
         if schedule_data is None or not schedule_data.get("current"):
             return fallback
@@ -569,12 +581,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 "%s: corrupt schedule (%s); falling back to manual band", self.zone_name, err
             )
             return fallback
-        return schedule.resolve(transitions, dt_util.now().time())
+        return schedule.resolve(transitions, dt_util.now().time(), ramp_minutes=ramp_minutes)
 
     def _compute_bands_per_step(
         self,
         schedule_data: StoredProfileSchedule | None,
         horizon_minutes: int,
+        *,
+        ramp_minutes: float = 0,
     ) -> list[tuple[float, float]] | None:
         """Build per-step ``(low, high)`` over the MPC horizon for lookahead.
 
@@ -604,9 +618,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             dt_util.now().time(),
             horizon_minutes,
             MPC_SIMULATION_STEP_MINUTES,
+            ramp_minutes=ramp_minutes,
         )
 
-    def _schedule_next_transition(self, schedule_data: StoredProfileSchedule | None) -> None:
+    def _schedule_next_transition(
+        self,
+        schedule_data: StoredProfileSchedule | None,
+        *,
+        ramp_minutes: float = 0,
+    ) -> None:
         if self._unsub_transition_timer is not None:
             self._unsub_transition_timer()
             self._unsub_transition_timer = None
@@ -621,6 +641,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         secs = _seconds_until_next_transition(transitions, dt_util.now())
         if secs is None:
             return
+        # v0.10.0: when ramp smoothing is enabled, wake at the ramp's
+        # leading edge `t - R/2` instead of the bare transition `t`. This
+        # ensures the smoothing actually starts on time in quiet rooms
+        # where no sensor activity would otherwise trigger a refresh in
+        # the leading half of the window. Only adjust when the leading
+        # edge is still in the future — if `secs <= half_ramp_secs` we
+        # are already inside the ramp window, and the existing wake-up
+        # at the bare transition is the correct next-significant moment
+        # (subtracting again would cause an immediate re-fire loop).
+        if ramp_minutes > 0:
+            half_ramp_secs = ramp_minutes * 60.0 / 2.0
+            if secs > half_ramp_secs:
+                secs = secs - half_ramp_secs
         capped = min(secs, _MAX_NEXT_TRANSITION_SECS)
         self._unsub_transition_timer = async_call_later(self.hass, capped, self._on_timer_fire)
 

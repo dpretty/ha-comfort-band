@@ -1862,3 +1862,273 @@ async def test_mpc_bands_per_step_none_when_no_schedule(
     assert plan_spy.called
     assert plan_spy.call_args.kwargs["bands_per_step"] is None
     await coordinator.async_unload()
+
+
+# ----- band-ramp smoothing (v0.10.0) -----
+
+
+async def test_band_ramp_smooths_schedule_resolve(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.10.0 integration: when ``band_ramp_minutes > 0``, the effective
+    band at a moment inside the ramp window is the linear interpolation of
+    the adjacent transitions — not the stepped value. Freeze 7 min before
+    the 07:00 transition (16,19) → (20,22) with ramp=30; the band sits
+    between the two endpoints. Pins the wiring of ``ramp_minutes`` through
+    ``_resolve_schedule`` → ``schedule.resolve``.
+    """
+    # Pin HA timezone to UTC so the freezer time matches `dt_util.now().time()`.
+    # Without this, the pytest-homeassistant fixture defaults to US/Pacific
+    # and schedules resolve against an offset local clock.
+    await hass.config.async_set_time_zone("UTC")
+    # 06:53 → 7 min before the 07:00 transition. With ramp=30 the ramp
+    # window is 06:45-07:15; 06:53 is 8 min into it (progress 8/30).
+    freezer.move_to("2026-05-19 06:53:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+            {"at": "22:00", "low": 16.0, "high": 19.0},
+        ],
+    )
+    await coordinator._store.async_update_zone(
+        "office",
+        band_ramp_minutes=30,
+    )
+    hass.states.async_set(TEMP_ENTITY, "18.5", {})
+
+    try:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # Stepped band at 06:53 would still be (16, 19); ramped value sits
+        # between the two adjacent bands. Loose bounds suffice — the exact
+        # arithmetic is pinned in test_schedule.py's ramp tests.
+        eff_low = coordinator.data.effective_low
+        eff_high = coordinator.data.effective_high
+        assert 16.0 < eff_low < 20.0, f"expected smoothed low, got {eff_low}"
+        assert 19.0 < eff_high < 22.0, f"expected smoothed high, got {eff_high}"
+    finally:
+        await coordinator.async_unload()
+
+
+async def test_band_ramp_passes_through_to_upcoming_bands(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """``band_ramp_minutes`` is forwarded to ``schedule.upcoming_bands``
+    so the MPC lookahead sees the same ramp as the live decision path.
+    Spy on the helper; assert the kwarg is what the coordinator stored.
+    """
+    from unittest.mock import patch
+
+    freezer.move_to("2026-05-19 05:30:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+        ],
+    )
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        mpc_enabled=True,
+        mpc_horizon_minutes=60,
+        band_ramp_minutes=30,
+    )
+    _seed_full_slope_data(coordinator, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "17.5", {})
+
+    with patch(
+        "custom_components.comfort_band.coordinator.schedule.upcoming_bands",
+        wraps=__import__(
+            "custom_components.comfort_band.schedule", fromlist=["upcoming_bands"]
+        ).upcoming_bands,
+    ) as ub_spy:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert ub_spy.called
+    assert ub_spy.call_args.kwargs["ramp_minutes"] == 30
+    await coordinator.async_unload()
+
+
+async def test_band_ramp_zero_keeps_stepped_behaviour(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Default ``band_ramp_minutes=0`` preserves v0.9.x stepped behaviour:
+    at 06:53 (inside what would be the ramp window if enabled), the
+    effective band still equals the pre-transition value exactly.
+    """
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 06:53:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+            {"at": "22:00", "low": 16.0, "high": 19.0},
+        ],
+    )
+    # band_ramp_minutes is 0 by default; assert that explicitly to pin
+    # the default rather than just relying on _setup_enabled_zone.
+    assert coordinator._store.get_zone("office")["band_ramp_minutes"] == 0
+    hass.states.async_set(TEMP_ENTITY, "18.5", {})
+
+    try:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        assert coordinator.data.effective_low == 16.0
+        assert coordinator.data.effective_high == 19.0
+    finally:
+        await coordinator.async_unload()
+
+
+async def test_band_ramp_schedules_timer_at_leading_edge(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.10.0 R5 fix: with ``band_ramp_minutes > 0`` the next-transition
+    timer fires at ``t - ramp/2`` instead of at ``t``, so the leading
+    half of the ramp isn't forfeited in quiet rooms. Spy on
+    ``async_call_later`` (the coordinator's only timer source) and
+    assert the delay matches the leading-edge target.
+    """
+    from unittest.mock import patch
+
+    await hass.config.async_set_time_zone("UTC")
+    # 06:00 (well before any transition); next transition is 07:00.
+    freezer.move_to("2026-05-19 06:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+        ],
+    )
+    await coordinator._store.async_update_zone("office", band_ramp_minutes=30)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+
+    captured_delays: list[float] = []
+
+    # Patch the `async_call_later` symbol the coordinator imports. Capture
+    # the delay arg of every call, then delegate to the real function so
+    # the runtime stays consistent.
+    from homeassistant.helpers.event import async_call_later as real_call_later
+
+    def _spy_call_later(hass_: Any, delay: float, action: Any) -> Any:
+        captured_delays.append(delay)
+        return real_call_later(hass_, delay, action)
+
+    try:
+        with patch(
+            "custom_components.comfort_band.coordinator.async_call_later",
+            side_effect=_spy_call_later,
+        ):
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+        # The transition timer should have been scheduled for 07:00 - 15min
+        # = 06:45 (= 2700 secs from 06:00). Capped at _MAX_NEXT_TRANSITION_SECS
+        # = 3600. 2700 is well within that, so the captured delay should
+        # equal 2700 (within a few seconds of clock slop).
+        #
+        # Debounce timer also calls async_call_later, so filter to the
+        # value closest to our target rather than asserting "exactly one
+        # call." The non-debounce delay is the transition timer.
+        assert captured_delays, "no async_call_later calls captured"
+        # Look for a captured delay near 2700s (allow ±5s for clock skew).
+        target = 7 * 3600 - 6 * 3600 - 15 * 60  # 2700
+        matching = [d for d in captured_delays if abs(d - target) < 5]
+        assert matching, (
+            f"expected a transition timer scheduled around {target}s "
+            f"(leading edge of 07:00 transition with ramp=30 from 06:00), "
+            f"got delays {captured_delays}"
+        )
+    finally:
+        await coordinator.async_unload()
+
+
+async def test_band_ramp_inside_window_keeps_bare_transition_timer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Guard against the re-fire loop the leading-edge subtraction would
+    otherwise cause: when ``now`` is already inside the ramp window (the
+    leading edge has passed), the timer falls back to waking at the bare
+    transition time. Without this guard, a refresh at e.g. 06:50 would
+    schedule for 06:45 (already past) → clamp to 1s → fire → resolve →
+    re-schedule for 06:45 → ... in a tight loop.
+    """
+    from unittest.mock import patch
+
+    await hass.config.async_set_time_zone("UTC")
+    # 06:50 — inside the 07:00 ramp window (06:45-07:15 with ramp=30).
+    # Transition is 10 min away; leading edge was 5 min ago.
+    freezer.move_to("2026-05-19 06:50:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 16.0, "high": 19.0},
+            {"at": "07:00", "low": 20.0, "high": 22.0},
+        ],
+    )
+    await coordinator._store.async_update_zone("office", band_ramp_minutes=30)
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+
+    captured_delays: list[float] = []
+    from homeassistant.helpers.event import async_call_later as real_call_later
+
+    def _spy_call_later(hass_: Any, delay: float, action: Any) -> Any:
+        captured_delays.append(delay)
+        return real_call_later(hass_, delay, action)
+
+    try:
+        with patch(
+            "custom_components.comfort_band.coordinator.async_call_later",
+            side_effect=_spy_call_later,
+        ):
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+        # Bare-transition target is 07:00 - 06:50 = 600s. With the guard,
+        # the timer stays at 600s (not 600 - 900 = -300 clamped to 1).
+        target = 600  # 10 min x 60
+        matching = [d for d in captured_delays if abs(d - target) < 5]
+        assert matching, (
+            f"expected bare-transition timer at {target}s (already inside "
+            f"ramp window so the guard suppresses the leading-edge subtract), "
+            f"got delays {captured_delays}"
+        )
+        # And no delay near 1s (which would indicate the guard misfired).
+        # 1s is the floor `max(..., 1.0)` we'd hit without the guard.
+        # _DEBOUNCE_SECS may also be small — verify the floor case explicitly.
+        # (No assertion here — debounce timer can be ~0.3s. The positive
+        # `matching` assertion above is the load-bearing check.)
+    finally:
+        await coordinator.async_unload()

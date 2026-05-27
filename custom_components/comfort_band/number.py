@@ -1,11 +1,12 @@
 """Per-zone number entities.
 
-Ten tunables are exposed as `number.{zone}_<key>`. Two of them
+Eleven tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other eight (`override_hours`, `deadband_below`, `deadband_above`,
+The other nine (`override_hours`, `deadband_below`, `deadband_above`,
 `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`,
-`passive_tolerance`, `mpc_horizon_minutes`) are simple persisted tunables.
+`passive_tolerance`, `mpc_horizon_minutes`, `band_ramp_minutes`) are
+simple persisted tunables.
 """
 
 from __future__ import annotations
@@ -19,6 +20,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    BAND_RAMP_MINUTES_MAX,
+    BAND_RAMP_MINUTES_MIN,
+    BAND_RAMP_MINUTES_STEP,
     DOMAIN,
     LOOKAHEAD_MAX,
     LOOKAHEAD_MIN,
@@ -129,6 +133,14 @@ _SPECS: tuple[_NumberSpec, ...] = (
         min_value=MPC_HORIZON_MIN,
         max_value=MPC_HORIZON_MAX,
         step=1,
+        unit=UnitOfTime.MINUTES,
+    ),
+    _NumberSpec(
+        key="band_ramp_minutes",
+        field="band_ramp_minutes",
+        min_value=BAND_RAMP_MINUTES_MIN,
+        max_value=BAND_RAMP_MINUTES_MAX,
+        step=BAND_RAMP_MINUTES_STEP,
         unit=UnitOfTime.MINUTES,
     ),
 )
