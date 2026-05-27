@@ -109,6 +109,21 @@ MPC_HORIZON_MAX: Final = 60
 # resolution of the underlying slope estimator (which produces °C/minute).
 MPC_SIMULATION_STEP_MINUTES: Final = 1.0
 
+# Band-ramp smoothing (v0.10.0+). When > 0, schedule transitions are
+# smoothed by linearly interpolating the (low, high) band edges within
+# ±ramp/2 of each transition's time. Per-zone via `number.{zone}_band_
+# ramp_minutes`. Defaults to 0 (instant step transitions — the v0.9.x
+# behaviour) so existing zones see no change on upgrade. A 30-minute
+# ramp smooths a 4 °C jump to ~0.14 °C/min instead of a wall, giving
+# HVAC time to ease into the new setpoint rather than chasing a sudden
+# deficit. The interpolation lives in `schedule.resolve` and
+# `schedule.upcoming_bands` so MPC / predictor / hysteresis all see the
+# smoothed band naturally via `effective_low` / `effective_high`.
+DEFAULT_BAND_RAMP_MINUTES: Final = 0
+BAND_RAMP_MINUTES_MIN: Final = 0
+BAND_RAMP_MINUTES_MAX: Final = 120
+BAND_RAMP_MINUTES_STEP: Final = 5
+
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0
 TEMP_MAX: Final = 26.0

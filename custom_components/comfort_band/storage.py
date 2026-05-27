@@ -34,6 +34,7 @@ __all__ = [
 
 from .const import (
     BUILTIN_PROFILES,
+    DEFAULT_BAND_RAMP_MINUTES,
     DEFAULT_CROSS_MODE_MIN_MINUTES,
     DEFAULT_DEADBAND_ABOVE,
     DEFAULT_DEADBAND_BELOW,
@@ -134,6 +135,16 @@ class StoredZone(TypedDict):
     # by the predictor for single-decision anticipation): MPC scores whole
     # cycles, predictor scores the next decision moment.
     mpc_horizon_minutes: int
+    # Schedule-transition smoothing window (v0.10.0+). When 0 (default),
+    # band transitions are instant steps — the v0.9.x behaviour. When
+    # > 0, the (low, high) band edges interpolate linearly within
+    # ±ramp/2 of each transition's time, so a 4 °C overnight setback
+    # rise at 06:00 becomes a 30-minute shoulder (05:45-06:15) instead
+    # of a wall. Implemented in `schedule.resolve` /
+    # `schedule.upcoming_bands` so MPC / predictor / hysteresis all see
+    # the smoothed band naturally. Exposed as
+    # `number.{zone}_band_ramp_minutes`, range [0, 120].
+    band_ramp_minutes: int
     enabled: bool
     # Gates the v0.6 predictive controller: when ON, `predictor.decide()`'s
     # anticipated action replaces `hysteresis.decide()`'s reactive one as the
@@ -201,6 +212,7 @@ def _default_zone(zone_name: str) -> StoredZone:
         "passive_tolerance": DEFAULT_PASSIVE_TOLERANCE_C,
         "mpc_enabled": False,
         "mpc_horizon_minutes": DEFAULT_MPC_HORIZON_MINUTES,
+        "band_ramp_minutes": DEFAULT_BAND_RAMP_MINUTES,
         "enabled": False,
         "learning_enabled": False,
         "use_apparent_temperature": False,
@@ -312,6 +324,15 @@ class ComfortBandStore:
                 migrated = True
             if "mpc_horizon_minutes" not in zone:
                 zone["mpc_horizon_minutes"] = DEFAULT_MPC_HORIZON_MINUTES
+                migrated = True
+            # v0.9 → v0.10: band-ramp smoothing. Default 0 (stepped
+            # transitions — current behaviour) so existing users see no
+            # change on upgrade. Users opt in by bumping the value via
+            # `number.{zone}_band_ramp_minutes`. Presence-keyed backfill
+            # preserves any explicit value if a user-edited store ships
+            # the key already.
+            if "band_ramp_minutes" not in zone:
+                zone["band_ramp_minutes"] = DEFAULT_BAND_RAMP_MINUTES
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)
