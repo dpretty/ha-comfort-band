@@ -2,6 +2,8 @@
 
 Per-room HVAC band-control for Home Assistant. Heats below a low threshold, cools above a high threshold, idles in between — giving heat pumps and mini-splits margin instead of fighting to hold a single setpoint.
 
+**v0.10.1** stops autonomous HVAC fan-speed changes from flushing the learning buffer. The manual-edit detector compared `fan_mode`, so an HVAC that varies its own fan speed (or reports a different fan_mode in `fan_only` idle vs `heat`/`cool`) wiped the sample buffer on every idle↔active transition. The buffer then never held idle *and* recovery samples at once, so `binary_sensor.{zone}_mpc_ready` never turned on and MPC silently fell back to the reactive predictor — no schedule-lookahead pre-heat. The detector now compares only `hvac_mode` + `target_temp` (still catching genuine manual setpoint/mode edits, including physical-remote ones); `fan_mode` is still captured per-sample.
+
 **v0.10.0** adds band-ramp smoothing: set `number.{zone}_band_ramp_minutes` to a non-zero value (e.g. 30) and schedule transitions interpolate linearly within ±ramp/2 of each transition. A 4 °C overnight rise at 06:00 becomes a 30-min shoulder instead of a wall — gentler HVAC, less overshoot. Per-zone, opt-in (default 0 = stepped, the v0.9.x behaviour). MPC's lookahead sees the ramp too.
 
 **v0.9.2** makes the room-temperature sensor swappable post-add via the existing zone OptionsFlow. Swapping flushes the zone's sample buffer so the slope estimator restarts cleanly; schedules and learning state are preserved. Pairs with v0.9.1's diagnostics: if `std_dev_idle` sits near 0, your sensor is too coarse — this OptionsFlow lets you swap to a finer one in one click.

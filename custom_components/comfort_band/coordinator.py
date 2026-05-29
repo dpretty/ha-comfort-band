@@ -798,16 +798,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         # About to issue climate commands: snapshot our intent so the
         # climate-state listener can recognise the resulting echoes and
-        # avoid mistaking them for manual edits. fan_mode is included since
-        # the listener also flushes on manual fan-mode changes (v0.8: even
-        # though fan_mode doesn't affect MPC's action space yet, it does
-        # change the room's thermal dynamics, so the slope estimator's prior
-        # data is no longer representative).
-        existing_fan_mode = self._current_climate_fan_mode()
+        # avoid mistaking them for manual edits. Only hvac_mode + target_temp
+        # are compared (see `_on_climate_state_change`): fan_mode is captured
+        # in samples but deliberately NOT part of the manual-edit comparison
+        # (v0.10.1 -- the HVAC's own per-mode / autonomous fan changes were
+        # flushing the learning buffer and starving MPC of idle samples).
         self._last_command_state = {
             "hvac_mode": decision.target_mode,
             "target_temp": rounded_target_temp,
-            "fan_mode": existing_fan_mode,
         }
         self._last_command_at = now_utc
 
@@ -845,7 +843,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._last_command_state = {
                 "hvac_mode": fresh.state,
                 "target_temp": fresh.attributes.get("temperature"),
-                "fan_mode": fresh.attributes.get("fan_mode"),
             }
             # Reuse the pre-call `now_utc` rather than calling utcnow() again:
             # the small delta from slow climate calls would just slightly
@@ -946,12 +943,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         manual edit; flush samples so the slope estimator doesn't fit stale
         dynamics.
 
-        v0.8 also compares `fan_mode`. A manual fan-mode change doesn't
-        affect v0.8's control decisions (MPC's v0.8 action space ignores
-        fan_mode), but it does change the room's thermal dynamics — the
-        slope estimator's prior data is no longer representative of what's
-        happening now. Treating a fan-mode change as a flush keeps the
-        estimator honest under mixed control.
+        v0.8 also compared `fan_mode` here, on the theory that a fan change
+        alters the room's thermal dynamics. v0.10.1 removes it: in practice
+        many HVACs report a different fan_mode in `fan_only` (idle) vs
+        `heat`/`cool`, and modulate fan speed autonomously while running.
+        Those device-driven changes are not "manual edits", but they tripped
+        the comparison and flushed the buffer on every idle<->active
+        transition — so the buffer never held idle AND recovery samples at
+        once, `mpc.is_ready` never turned True, and MPC silently fell back to
+        the reactive predictor (no schedule-lookahead pre-heat). Comparing
+        only `hvac_mode` + `target_temp` still catches genuine manual setpoint
+        / mode edits (incl. physical-remote edits with no HA context). fan_mode
+        is still captured per-sample for future `(action, fan_mode)`
+        partitioning; it just no longer forces a flush.
         """
         # `EventStateChangedData` declares both keys as required (`State | None`),
         # so subscript access is the type-honest read; .get() would silently
@@ -964,7 +968,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         observed = {
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
-            "fan_mode": new_state.attributes.get("fan_mode"),
         }
         now = dt_util.utcnow()
         # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)

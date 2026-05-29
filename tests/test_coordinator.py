@@ -1462,32 +1462,37 @@ async def test_target_temp_falls_back_to_default_step_on_nan_attribute(
     await coordinator.async_unload()
 
 
-async def test_manual_fan_mode_change_flushes_sample_buffer(
+async def test_fan_mode_change_does_not_flush_sample_buffer(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """Manual fan-mode changes alter the room's thermal dynamics — slope
-    estimator data from the prior fan_mode is no longer representative.
-    Detected by `_on_climate_state_change` comparing fan_mode and flushing
-    the buffer, same as for hvac_mode / temperature mismatches.
+    """v0.10.1 regression: a fan-mode-only change must NOT flush the buffer.
+
+    Pre-v0.10.1 the manual-edit detector compared `fan_mode`, so the HVAC's
+    own autonomous fan modulation (or a different fan_mode in fan_only vs
+    heat) flushed the learning buffer. v0.10.1 compares only `hvac_mode` +
+    `target_temp`; fan_mode is still captured per-sample but no longer forces
+    a flush. Here the observed state matches the baseline on hvac_mode +
+    target_temp and differs ONLY in fan_mode, well outside the echo window.
     """
     from homeassistant.core import Event, EventStateChangedData, State
 
     freezer.move_to("2026-05-19 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
-    # Establish a baseline command + buffer (with fan_mode=low at command time).
-    hass.states.async_set(CLIMATE_ENTITY, "off", {"fan_mode": "low"})
+    # Establish a baseline command + buffer.
     hass.states.async_set(TEMP_ENTITY, "18.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert len(coordinator._samples_cache) >= 1
-    assert coordinator._last_command_state is not None
-    assert coordinator._last_command_state.get("fan_mode") == "low"
+    before = list(coordinator._samples_cache)
 
-    # Manual fan-mode change well outside the echo window.
-    freezer.tick(timedelta(minutes=10))
+    # Pin a baseline matching the incoming event on hvac_mode + target_temp,
+    # differing ONLY in fan_mode; place the last command well outside the
+    # echo window so the change is treated as a candidate "edit".
+    coordinator._last_command_state = {"hvac_mode": "heat", "target_temp": 19.5}
+    coordinator._last_command_at = dt_util.utcnow() - timedelta(minutes=10)
     old_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "low"})
     new_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "high"})
     event: Event[EventStateChangedData] = Event(
@@ -1497,7 +1502,51 @@ async def test_manual_fan_mode_change_flushes_sample_buffer(
     coordinator._on_climate_state_change(event)
     await hass.async_block_till_done()
 
-    assert coordinator._samples_cache == []
+    # Buffer preserved (was [] under the pre-v0.10.1 fan_mode comparison).
+    assert coordinator._samples_cache == before
+    await coordinator.async_unload()
+
+
+async def test_autonomous_fan_change_preserves_cross_segment_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.10.1 end-to-end for the gym's production bug: with idle + heat
+    samples both in the buffer, an autonomous fan-mode change must keep BOTH
+    segments. Pre-v0.10.1 each idle<->heat transition's fan settle flushed the
+    buffer, so it never held idle AND recovery samples at once → idle_slope
+    stayed None → mpc_ready never True → MPC silently fell back to the
+    reactive predictor (no schedule-lookahead pre-heat).
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    from custom_components.comfort_band.const import ACTION_HEAT, ACTION_IDLE
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Seed a buffer that already spans idle + heat (what mpc_ready needs).
+    _seed_heat_only_slope_data(coordinator, now=dt_util.utcnow())
+    seeded_actions = {s.action for s in coordinator._samples_cache}
+    assert ACTION_IDLE in seeded_actions and ACTION_HEAT in seeded_actions
+
+    # The HVAC settles its fan to a new speed after a heat command — same
+    # hvac_mode + target_temp, only fan_mode differs, outside the echo window.
+    coordinator._last_command_state = {"hvac_mode": "heat", "target_temp": 19.5}
+    coordinator._last_command_at = dt_util.utcnow() - timedelta(minutes=10)
+    old_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "low"})
+    new_state = State(CLIMATE_ENTITY, "heat", {"temperature": 19.5, "fan_mode": "high"})
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {"entity_id": CLIMATE_ENTITY, "old_state": old_state, "new_state": new_state},
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    # Both segments survive → idle_slope + recovery_heat both derivable.
+    surviving = {s.action for s in coordinator._samples_cache}
+    assert ACTION_IDLE in surviving and ACTION_HEAT in surviving
     await coordinator.async_unload()
 
 
