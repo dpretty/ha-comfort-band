@@ -1,4 +1,4 @@
-"""Tests for the eight `comfort_band.*` services."""
+"""Tests for the `comfort_band.*` services."""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ async def test_all_services_registered(
         "clone_profile",
         "rename_profile",
         "delete_profile",
+        "record_feedback",
     }
     for service in expected:
         assert hass.services.has_service(DOMAIN, service), f"missing service: {service}"
@@ -452,3 +453,62 @@ async def test_import_legacy_writes_to_default_after_home_rename(
     # Schedule landed on the renamed default, not on the now-absent "home".
     assert store.get_zone_schedule("office", "weekday") is not None
     assert store.get_zone_schedule("office", "home") is None
+
+
+# ----- comfort feedback (v0.11.0) -----
+
+
+async def test_record_feedback_persists_enriched_entry(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """record_feedback appends one entry enriched from the live coordinator
+    state (room temp, effective band, current action) plus a timestamp."""
+    await hass.services.async_call(
+        DOMAIN,
+        "record_feedback",
+        {"zone": "office", "label": "just_right"},
+        blocking=True,
+    )
+    data = hass.data[DOMAIN]
+    coordinator = data.zone_coordinators[data.zone_slug_to_entry_id["office"]]
+    state = coordinator.data
+    assert state is not None  # setup_zone ran a refresh
+
+    entries = data.feedback_store.get_entries("office")
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["zone"] == "office"
+    assert entry["label"] == "just_right"
+    assert entry["room_temp"] == state.room
+    assert entry["low"] == state.effective_low
+    assert entry["high"] == state.effective_high
+    assert entry["action"] == state.decision.action
+    assert entry["timestamp"]  # ISO timestamp present
+
+
+async def test_record_feedback_unknown_zone_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Unknown zone"):
+        await hass.services.async_call(
+            DOMAIN,
+            "record_feedback",
+            {"zone": "nope", "label": "too_hot"},
+            blocking=True,
+        )
+
+
+async def test_record_feedback_invalid_label_rejected(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    import voluptuous as vol
+
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN,
+            "record_feedback",
+            {"zone": "office", "label": "meh"},
+            blocking=True,
+        )
+    # A schema-rejected call must not persist anything.
+    assert hass.data[DOMAIN].feedback_store.get_entries("office") == []
