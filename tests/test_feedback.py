@@ -72,9 +72,7 @@ async def test_get_entries_filters_by_zone(
     assert store.get_entries("unknown") == []
 
 
-async def test_get_entries_since_filter(
-    hass: HomeAssistant, hass_storage: dict[str, Any]
-) -> None:
+async def test_get_entries_since_filter(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     store = FeedbackStore(hass)
     await store.async_load()
     await store.async_append(_entry("office", "2026-05-01T10:00:00+00:00", "too_cold"))
