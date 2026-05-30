@@ -157,6 +157,14 @@ HVAC_MODE_FAN_ONLY: Final = "fan_only"
 STORAGE_VERSION: Final = 1
 STORAGE_KEY: Final = "comfort_band.data"
 
+# Comfort-feedback log (v0.11.0). Kept in a SEPARATE Store from the main zone
+# data so the append-only feedback history never bloats (or risks corrupting)
+# the core config. Capped to the most-recent N entries to bound disk + memory.
+FEEDBACK_STORAGE_VERSION: Final = 1
+FEEDBACK_STORAGE_KEY: Final = "comfort_band.feedback"
+FEEDBACK_MAX_ENTRIES: Final = 2000
+FEEDBACK_LABELS: Final = ("too_hot", "just_right", "too_cold")
+
 # Platforms forwarded by each ConfigEntry kind.
 PLATFORMS_ZONE: Final = (
     Platform.NUMBER,

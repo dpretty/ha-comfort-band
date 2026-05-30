@@ -15,7 +15,12 @@ from typing import Any
 import pytest
 from homeassistant.core import HomeAssistant
 
-from custom_components.comfort_band.ws import ws_get_schedule, ws_subscribe_schedule
+from custom_components.comfort_band.const import DOMAIN
+from custom_components.comfort_band.ws import (
+    ws_get_feedback,
+    ws_get_schedule,
+    ws_subscribe_schedule,
+)
 
 
 class _FakeConnection:
@@ -123,6 +128,7 @@ async def test_command_is_registered_at_setup(
     handlers = hass.data.get("websocket_api", {})
     assert "comfort_band/get_schedule" in handlers
     assert "comfort_band/subscribe_schedule" in handlers
+    assert "comfort_band/get_feedback" in handlers
 
 
 # ----- subscribe_schedule -----
@@ -303,3 +309,66 @@ async def test_subscribe_unsubscribe_stops_updates(
 
     # Only the initial event from subscribe — nothing after unsub.
     assert len(_events_from(conn)) == 1
+
+
+# ----- get_feedback (v0.11.0) -----
+
+
+async def test_get_feedback_unknown_zone_errors(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    conn = _FakeConnection()
+    ws_get_feedback(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 1, "type": "comfort_band/get_feedback", "zone": "nope"},
+    )
+    assert conn.results == []
+    assert conn.errors and conn.errors[0][1] == "zone_not_found"
+
+
+async def test_get_feedback_returns_recorded_entries(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Write two entries via the service so the round-trip is exercised.
+    for label in ("too_hot", "just_right"):
+        await hass.services.async_call(
+            DOMAIN, "record_feedback", {"zone": "office", "label": label}, blocking=True
+        )
+    conn = _FakeConnection()
+    ws_get_feedback(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 7, "type": "comfort_band/get_feedback", "zone": "office"},
+    )
+    assert conn.errors == []
+    assert len(conn.results) == 1
+    msg_id, payload = conn.results[0]
+    assert msg_id == 7
+    labels = [e["label"] for e in payload["entries"]]
+    assert labels == ["too_hot", "just_right"]
+
+
+async def test_get_feedback_since_filter(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Seed entries with controlled timestamps straight into the store.
+    fb = hass.data[DOMAIN].feedback_store
+    base = {"zone": "office", "room_temp": 21.0, "low": 19.5, "high": 22.5, "action": "idle"}
+    await fb.async_append({**base, "timestamp": "2026-05-01T10:00:00+00:00", "label": "too_cold"})
+    await fb.async_append({**base, "timestamp": "2026-05-03T10:00:00+00:00", "label": "too_hot"})
+
+    conn = _FakeConnection()
+    ws_get_feedback(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {
+            "id": 9,
+            "type": "comfort_band/get_feedback",
+            "zone": "office",
+            "since": "2026-05-02T00:00:00+00:00",
+        },
+    )
+    assert conn.errors == []
+    labels = [e["label"] for e in conn.results[0][1]["entries"]]
+    assert labels == ["too_hot"]

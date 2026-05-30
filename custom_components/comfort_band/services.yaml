@@ -176,6 +176,28 @@ cancel_override:
       selector:
         text:
 
+record_feedback:
+  name: Record comfort feedback
+  description: >-
+    Log how the current band feels for a zone (too warm / just right / too
+    cool). Each entry is enriched with the live room temperature, band, and
+    action for the v3 auto-learning loop.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      selector:
+        text:
+    label:
+      name: Feedback
+      required: true
+      selector:
+        select:
+          options:
+            - too_hot
+            - just_right
+            - too_cold
+
 set_profile:
   name: Set active profile
   description: Switch the global active profile. All zones react via the dispatcher signal.

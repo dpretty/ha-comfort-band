@@ -23,8 +23,10 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, LOGGER
+from .const import DOMAIN, FEEDBACK_LABELS, LOGGER
+from .feedback import FeedbackEntry
 from .legacy import read_legacy_hourly_schedule
 from .schedule import (
     Transition,
@@ -51,6 +53,7 @@ SERVICE_CREATE_PROFILE = "create_profile"
 SERVICE_CLONE_PROFILE = "clone_profile"
 SERVICE_RENAME_PROFILE = "rename_profile"
 SERVICE_DELETE_PROFILE = "delete_profile"
+SERVICE_RECORD_FEEDBACK = "record_feedback"
 
 _TIME_RE = r"^[0-2]\d:[0-5]\d$"
 
@@ -98,6 +101,13 @@ _START_OVERRIDE_SCHEMA = vol.Schema(
 )
 
 _CANCEL_OVERRIDE_SCHEMA = vol.Schema({vol.Required("zone"): cv.string})
+
+_RECORD_FEEDBACK_SCHEMA = vol.Schema(
+    {
+        vol.Required("zone"): cv.string,
+        vol.Required("label"): vol.In(FEEDBACK_LABELS),
+    }
+)
 
 _SET_PROFILE_SCHEMA = vol.Schema({vol.Required("profile"): cv.string})
 
@@ -194,7 +204,7 @@ async def _refresh_zone_if_active(hass: HomeAssistant, zone_name: str) -> None:
 
 
 async def async_register_services(hass: HomeAssistant) -> None:
-    """Idempotently register all 12 services."""
+    """Idempotently register all 13 services."""
     if hass.services.has_service(DOMAIN, SERVICE_SET_SCHEDULE):
         return
 
@@ -279,6 +289,28 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _cancel_override(call: ServiceCall) -> None:
         coordinator = _coordinator(hass, call.data["zone"])
         await coordinator.async_cancel_override()
+
+    async def _record_feedback(call: ServiceCall) -> None:
+        # Append a comfort-feedback data point enriched with the band/action
+        # in effect right now, so the v3 learning loop can correlate without
+        # re-deriving context. Routed through `_coordinator` for the same
+        # unknown-zone ServiceValidationError every other service raises; a
+        # resolved coordinator has always completed its first refresh, so
+        # `.data` is populated (it's only None pre-first-refresh, before the
+        # zone is registered in `zone_coordinators`).
+        zone_name = call.data["zone"]
+        coordinator = _coordinator(hass, zone_name)
+        state = coordinator.data
+        entry: FeedbackEntry = {
+            "zone": zone_name,
+            "timestamp": dt_util.utcnow().isoformat(),
+            "label": call.data["label"],
+            "room_temp": state.room,
+            "low": state.effective_low,
+            "high": state.effective_high,
+            "action": state.decision.action,
+        }
+        await _data(hass).feedback_store.async_append(entry)
 
     async def _set_profile(call: ServiceCall) -> None:
         await _data(hass).profile_registry.async_set_active(call.data["profile"])
@@ -376,6 +408,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
         SERVICE_CANCEL_OVERRIDE,
         _cancel_override,
         schema=_CANCEL_OVERRIDE_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RECORD_FEEDBACK, _record_feedback, schema=_RECORD_FEEDBACK_SCHEMA
     )
     hass.services.async_register(
         DOMAIN, SERVICE_SET_PROFILE, _set_profile, schema=_SET_PROFILE_SCHEMA

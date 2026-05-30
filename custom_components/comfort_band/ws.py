@@ -1,9 +1,10 @@
 """Websocket commands for the Comfort Band frontend card.
 
 The integration's services in `services.py` are write-only; the card needs
-read APIs to render the schedule editor. This module owns both: the
-request/response `get_schedule` and the push `subscribe_schedule` that
-keeps multiple card instances in sync without polling.
+read APIs to render the schedule editor. This module owns the
+request/response `get_schedule`, the push `subscribe_schedule` that keeps
+multiple card instances in sync without polling, and `get_feedback` (the
+read side of the comfort-feedback log written by `record_feedback`).
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ def async_register_ws_commands(hass: HomeAssistant) -> None:
     """Register every websocket command in this module."""
     async_register_command(hass, ws_get_schedule)
     async_register_command(hass, ws_subscribe_schedule)
+    async_register_command(hass, ws_get_feedback)
 
 
 @websocket_command(
@@ -118,3 +120,32 @@ async def ws_subscribe_schedule(
     # resolves its `subscribeMessage` promise on the result frame.
     connection.send_result(msg["id"])
     connection.send_event(msg["id"], {"schedule": initial})
+
+
+@websocket_command(
+    {
+        vol.Required("type"): "comfort_band/get_feedback",
+        vol.Required("zone"): _NAME_FIELD,
+        vol.Optional("since"): str,
+    }
+)
+@callback
+def ws_get_feedback(
+    hass: HomeAssistant,
+    connection: ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return `{entries: [...]}` of recorded comfort feedback for a zone.
+
+    Read path for the v3 auto-learning loop (the `record_feedback` service
+    is the write path). Optional `since` (ISO-8601) filters to entries at or
+    after that time. Unknown zone → `zone_not_found`, matching
+    `get_schedule`. Entries are returned oldest-first.
+    """
+    data: ComfortBandData = hass.data[DOMAIN]
+    zone = msg["zone"]
+    if not data.store.has_zone(zone):
+        connection.send_error(msg["id"], "zone_not_found", f"Zone {zone!r} does not exist")
+        return
+    entries = data.feedback_store.get_entries(zone, msg.get("since"))
+    connection.send_result(msg["id"], {"entries": entries})

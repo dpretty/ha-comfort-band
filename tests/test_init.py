@@ -56,6 +56,26 @@ async def test_zone_entry_creates_all_entities(
         assert state is not None, f"missing entity: {entity_id}"
 
 
+async def test_shared_data_carries_loaded_feedback_store(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """v0.11.0: ComfortBandData exposes a loaded FeedbackStore wired in
+    `_ensure_shared_data` (the record_feedback service depends on it)."""
+    from custom_components.comfort_band.const import DOMAIN
+    from custom_components.comfort_band.feedback import FeedbackStore
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.5", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    feedback_store = hass.data[DOMAIN].feedback_store
+    assert isinstance(feedback_store, FeedbackStore)
+    # Loaded + usable: an empty log returns no entries rather than raising.
+    assert feedback_store.get_entries("office") == []
+
+
 async def test_profile_manager_entry_creates_select(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
