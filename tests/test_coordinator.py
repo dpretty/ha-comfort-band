@@ -2442,3 +2442,42 @@ async def test_naive_persisted_timestamp_is_dropped_not_crashed(
     zone = coordinator._store.get_zone("office")
     assert zone["persisted_idle_slope"] is None
     assert zone["persisted_idle_slope_at"] is None
+
+
+async def test_cached_idle_does_not_leak_into_reactive_predictor(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The cached idle slope is an MPC-only concern: it must NOT reach the v0.7
+    predictor's passive-drift branch, or it could silently suppress a reactive
+    heat call off a stale slope on a predictor-only zone.
+
+    Scenario engineered so that IF the predictor saw the cached idle, passive-
+    drift acceptance would fire (room within passive_tolerance below the band,
+    a strongly *warming* cached idle projects recovery into band) and the
+    predicted action would flip HEAT -> IDLE. With the live slopes (idle=None,
+    empty buffer) the branch is unreachable, so the predictor must still say
+    HEAT. The thermal_slope sensor still shows the cached value (it drives MPC).
+    """
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    now = dt_util.utcnow()
+    coordinator._samples_cache = []  # live idle is None
+    # Strongly warming cached idle (would trigger passive-heat-suppression if
+    # it leaked): projected = 19.1 + 0.12*5 = 19.7 >= low(19.5).
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=0.12,
+        persisted_idle_slope_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+    # 19.1 <= low(19.5) - deadband_below(0.3) -> hysteresis wants HEAT; and
+    # 19.1 >= low - passive_tolerance(0.5) = 19.0 -> passive branch eligible.
+    hass.states.async_set(TEMP_ENTITY, "19.1", {})
+
+    state = await coordinator._async_update_data()
+
+    # Cache is genuinely present (would have suppressed if it leaked)...
+    assert state.idle_slope_source == "cached"
+    assert state.thermal_slopes.idle == 0.12
+    # ...but the predictor ran on live slopes, so it did NOT suppress the heat.
+    assert state.predicted_decision.action == ACTION_HEAT

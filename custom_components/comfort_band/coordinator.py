@@ -108,11 +108,14 @@ class ZoneState:
     # v0.12.0: `thermal_slopes` here are the *effective* slopes — identical to
     # the live estimate except that, when the live idle slope is None but a
     # recent persisted idle slope exists, idle is substituted from storage so
-    # MPC stays ready through a heating chase. `idle_slope_source` records
-    # which path produced the idle value ("live" | "cached" | "none") and
-    # `idle_slope_cached_age_min` is the age (min) of the substituted value
-    # (None unless source is "cached"). Both surface on the thermal_slope
-    # sensor so users can see when the cached value is driving control.
+    # MPC stays ready through a heating chase. These drive `mpc.is_ready` /
+    # `mpc.plan` and the thermal_slope sensor only; the reactive predictor and
+    # hysteresis run on the *live* slopes (the cache must not change reactive
+    # control). `idle_slope_source` records which path produced the idle value
+    # ("live" | "cached" | "none") and `idle_slope_cached_age_min` is the age
+    # (min) of the substituted value (None unless source is "cached"). Both
+    # surface on the thermal_slope sensor so users can see when MPC is running
+    # on the cached value.
     thermal_slopes: ThermalSlopes
     idle_slope_source: str
     idle_slope_cached_age_min: float | None
@@ -421,15 +424,23 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # out of MPC readiness exactly when pre-heat is needed.
         # `_resolve_idle_slope` substitutes a recent persisted idle slope in
         # that case (and refreshes the persisted value when the live one is
-        # fresh), returning the *effective* slopes used by every downstream
-        # decision plus diagnostics for the thermal_slope sensor.
+        # fresh), returning the *effective* slopes plus diagnostics.
+        #
+        # The cache is an MPC-readiness concern ONLY: `effective_slopes` feeds
+        # `mpc.is_ready` / `mpc.plan` (and the thermal_slope sensor, so users
+        # can see the cached value). The reactive predictor below deliberately
+        # gets the *live* `thermal_slopes` — a cached idle must NOT reach the
+        # v0.7 passive-drift / anticipatory-startup branches, or it would
+        # silently change reactive control on a predictor-only zone (suppress a
+        # heat/cool call off a stale slope). Predictor + hysteresis stay
+        # byte-for-byte v0.11; only MPC gains the cache.
         (
             effective_slopes,
             idle_slope_source,
             idle_slope_cached_age_min,
         ) = await self._resolve_idle_slope(thermal_slopes, zone, now_utc)
         predicted_decision = predictor.decide(
-            effective_slopes,
+            thermal_slopes,
             hyst_inputs,
             lookahead_minutes=zone["lookahead_minutes"],
             passive_tolerance=zone["passive_tolerance"],
