@@ -346,12 +346,16 @@ class ComfortBandStore:
                 migrated = True
             # v0.11 → v0.12: persisted idle slope. Default None/None so a
             # freshly-upgraded zone learns its idle slope from live samples
-            # before any cached substitution kicks in. Presence-keyed so a
-            # store that already carries the keys keeps its values across a
-            # reload. The two keys are written together (slope + timestamp),
-            # so a missing-key check on either implies both are absent.
+            # before any cached substitution kicks in. The integration always
+            # writes the two keys together, but each is backfilled
+            # independently so a hand-edited / partially-written store with
+            # only one key present can't leave the other absent — the
+            # coordinator subscripts both keys directly, so a missing one would
+            # raise KeyError and fail the whole refresh.
             if "persisted_idle_slope" not in zone:
                 zone["persisted_idle_slope"] = None
+                migrated = True
+            if "persisted_idle_slope_at" not in zone:
                 zone["persisted_idle_slope_at"] = None
                 migrated = True
         if migrated:

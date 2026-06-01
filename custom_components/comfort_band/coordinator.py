@@ -619,12 +619,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         )
         if not due:
             return
-        self._last_idle_slope_persist_at = now_utc
         await self._store.async_update_zone(
             self.zone_name,
             persisted_idle_slope=slope,
             persisted_idle_slope_at=now_utc.isoformat(),
         )
+        # Advance the throttle only after the write lands (mirrors the
+        # sample-persist path) so a failed write doesn't push the next attempt
+        # out by a full interval.
+        self._last_idle_slope_persist_at = now_utc
 
     async def _clear_persisted_idle_slope(self) -> None:
         """Null the persisted idle slope (stale-expiry path).
