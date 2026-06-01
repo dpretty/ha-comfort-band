@@ -157,6 +157,14 @@ class StoredZone(TypedDict):
     use_apparent_temperature: bool
     last_action_at: str | None
     last_action: str | None
+    # v0.12.0: last good idle (passive heat-loss) slope, persisted across the
+    # 90-min sample window so MPC readiness survives a long heating chase when
+    # the live window can only produce short idle blips. °C/min, signed
+    # (negative = cooling toward ambient). None = none learned yet.
+    # `persisted_idle_slope_at` is the ISO-8601 UTC timestamp of that slope,
+    # used to expire it after `PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`.
+    persisted_idle_slope: float | None
+    persisted_idle_slope_at: str | None
 
 
 class StoredProfile(TypedDict):
@@ -218,6 +226,8 @@ def _default_zone(zone_name: str) -> StoredZone:
         "use_apparent_temperature": False,
         "last_action_at": None,
         "last_action": None,
+        "persisted_idle_slope": None,
+        "persisted_idle_slope_at": None,
     }
 
 
@@ -333,6 +343,16 @@ class ComfortBandStore:
             # the key already.
             if "band_ramp_minutes" not in zone:
                 zone["band_ramp_minutes"] = DEFAULT_BAND_RAMP_MINUTES
+                migrated = True
+            # v0.11 → v0.12: persisted idle slope. Default None/None so a
+            # freshly-upgraded zone learns its idle slope from live samples
+            # before any cached substitution kicks in. Presence-keyed so a
+            # store that already carries the keys keeps its values across a
+            # reload. The two keys are written together (slope + timestamp),
+            # so a missing-key check on either implies both are absent.
+            if "persisted_idle_slope" not in zone:
+                zone["persisted_idle_slope"] = None
+                zone["persisted_idle_slope_at"] = None
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

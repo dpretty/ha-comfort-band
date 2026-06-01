@@ -55,6 +55,9 @@ async def test_default_zone_has_sane_initial_values(
     # the v0.9.x behaviour). Users opt in by raising via
     # `number.{zone}_band_ramp_minutes`.
     assert zone["band_ramp_minutes"] == 0
+    # v0.12.0 persisted idle slope: nothing learned yet on a fresh zone.
+    assert zone["persisted_idle_slope"] is None
+    assert zone["persisted_idle_slope_at"] is None
 
 
 # ----- round-trip persistence -----
@@ -736,6 +739,9 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     assert store.get_zone("office")["mpc_horizon_minutes"] == 60
     # v0.10.0: band_ramp_minutes also backfilled to 0 for legacy zones.
     assert store.get_zone("office")["band_ramp_minutes"] == 0
+    # v0.12.0: persisted idle slope backfilled to None/None for legacy zones.
+    assert store.get_zone("office")["persisted_idle_slope"] is None
+    assert store.get_zone("office")["persisted_idle_slope_at"] is None
 
 
 async def test_load_v0_8_zone_with_explicit_mpc_horizon_preserves_user_value(

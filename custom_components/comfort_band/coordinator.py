@@ -15,7 +15,7 @@ via `climate.set_hvac_mode` + `set_temperature` -- but only if the per-zone
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +40,7 @@ from .const import (
     CLIMATE_ECHO_WINDOW_S,
     LOGGER,
     MPC_SIMULATION_STEP_MINUTES,
+    PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
     SAMPLE_PERSIST_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
@@ -104,7 +105,17 @@ class ZoneState:
     # mode), regardless of learning_enabled. thermal_slopes carries the
     # current learned slopes for the thermal_slope sensor's attributes.
     predicted_decision: HysteresisDecision
+    # v0.12.0: `thermal_slopes` here are the *effective* slopes — identical to
+    # the live estimate except that, when the live idle slope is None but a
+    # recent persisted idle slope exists, idle is substituted from storage so
+    # MPC stays ready through a heating chase. `idle_slope_source` records
+    # which path produced the idle value ("live" | "cached" | "none") and
+    # `idle_slope_cached_age_min` is the age (min) of the substituted value
+    # (None unless source is "cached"). Both surface on the thermal_slope
+    # sensor so users can see when the cached value is driving control.
     thermal_slopes: ThermalSlopes
+    idle_slope_source: str
+    idle_slope_cached_age_min: float | None
     # v0.8 model-predictive controller. `mpc_decision` is always populated
     # (shadow mode), regardless of `mpc_enabled`. When MPC isn't ready
     # (a slope is missing), `mpc.plan` returns `predicted_decision` so the
@@ -160,6 +171,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._last_command_at: datetime | None = None
         self._unsub_climate: CALLBACK_TYPE | None = None
         self._last_sample_persist_at: datetime | None = None
+        # v0.12.0: throttles writes of the persisted idle slope (see
+        # `_maybe_persist_idle_slope`). Mirrors `_last_sample_persist_at` --
+        # ephemeral, reset on flush so the next fresh idle slope writes
+        # immediately.
+        self._last_idle_slope_persist_at: datetime | None = None
 
     # ----- setup / teardown -----
 
@@ -209,6 +225,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._last_command_state = None
         self._last_command_at = None
         self._last_sample_persist_at = None
+        self._last_idle_slope_persist_at = None
 
     # ----- mutators (called from entities + services) -----
 
@@ -397,8 +414,22 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # and fed into both `decide()` (anticipation logic) and the
         # thermal_slope sensor's attributes (via ZoneState).
         thermal_slopes = predictor.estimate_slopes(self._samples_cache, now=now_utc)
+        # v0.12.0: the idle (passive heat-loss) slope changes slowly, so we
+        # remember the last good one beyond the 90-min sample window. When a
+        # heating-dominated room chases a rising morning band, the live window
+        # only yields short idle blips (idle is None) and the room would drop
+        # out of MPC readiness exactly when pre-heat is needed.
+        # `_resolve_idle_slope` substitutes a recent persisted idle slope in
+        # that case (and refreshes the persisted value when the live one is
+        # fresh), returning the *effective* slopes used by every downstream
+        # decision plus diagnostics for the thermal_slope sensor.
+        (
+            effective_slopes,
+            idle_slope_source,
+            idle_slope_cached_age_min,
+        ) = await self._resolve_idle_slope(thermal_slopes, zone, now_utc)
         predicted_decision = predictor.decide(
-            thermal_slopes,
+            effective_slopes,
             hyst_inputs,
             lookahead_minutes=zone["lookahead_minutes"],
             passive_tolerance=zone["passive_tolerance"],
@@ -427,7 +458,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # mis-scoring to at most one refresh cycle. A future
         # improvement could splice scheduled bands into the post-expiry
         # tail of the list.
-        mpc_ready = mpc.is_ready(thermal_slopes)
+        mpc_ready = mpc.is_ready(effective_slopes)
         bands_per_step = (
             None
             if override_active
@@ -438,7 +469,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             )
         )
         mpc_decision = mpc.plan(
-            thermal_slopes,
+            effective_slopes,
             hyst_inputs,
             horizon_minutes=zone["mpc_horizon_minutes"],
             predictor_decision=predicted_decision,
@@ -479,7 +510,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             override_until=override_until,
             decision=final_decision,
             predicted_decision=predicted_decision,
-            thermal_slopes=thermal_slopes,
+            thermal_slopes=effective_slopes,
+            idle_slope_source=idle_slope_source,
+            idle_slope_cached_age_min=idle_slope_cached_age_min,
             mpc_decision=mpc_decision,
             mpc_ready=mpc_ready,
         )
@@ -493,6 +526,92 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         return state
 
     # ----- helpers -----
+
+    async def _resolve_idle_slope(
+        self,
+        slopes: ThermalSlopes,
+        zone: StoredZone,
+        now_utc: datetime,
+    ) -> tuple[ThermalSlopes, str, float | None]:
+        """Apply the persisted-idle-slope policy (v0.12.0).
+
+        The idle (passive heat-loss) rate changes slowly, so a recent value
+        stays valid well beyond the 90-min sample window. Returns
+        ``(effective_slopes, source, cached_age_min)``:
+
+        - **Live idle slope present** -> remember it (throttled write) and
+          return the slopes unchanged. ``source="live"``.
+        - **Live idle slope absent** but a persisted one exists within
+          ``PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`` -> substitute it via
+          ``dataclasses.replace`` (tagging ``method_idle="cached"``) so MPC
+          stays ready through a heating chase. ``source="cached"``, age in min.
+        - **Live idle slope absent** and no usable persisted one (never
+          learned, or expired) -> return unchanged. ``source="none"``. An
+          expired value is cleared from storage so it can't resurface.
+
+        Only the idle slope is persisted: recovery slopes change faster and
+        are always present during a heating/cooling chase, so they don't have
+        the aging-out problem idle does.
+        """
+        if slopes.idle is not None:
+            await self._maybe_persist_idle_slope(slopes.idle, now_utc)
+            return slopes, "live", None
+
+        persisted = zone["persisted_idle_slope"]
+        persisted_at = _parse_iso(zone["persisted_idle_slope_at"])
+        if persisted is None or persisted_at is None:
+            return slopes, "none", None
+
+        age_min = (now_utc - persisted_at).total_seconds() / 60.0
+        if age_min > PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES:
+            # Stale -- drop it so a long-dead value can't keep MPC "ready"
+            # against a thermal model that no longer holds.
+            await self._clear_persisted_idle_slope()
+            return slopes, "none", None
+
+        effective = replace(slopes, idle=persisted, method_idle="cached")
+        # Clamp the reported age at 0 to absorb minor clock skew (a timestamp
+        # written by a slightly-ahead clock would otherwise read negative).
+        return effective, "cached", round(max(0.0, age_min), 1)
+
+    async def _maybe_persist_idle_slope(self, slope: float, now_utc: datetime) -> None:
+        """Persist a fresh live idle slope, throttled to bound flash wear.
+
+        Writes at most once per ``SAMPLE_PERSIST_INTERVAL_S`` (mirroring the
+        sample-buffer cadence), refreshing both the value and the timestamp.
+        That keeps ``persisted_idle_slope_at`` tracking "this slope is current"
+        to within ~5 min, so the cached value's age at the start of a heating
+        chase reflects time-since-idle (when the chase began), not
+        time-since-first-observed. The first call after setup / a buffer flush
+        (``_last_idle_slope_persist_at is None``) writes immediately. The idle
+        rate is slow-changing, so a value up to 5 min stale is fine.
+        """
+        due = (
+            self._last_idle_slope_persist_at is None
+            or (now_utc - self._last_idle_slope_persist_at).total_seconds()
+            >= SAMPLE_PERSIST_INTERVAL_S
+        )
+        if not due:
+            return
+        self._last_idle_slope_persist_at = now_utc
+        await self._store.async_update_zone(
+            self.zone_name,
+            persisted_idle_slope=slope,
+            persisted_idle_slope_at=now_utc.isoformat(),
+        )
+
+    async def _clear_persisted_idle_slope(self) -> None:
+        """Null the persisted idle slope (stale-expiry path).
+
+        Buffer-flush sites clear it inline in their own store write to keep
+        the flush atomic; this is the standalone expiry path.
+        """
+        self._last_idle_slope_persist_at = None
+        await self._store.async_update_zone(
+            self.zone_name,
+            persisted_idle_slope=None,
+            persisted_idle_slope_at=None,
+        )
 
     def _read_numeric_sensor(self, entity_id: str | None) -> float | None:
         """Shared read path for any external numeric sensor: returns the
@@ -1005,7 +1124,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # writes immediately, matching the "transitions always persist"
         # contract (a flush is functionally a forced segment boundary).
         self._last_sample_persist_at = None
-        self.hass.async_create_task(self._store.async_update_zone(self.zone_name, samples=[]))
+        # v0.12.0: a manual edit invalidates the learned thermal model, so the
+        # persisted idle slope is dropped too -- the new control regime may
+        # have a different passive heat-loss rate. Cleared in the same write as
+        # samples=[] to keep the flush atomic.
+        self._last_idle_slope_persist_at = None
+        self.hass.async_create_task(
+            self._store.async_update_zone(
+                self.zone_name,
+                samples=[],
+                persisted_idle_slope=None,
+                persisted_idle_slope_at=None,
+            )
+        )
 
 
 def _parse_iso(value: str | None) -> datetime | None:

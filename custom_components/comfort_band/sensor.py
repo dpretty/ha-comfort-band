@@ -154,9 +154,18 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, float | int | str | None]:
-        s = self.coordinator.data.thermal_slopes
+        data = self.coordinator.data
+        s = data.thermal_slopes
         return {
             "idle_slope": None if s.idle is None else round(s.idle * 60.0, 3),
+            # v0.12.0: where the idle slope came from this refresh. "live" =
+            # estimated from the current sample window; "cached" = substituted
+            # from the persisted last-good value because the live window only
+            # had idle blips (MPC stays ready through a heating chase);
+            # "none" = no idle slope available. `idle_slope_cached_age_min` is
+            # the age of the cached value in minutes (null unless "cached").
+            "idle_slope_source": data.idle_slope_source,
+            "idle_slope_cached_age_min": data.idle_slope_cached_age_min,
             "recovery_slope_heat": (
                 None if s.recovery_heat is None else round(s.recovery_heat * 60.0, 3)
             ),
