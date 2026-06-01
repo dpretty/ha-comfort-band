@@ -565,7 +565,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         the aging-out problem idle does.
         """
         if slopes.idle is not None:
-            await self._maybe_persist_idle_slope(slopes.idle, now_utc)
+            # Persist only for learning-enabled zones: the cache is a
+            # predictive-control feature — it only ever feeds mpc.is_ready /
+            # mpc.plan, so a pure-hysteresis zone would never consume it. Skip
+            # the storage write there to avoid needless SD-card wear. Gating on
+            # learning_enabled (not mpc_enabled) keeps the cache — and thus the
+            # shadow `mpc_ready` signal — warm for zones being evaluated for MPC
+            # before the user flips mpc_enabled on.
+            if zone["learning_enabled"]:
+                await self._maybe_persist_idle_slope(slopes.idle, now_utc)
             return slopes, "live", None
 
         persisted = zone["persisted_idle_slope"]

@@ -2216,6 +2216,8 @@ async def test_live_idle_slope_is_persisted(
     """When the live window yields an idle slope, it is written to storage so a
     later heating chase can borrow it. Source is reported as "live"."""
     freezer.move_to("2026-05-19 12:00:00+00:00")
+    # Persist is gated on learning_enabled (the cache only feeds MPC).
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
     _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
 
@@ -2228,6 +2230,27 @@ async def test_live_idle_slope_is_persisted(
     # The persisted value equals the live estimate, with a timestamp set.
     assert zone["persisted_idle_slope"] == state.thermal_slopes.idle
     assert zone["persisted_idle_slope_at"] is not None
+
+
+async def test_persist_skipped_for_non_learning_zone(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A pure-hysteresis zone (learning off — the fixture default) still
+    computes the idle slope for the thermal_slope sensor, but does NOT persist
+    it: the cache only feeds MPC, so persisting would be wasted SD-card writes."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "live"
+    assert state.thermal_slopes.idle is not None  # computed for the sensor...
+    zone = coordinator._store.get_zone("office")
+    assert zone["persisted_idle_slope"] is None  # ...but not written to storage
+    assert zone["persisted_idle_slope_at"] is None
 
 
 async def test_cached_idle_slope_keeps_mpc_ready_during_heating_chase(
@@ -2371,6 +2394,7 @@ async def test_persisted_idle_slope_write_is_throttled(
     SAMPLE_PERSIST_INTERVAL_S (300 s): a refresh within the window must not
     advance the timestamp; one past it must."""
     freezer.move_to("2026-05-19 12:00:00+00:00")
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
     _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
 
