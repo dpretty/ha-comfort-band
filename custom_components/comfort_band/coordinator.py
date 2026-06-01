@@ -561,6 +561,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         persisted_at = _parse_iso(zone["persisted_idle_slope_at"])
         if persisted is None or persisted_at is None:
             return slopes, "none", None
+        if persisted_at.tzinfo is None:
+            # A naive timestamp is only reachable via a hand-edited / corrupt
+            # store. Drop it rather than let the aware/naive subtraction below
+            # raise TypeError and fail the entire refresh (all entities would
+            # go unavailable). Clearing makes the next refresh quiescent.
+            await self._clear_persisted_idle_slope()
+            return slopes, "none", None
 
         age_min = (now_utc - persisted_at).total_seconds() / 60.0
         if age_min > PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES:

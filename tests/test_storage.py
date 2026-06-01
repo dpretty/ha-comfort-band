@@ -78,6 +78,29 @@ async def test_zone_round_trips_across_store_instances(
     assert zone["manual_low"] == 21.5
 
 
+async def test_persisted_idle_slope_round_trips_across_store_instances(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.12.0: the persisted idle slope must survive a store reload (restart)
+    — it's written to `.storage`, not just held in coordinator memory. Guards
+    against a regression that wrote it RAM-only (which every same-instance
+    test would silently pass)."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at="2026-05-19T06:55:00+00:00",
+    )
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["persisted_idle_slope"] == -0.004
+    assert zone["persisted_idle_slope_at"] == "2026-05-19T06:55:00+00:00"
+
+
 async def test_active_profile_persists(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
     first = ComfortBandStore(hass)
     await first.async_load()

@@ -2332,3 +2332,113 @@ async def test_manual_edit_flush_clears_persisted_idle_slope(
     assert zone["persisted_idle_slope"] is None
     assert zone["persisted_idle_slope_at"] is None
     await coordinator.async_unload()
+
+
+async def test_cached_idle_without_recovery_stays_not_ready(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The cached idle slope alone must NOT force readiness: `mpc.is_ready`
+    also needs a recovery slope. With an empty live window (no recovery) but a
+    fresh persisted idle, the source is "cached" yet `mpc_ready` stays False —
+    the cache fills a gap, it doesn't fabricate a whole model."""
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    now = dt_util.utcnow()
+    coordinator._samples_cache = []  # no live slopes at all (no recovery either)
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.2", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "cached"
+    assert state.thermal_slopes.idle == -0.004
+    assert state.thermal_slopes.recovery_heat is None
+    assert state.thermal_slopes.recovery_cool is None
+    assert state.mpc_ready is False
+
+
+async def test_persisted_idle_slope_write_is_throttled(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The persisted-idle-slope write is throttled to <=1 per
+    SAMPLE_PERSIST_INTERVAL_S (300 s): a refresh within the window must not
+    advance the timestamp; one past it must."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+
+    await coordinator._async_update_data()
+    first_at = coordinator._store.get_zone("office")["persisted_idle_slope_at"]
+    assert first_at is not None
+
+    # A refresh 60 s later (< 300 s) must NOT rewrite the timestamp.
+    freezer.tick(timedelta(seconds=60))
+    await coordinator._async_update_data()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] == first_at
+
+    # Past the interval, the next refresh refreshes the timestamp.
+    freezer.tick(timedelta(seconds=300))
+    await coordinator._async_update_data()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] != first_at
+
+
+async def test_thermal_slope_sensor_exposes_idle_source_attributes(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The cached-idle diagnostics actually reach the thermal_slope sensor's
+    `extra_state_attributes` (guards against a plumbing typo between ZoneState
+    and the sensor)."""
+    from custom_components.comfort_band.sensor import ThermalSlopeSensor
+
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    now = dt_util.utcnow()
+    _seed_recovery_heat_run(coordinator, now=now)
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.2", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    attrs = ThermalSlopeSensor(coordinator).extra_state_attributes
+    assert attrs["idle_slope_source"] == "cached"
+    assert attrs["idle_slope_cached_age_min"] == pytest.approx(5.0, abs=0.1)
+    # The cached value also surfaces as the displayed idle_slope (x60 -> °C/h).
+    assert attrs["idle_slope"] == pytest.approx(-0.004 * 60.0, abs=1e-6)
+
+
+async def test_naive_persisted_timestamp_is_dropped_not_crashed(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A naive (tz-less) persisted timestamp — only reachable via a corrupt /
+    hand-edited store — must not crash the refresh on the aware/naive datetime
+    subtraction. It's treated as unusable and cleared."""
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    coordinator._samples_cache = []
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at="2026-05-19T06:55:00",  # naive: no tz offset
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.2", {})
+
+    state = await coordinator._async_update_data()  # must not raise
+
+    assert state.idle_slope_source == "none"
+    assert state.thermal_slopes.idle is None
+    zone = coordinator._store.get_zone("office")
+    assert zone["persisted_idle_slope"] is None
+    assert zone["persisted_idle_slope_at"] is None
