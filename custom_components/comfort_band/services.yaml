@@ -1,12 +1,19 @@
 set_schedule:
   name: Set schedule
-  description: Replace the schedule for a profile in a zone with the given transitions.
+  description: Replace the schedule for a profile with the given transitions. Target a zone's own schedule (zone) OR a shared schedule (shared_id) — exactly one.
   fields:
     zone:
       name: Zone
-      description: Zone slug (e.g. "office")
-      required: true
+      description: Zone slug (e.g. "office"). Provide this OR shared_id.
+      required: false
       example: office
+      selector:
+        text:
+    shared_id:
+      name: Shared schedule id
+      description: Id of a shared schedule to edit instead of a zone. Provide this OR zone.
+      required: false
+      example: bedrooms
       selector:
         text:
     profile:
@@ -26,12 +33,20 @@ set_schedule:
 
 add_transition:
   name: Add transition
-  description: Add a single transition to a profile schedule.
+  description: Add a single transition to a profile schedule (zone OR shared_id — exactly one).
   fields:
     zone:
       name: Zone
-      required: true
+      description: Zone slug. Provide this OR shared_id.
+      required: false
       example: office
+      selector:
+        text:
+    shared_id:
+      name: Shared schedule id
+      description: Shared schedule to edit instead of a zone. Provide this OR zone.
+      required: false
+      example: bedrooms
       selector:
         text:
     profile:
@@ -76,7 +91,14 @@ update_transition:
   fields:
     zone:
       name: Zone
-      required: true
+      description: Zone slug. Provide this OR shared_id.
+      required: false
+      selector:
+        text:
+    shared_id:
+      name: Shared schedule id
+      description: Shared schedule to edit instead of a zone. Provide this OR zone.
+      required: false
       selector:
         text:
     profile:
@@ -114,7 +136,14 @@ remove_transition:
   fields:
     zone:
       name: Zone
-      required: true
+      description: Zone slug. Provide this OR shared_id.
+      required: false
+      selector:
+        text:
+    shared_id:
+      name: Shared schedule id
+      description: Shared schedule to edit instead of a zone. Provide this OR zone.
+      required: false
       selector:
         text:
     profile:
@@ -300,5 +329,78 @@ delete_profile:
       description: Profile to delete. Cannot be the default profile.
       required: true
       example: trip
+      selector:
+        text:
+
+create_shared_schedule:
+  name: Create shared schedule
+  description: "Create a named shared schedule that zones can be assigned to (so grouped rooms target the same band). Limit: 50 per install."
+  fields:
+    name:
+      name: Name
+      description: Display name (unique). The id is a slug derived from it.
+      required: true
+      example: Bedrooms
+      selector:
+        text:
+    seed_from_zone:
+      name: Seed from zone
+      description: Optional. Copy this zone's own schedules (all profiles) as the starting point.
+      required: false
+      example: nate
+      selector:
+        text:
+
+rename_shared_schedule:
+  name: Rename shared schedule
+  description: Rename a shared schedule. The id is unchanged, so assigned zones keep following it.
+  fields:
+    shared_id:
+      name: Shared schedule id
+      required: true
+      example: bedrooms
+      selector:
+        text:
+    name:
+      name: New name
+      description: New display name. Must not already exist.
+      required: true
+      example: Kids rooms
+      selector:
+        text:
+
+delete_shared_schedule:
+  name: Delete shared schedule
+  description: Delete a shared schedule. Refuses if any zone is assigned unless cascade is true (which unassigns them back to their own schedule).
+  fields:
+    shared_id:
+      name: Shared schedule id
+      required: true
+      example: bedrooms
+      selector:
+        text:
+    cascade:
+      name: Cascade
+      description: Unassign every zone using this shared schedule before deleting.
+      required: false
+      example: true
+      selector:
+        boolean:
+
+assign_schedule:
+  name: Assign schedule
+  description: Assign a zone to a shared schedule, or clear it back to its own schedule.
+  fields:
+    zone:
+      name: Zone
+      required: true
+      example: nate
+      selector:
+        text:
+    shared_id:
+      name: Shared schedule id
+      description: Shared schedule to follow. Omit (or null) for the zone's own schedule.
+      required: false
+      example: bedrooms
       selector:
         text:

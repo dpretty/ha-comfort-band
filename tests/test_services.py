@@ -45,6 +45,10 @@ async def test_all_services_registered(
         "rename_profile",
         "delete_profile",
         "record_feedback",
+        "create_shared_schedule",
+        "rename_shared_schedule",
+        "delete_shared_schedule",
+        "assign_schedule",
     }
     for service in expected:
         assert hass.services.has_service(DOMAIN, service), f"missing service: {service}"
@@ -512,3 +516,104 @@ async def test_record_feedback_invalid_label_rejected(
         )
     # A schema-rejected call must not persist anything.
     assert hass.data[DOMAIN].feedback_store.get_entries("office") == []
+
+
+# ----- v0.14.0 shared schedules -----
+
+
+async def test_create_assign_and_edit_shared_schedule(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    store = hass.data[DOMAIN].store
+    await hass.services.async_call(
+        DOMAIN, "create_shared_schedule", {"name": "Bedrooms"}, blocking=True
+    )
+    sid = hass.data[DOMAIN].shared_schedule_registry.id_for("Bedrooms")
+    assert sid is not None
+
+    await hass.services.async_call(
+        DOMAIN, "assign_schedule", {"zone": "office", "shared_id": sid}, blocking=True
+    )
+    assert store.get_zone("office")["schedule_id"] == sid
+
+    # set_schedule targeting the shared id writes the SHARED schedule, not the
+    # zone's own.
+    await hass.services.async_call(
+        DOMAIN,
+        "set_schedule",
+        {
+            "shared_id": sid,
+            "profile": "home",
+            "transitions": [{"at": "06:00", "low": 21.0, "high": 24.0}],
+        },
+        blocking=True,
+    )
+    assert store.get_shared_schedule_slot(sid, "home")["current"][0]["low"] == 21.0
+    assert store.get_zone_schedule("office", "home") is None  # own schedule untouched
+
+    # Clear assignment back to own.
+    await hass.services.async_call(DOMAIN, "assign_schedule", {"zone": "office"}, blocking=True)
+    assert store.get_zone("office")["schedule_id"] is None
+
+
+async def test_set_schedule_requires_exactly_one_target(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Neither zone nor shared_id.
+    with pytest.raises(ServiceValidationError, match="exactly one"):
+        await hass.services.async_call(
+            DOMAIN, "set_schedule", {"profile": "home", "transitions": []}, blocking=True
+        )
+    # Both.
+    with pytest.raises(ServiceValidationError, match="exactly one"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_schedule",
+            {"zone": "office", "shared_id": "x", "profile": "home", "transitions": []},
+            blocking=True,
+        )
+
+
+async def test_set_schedule_unknown_shared_id_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="Unknown shared schedule"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_schedule",
+            {"shared_id": "ghost", "profile": "home", "transitions": []},
+            blocking=True,
+        )
+
+
+async def test_delete_shared_schedule_refuses_then_cascades(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    store = hass.data[DOMAIN].store
+    await hass.services.async_call(
+        DOMAIN, "create_shared_schedule", {"name": "Bedrooms"}, blocking=True
+    )
+    sid = hass.data[DOMAIN].shared_schedule_registry.id_for("Bedrooms")
+    await hass.services.async_call(
+        DOMAIN, "assign_schedule", {"zone": "office", "shared_id": sid}, blocking=True
+    )
+    # Refuse while assigned.
+    with pytest.raises(ServiceValidationError, match="assigned"):
+        await hass.services.async_call(
+            DOMAIN, "delete_shared_schedule", {"shared_id": sid}, blocking=True
+        )
+    # Cascade unassigns + deletes.
+    await hass.services.async_call(
+        DOMAIN, "delete_shared_schedule", {"shared_id": sid, "cascade": True}, blocking=True
+    )
+    assert not store.has_shared_schedule(sid)
+    assert store.get_zone("office")["schedule_id"] is None
+
+
+async def test_assign_schedule_unknown_shared_raises(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="does not exist"):
+        await hass.services.async_call(
+            DOMAIN, "assign_schedule", {"zone": "office", "shared_id": "ghost"}, blocking=True
+        )
