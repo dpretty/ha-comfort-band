@@ -55,6 +55,9 @@ async def test_default_zone_has_sane_initial_values(
     # the v0.9.x behaviour). Users opt in by raising via
     # `number.{zone}_band_ramp_minutes`.
     assert zone["band_ramp_minutes"] == 0
+    # v0.12.0 persisted idle slope: nothing learned yet on a fresh zone.
+    assert zone["persisted_idle_slope"] is None
+    assert zone["persisted_idle_slope_at"] is None
 
 
 # ----- round-trip persistence -----
@@ -73,6 +76,55 @@ async def test_zone_round_trips_across_store_instances(
     zone = second.get_zone("office")
     assert zone["enabled"] is True
     assert zone["manual_low"] == 21.5
+
+
+async def test_persisted_idle_slope_round_trips_across_store_instances(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.12.0: the persisted idle slope must survive a store reload (restart)
+    — it's written to `.storage`, not just held in coordinator memory. Guards
+    against a regression that wrote it RAM-only (which every same-instance
+    test would silently pass)."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at="2026-05-19T06:55:00+00:00",
+    )
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["persisted_idle_slope"] == -0.004
+    assert zone["persisted_idle_slope_at"] == "2026-05-19T06:55:00+00:00"
+
+
+async def test_partial_persisted_idle_keys_backfilled_independently(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A store carrying only ONE of the two persisted-idle-slope keys (corrupt
+    / hand-edited) must be repaired independently on load, so neither key is
+    ever left absent — the coordinator subscripts both directly and a missing
+    one would raise KeyError and fail the whole refresh."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at="2026-05-19T06:55:00+00:00",
+    )
+    # Simulate corruption: drop just the timestamp key from the persisted blob.
+    del hass_storage["comfort_band.data"]["data"]["zones"]["office"]["persisted_idle_slope_at"]
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["persisted_idle_slope"] == -0.004  # surviving value preserved
+    assert "persisted_idle_slope_at" in zone  # missing key independently backfilled
+    assert zone["persisted_idle_slope_at"] is None
 
 
 async def test_active_profile_persists(hass: HomeAssistant, hass_storage: dict[str, Any]) -> None:
@@ -736,6 +788,9 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     assert store.get_zone("office")["mpc_horizon_minutes"] == 60
     # v0.10.0: band_ramp_minutes also backfilled to 0 for legacy zones.
     assert store.get_zone("office")["band_ramp_minutes"] == 0
+    # v0.12.0: persisted idle slope backfilled to None/None for legacy zones.
+    assert store.get_zone("office")["persisted_idle_slope"] is None
+    assert store.get_zone("office")["persisted_idle_slope_at"] is None
 
 
 async def test_load_v0_8_zone_with_explicit_mpc_horizon_preserves_user_value(

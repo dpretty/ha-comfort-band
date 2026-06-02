@@ -176,7 +176,17 @@ class ZoneOptionsFlow(OptionsFlow):
                 # so this is unreachable in practice. No defensive
                 # guard for consistency with the rest of the codebase.
                 store = self.hass.data[DOMAIN].store
-                await store.async_update_zone(entry.data[CONF_ZONE_NAME], samples=[])
+                # v0.12.0: also drop the persisted idle slope — it was learned
+                # from the old sensor's data (possibly at a different
+                # resolution / offset) and must not bridge into the new
+                # sensor's thermal model. Cleared in the same write as the
+                # sample flush.
+                await store.async_update_zone(
+                    entry.data[CONF_ZONE_NAME],
+                    samples=[],
+                    persisted_idle_slope=None,
+                    persisted_idle_slope_at=None,
+                )
             return self.async_create_entry(
                 title="",
                 # Voluptuous omits the humidity key when its EntitySelector
