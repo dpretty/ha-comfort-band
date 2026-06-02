@@ -2595,3 +2595,240 @@ async def test_cached_idle_of_zero_is_substituted(
     assert state.idle_slope_source == "cached"
     assert state.thermal_slopes.idle == 0.0
     assert state.mpc_ready is True
+
+
+# ----- v0.13.0: deterministic fan-boost -----
+
+
+def _register_climate_with_fan(
+    hass: HomeAssistant, *, fan_modes: list[str] | None, fan_mode: str | None
+) -> None:
+    """Register the office climate entity with `fan_modes` + current `fan_mode`.
+
+    The behaviour-test helpers (`_setup_enabled_zone`) never register a climate
+    state, so the fan-boost guards fail closed by default — tests that exercise
+    fan control must register one explicitly. `fan_modes=None` omits the
+    attribute entirely (simulates a fanless unit)."""
+    attrs: dict[str, Any] = {}
+    if fan_modes is not None:
+        attrs["fan_modes"] = fan_modes
+    if fan_mode is not None:
+        attrs["fan_mode"] = fan_mode
+    hass.states.async_set(CLIMATE_ENTITY, "off", attrs)
+
+
+async def _enable_fan_control(
+    coordinator: ZoneCoordinator, *, active: str | None = None, idle: str | None = None
+) -> None:
+    await coordinator._store.async_update_zone(
+        "office", fan_control_enabled=True, active_fan_mode=active, idle_fan_mode=idle
+    )
+
+
+async def test_fan_boost_commands_active_mode_on_heat(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Heating with fan control on commands the configured active fan mode."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})  # below band -> heat
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_HEAT
+    fan_calls = _calls_for(climate_calls, "set_fan_mode")
+    assert any(c["fan_mode"] == "high" for c in fan_calls), fan_calls
+
+
+async def test_fan_boost_commands_active_mode_on_cool(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """The shared 'active' fan covers cooling too (not just heating)."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "24.0", {})  # above band -> cool
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_COOL
+    fan_calls = _calls_for(climate_calls, "set_fan_mode")
+    assert any(c["fan_mode"] == "high" for c in fan_calls), fan_calls
+
+
+async def test_fan_boost_commands_idle_mode_on_release(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Releasing to idle (fan_only) commands the configured idle fan mode."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="high")
+
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})  # in band -> idle/fan_only
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_IDLE
+    fan_calls = _calls_for(climate_calls, "set_fan_mode")
+    assert any(c["fan_mode"] == "low" for c in fan_calls), fan_calls
+
+
+async def test_fan_boost_off_by_default_issues_no_fan_command(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """With fan_control_enabled off (the default), no set_fan_mode is issued
+    even with active/idle modes configured — zero behaviour change."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # Modes set but the master switch stays OFF.
+    await coordinator._store.async_update_zone(
+        "office", active_fan_mode="high", idle_fan_mode="low"
+    )
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_skips_when_desired_equals_current(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """No redundant set_fan_mode when the fan is already at the desired mode."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="high")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})  # heat, desired "high" == current
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_HEAT
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_skips_mode_not_in_fan_modes(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A stored mode the unit no longer lists is skipped (no command, no raise)."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="turbo", idle="low")  # "turbo" not offered
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_skips_when_climate_has_no_fan_modes(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A fanless / unavailable climate (no fan_modes attribute) is left alone."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=None, fan_mode=None)  # no fan support
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_skip_on_none_active_still_commands_idle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Asymmetric config: active_fan_mode=None (don't touch the fan while
+    heating) but idle_fan_mode set — heating issues nothing, idle still
+    commands the quiet fan. This is the user's primary 'low while idle' case."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active=None, idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="high")
+
+    # Heating with active=None -> no fan command.
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_HEAT
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+    # Release to idle -> idle_fan_mode is still commanded.
+    climate_calls.clear()
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    assert any(c["fan_mode"] == "low" for c in _calls_for(climate_calls, "set_fan_mode"))
+
+
+async def test_fan_boost_not_issued_in_shadow_mode(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Shadow mode (enabled=False) issues no climate commands at all, fan
+    control included."""
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    # enabled stays False (shadow); fan control on.
+    await store.async_update_zone(
+        "office", fan_control_enabled=True, active_fan_mode="high", idle_fan_mode="low"
+    )
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_suppressed_by_min_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A same-action re-commit suppressed by the min-cycle gate suppresses the
+    fan command too (the gate returns before set_hvac_mode)."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="high", idle="low")
+    _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="low")
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(_calls_for(climate_calls, "set_fan_mode")) >= 1  # initial heat fan
+
+    # 5 min later (same heat action, within the 8-min default) -> suppressed.
+    climate_calls.clear()
+    freezer.tick(timedelta(minutes=5))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert _calls_for(climate_calls, "set_hvac_mode") == []
+    assert _calls_for(climate_calls, "set_fan_mode") == []

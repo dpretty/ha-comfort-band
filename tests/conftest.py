@@ -30,7 +30,7 @@ def auto_enable_custom_integrations(
 
 @pytest.fixture
 def climate_calls(hass: HomeAssistant) -> list[tuple[str, dict[str, Any]]]:
-    """Record every climate.set_hvac_mode / set_temperature call."""
+    """Record every climate.set_hvac_mode / set_temperature / set_fan_mode call."""
     recorded: list[tuple[str, dict[str, Any]]] = []
 
     async def _record(call: ServiceCall) -> None:
@@ -38,6 +38,7 @@ def climate_calls(hass: HomeAssistant) -> list[tuple[str, dict[str, Any]]]:
 
     hass.services.async_register("climate", "set_hvac_mode", _record)
     hass.services.async_register("climate", "set_temperature", _record)
+    hass.services.async_register("climate", "set_fan_mode", _record)
     return recorded
 
 

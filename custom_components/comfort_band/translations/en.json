@@ -96,6 +96,12 @@
     "select": {
       "active_profile": {
         "name": "Active profile"
+      },
+      "active_fan_mode": {
+        "name": "Active fan mode"
+      },
+      "idle_fan_mode": {
+        "name": "Idle fan mode"
       }
     },
     "sensor": {
@@ -157,6 +163,9 @@
       },
       "use_apparent_temperature": {
         "name": "Use apparent temperature"
+      },
+      "fan_control_enabled": {
+        "name": "Fan control enabled"
       }
     }
   }

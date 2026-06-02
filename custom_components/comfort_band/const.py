@@ -180,6 +180,7 @@ FEEDBACK_LABELS: Final = ("too_hot", "just_right", "too_cold")
 # Platforms forwarded by each ConfigEntry kind.
 PLATFORMS_ZONE: Final = (
     Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.BUTTON,

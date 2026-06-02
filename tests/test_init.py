@@ -38,6 +38,9 @@ _EXPECTED_ZONE_ENTITIES = (
     "switch.office_learning_enabled",
     "switch.office_mpc_enabled",  # v0.8
     "switch.office_use_apparent_temperature",
+    "switch.office_fan_control_enabled",  # v0.13
+    "select.office_active_fan_mode",  # v0.13 (unavailable until climate has fan_modes)
+    "select.office_idle_fan_mode",  # v0.13
 )
 
 
