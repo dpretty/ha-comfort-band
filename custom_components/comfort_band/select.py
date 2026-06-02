@@ -28,6 +28,12 @@ from .entity import ComfortBandProfileEntity, ComfortBandZoneEntity
 if TYPE_CHECKING:
     from .profiles import ProfileRegistry
 
+# Sentinel option on the fan-mode selects meaning "don't command this side"
+# (stored as None). Lets a user stop boosting one side from the UI — e.g. keep
+# the quiet idle fan but drop the active one — without disabling the whole
+# switch. Collision with a real fan mode named "(none)" is implausible.
+_FAN_MODE_NONE = "(none)"
+
 
 class ActiveProfileSelect(ComfortBandProfileEntity, SelectEntity):
     def __init__(self) -> None:
@@ -83,33 +89,42 @@ class FanModeSelect(ComfortBandZoneEntity, SelectEntity):
 
     @property
     def options(self) -> list[str]:
-        return self.coordinator._climate_fan_modes()
+        # Prepend the "(none)" sentinel so the user can clear this side from the
+        # UI. Only when the unit actually has fan modes — an empty list keeps
+        # the select `available=False` (see below) rather than offering a lone
+        # "(none)" on a fanless climate.
+        modes = self.coordinator._climate_fan_modes()
+        return [_FAN_MODE_NONE, *modes] if modes else []
 
     @property
     def available(self) -> bool:
         # Unavailable (greyed out) when the coordinator is failing OR the
-        # climate exposes no fan modes (offline / fanless unit) — honest UI,
-        # and it stops HA warning about a stored value not in an empty option
-        # list.
-        return super().available and bool(self.options)
+        # climate exposes no fan modes (offline / fanless unit) — honest UI.
+        # Gate on the raw fan modes, not `self.options` (which always carries
+        # the sentinel once there's at least one real mode).
+        return super().available and bool(self.coordinator._climate_fan_modes())
 
     @property
     def current_option(self) -> str | None:
-        # Show the stored mode only when it's a currently-valid option. A stale
-        # stored value (unit re-labelled its modes) renders blank rather than
-        # tripping HA's "current_option not in options" warning; storage is
-        # left intact (read-side coercion only) and the coordinator's own
-        # membership guard independently refuses to command a dead string.
         # `self._field` is a runtime str, so the StoredZone TypedDict can't be
         # indexed by it directly (mypy literal-key rule) — cast as the storage
         # module does for the same reason.
         zone = cast("dict[str, Any]", self.coordinator.data.zone)
         stored = zone[self._field]
-        return stored if stored in self.options else None
+        if stored is None:
+            # Unset -> show the sentinel (which is in `options`, so HA doesn't
+            # warn about current_option not being a valid option).
+            return _FAN_MODE_NONE
+        # A stored mode the unit no longer offers (re-labelled) renders blank
+        # rather than tripping HA's "current_option not in options" warning;
+        # storage is left intact (read-side coercion only) and the coordinator's
+        # own membership guard independently refuses to command a dead string.
+        return stored if stored in self.coordinator._climate_fan_modes() else None
 
     async def async_select_option(self, option: str) -> None:
-        # HA only ever passes a value currently in `options`.
-        await self._setter(option)
+        # HA only ever passes a value currently in `options` (incl. the
+        # sentinel, which maps back to None = don't command this side).
+        await self._setter(None if option == _FAN_MODE_NONE else option)
 
 
 async def async_setup_entry(

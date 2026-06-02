@@ -57,9 +57,10 @@ async def test_fan_mode_select_options_match_climate_fan_modes(
     for entity_id in ("select.office_active_fan_mode", "select.office_idle_fan_mode"):
         state = hass.states.get(entity_id)
         assert state is not None, entity_id
-        assert state.attributes["options"] == FAN_MODES
-        # Nothing picked yet -> blank (current_option None).
-        assert state.state == STATE_UNKNOWN
+        # Options are the unit's fan_modes plus the leading "(none)" sentinel.
+        assert state.attributes["options"] == ["(none)", *FAN_MODES]
+        # Nothing picked yet -> shows the "(none)" sentinel.
+        assert state.state == "(none)"
 
 
 async def test_fan_mode_select_persists_choice(
@@ -108,4 +109,30 @@ async def test_fan_mode_select_blanks_stale_stored_value(
     assert state is not None
     # Blank (current_option coerced to None), still available (fan_modes present).
     assert state.state == STATE_UNKNOWN
-    assert state.attributes["options"] == FAN_MODES
+    assert state.attributes["options"] == ["(none)", *FAN_MODES]
+
+
+async def test_fan_mode_select_none_option_clears_the_mode(
+    hass: HomeAssistant, hass_storage: dict[str, Any], fan_zone: Any
+) -> None:
+    """Picking the '(none)' sentinel writes None — lets a user drop one side
+    (e.g. keep idle, stop boosting active) without disabling the whole switch."""
+    store = hass.data[DOMAIN].store
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": "select.office_active_fan_mode", "option": "high"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert store.get_zone("office")["active_fan_mode"] == "high"
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": "select.office_active_fan_mode", "option": "(none)"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert store.get_zone("office")["active_fan_mode"] is None
+    assert hass.states.get("select.office_active_fan_mode").state == "(none)"
