@@ -36,6 +36,7 @@ from .coordinator import ZoneCoordinator
 from .feedback import FeedbackStore
 from .profiles import ProfileRegistry
 from .services import async_register_services
+from .shared_schedules import SharedScheduleRegistry
 from .storage import ComfortBandStore
 from .ws import async_register_ws_commands
 
@@ -48,6 +49,7 @@ class ComfortBandData:
 
     store: ComfortBandStore
     profile_registry: ProfileRegistry
+    shared_schedule_registry: SharedScheduleRegistry
     feedback_store: FeedbackStore
     zone_coordinators: dict[str, ZoneCoordinator] = field(default_factory=dict)
     zone_slug_to_entry_id: dict[str, str] = field(default_factory=dict)
@@ -163,11 +165,13 @@ async def _ensure_shared_data(hass: HomeAssistant) -> ComfortBandData:
     store = ComfortBandStore(hass)
     await store.async_load()
     registry = ProfileRegistry(hass, store)
+    shared_schedule_registry = SharedScheduleRegistry(hass, store)
     feedback_store = FeedbackStore(hass)
     await feedback_store.async_load()
     data = ComfortBandData(
         store=store,
         profile_registry=registry,
+        shared_schedule_registry=shared_schedule_registry,
         feedback_store=feedback_store,
     )
     hass.data[DOMAIN] = data

@@ -2873,3 +2873,114 @@ async def test_fan_boost_redundant_guard_handles_integer_fan_mode(
     assert coordinator.data.decision.action == ACTION_HEAT
     assert _calls_for(climate_calls, "set_hvac_mode")  # the action WAS applied...
     assert _calls_for(climate_calls, "set_fan_mode") == []  # ...but the fan is already correct
+
+
+# ----- v0.14.0: shared-schedule band resolution -----
+
+
+async def _assign_shared(coordinator: ZoneCoordinator, name: str, low: float, high: float) -> str:
+    """Create a shared schedule with an all-day band on the home profile and
+    assign the office zone to it. Returns the shared id."""
+    store = coordinator._store
+    sid = await store.async_add_shared_schedule(name)
+    await store.async_set_shared_schedule(sid, "home", [{"at": "00:00", "low": low, "high": high}])
+    await store.async_set_zone_schedule_id("office", sid)
+    return sid
+
+
+async def test_assigned_zone_resolves_shared_band(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """An assigned zone resolves its band from the shared schedule, not its own
+    (default-empty) schedules / manual band."""
+    await _assign_shared(coordinator, "Bedrooms", 21.0, 24.0)
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+    state = await coordinator._async_update_data()
+    assert (state.sched_low, state.sched_high) == (21.0, 24.0)
+    assert (state.effective_low, state.effective_high) == (21.0, 24.0)
+    await coordinator.async_unload()
+
+
+async def test_dangling_schedule_id_falls_back_to_own_then_manual(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """A schedule_id pointing at a deleted shared schedule must not raise — it
+    falls back to the zone's own schedules, then the manual band."""
+    # Simulate corruption: a schedule_id that doesn't exist (bypasses the
+    # validating setter the way a hand-edited / deleted-out-from-under store
+    # would).
+    await coordinator._store.async_update_zone("office", schedule_id="ghost")
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    state = await coordinator._async_update_data()  # must not raise
+    # Office has no own schedule -> manual band (default 19.5 / 22.5).
+    assert (state.sched_low, state.sched_high) == (19.5, 22.5)
+
+
+async def test_override_wins_over_shared_schedule(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """A per-zone override still forces the manual band even when assigned to a
+    shared schedule."""
+    await _assign_shared(coordinator, "Bedrooms", 21.0, 24.0)
+    await coordinator.async_start_override(low=17.0, high=19.0, hours=2)
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    assert state.override_active is True
+    assert (state.effective_low, state.effective_high) == (17.0, 19.0)
+    await coordinator.async_unload()
+
+
+async def test_unassign_restores_own_schedule(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """Clearing the assignment (schedule_id=None) reverts to the zone's own
+    schedule / manual band."""
+    await _assign_shared(coordinator, "Bedrooms", 21.0, 24.0)
+    await coordinator._store.async_set_zone_schedule_id("office", None)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    state = await coordinator._async_update_data()
+    assert (state.sched_low, state.sched_high) == (19.5, 22.5)  # back to manual
+
+
+async def test_assigned_zone_resolves_per_active_profile(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """A shared schedule is profile-aware: flipping the active profile resolves
+    the matching per-profile band."""
+    store = coordinator._store
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(sid, "home", [{"at": "00:00", "low": 21.0, "high": 24.0}])
+    await store.async_set_shared_schedule(sid, "away", [{"at": "00:00", "low": 15.0, "high": 28.0}])
+    await store.async_set_zone_schedule_id("office", sid)
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+
+    state = await coordinator._async_update_data()
+    assert (state.sched_low, state.sched_high) == (21.0, 24.0)  # home active by default
+
+    await store.async_set_active_profile("away")
+    state = await coordinator._async_update_data()
+    assert (state.sched_low, state.sched_high) == (15.0, 28.0)  # away band
+    await coordinator.async_unload()
+
+
+async def test_assigned_to_empty_shared_schedule_uses_manual_not_own(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """When a zone is assigned to a shared schedule that EXISTS but has no slot
+    for the active/default profile, its own (now-dormant) schedule is skipped —
+    band resolution falls straight to the manual band. (Contrast the dangling-id
+    case, which treats the zone as effectively unassigned: own -> manual.)"""
+    store = coordinator._store
+    # Give the zone an OWN schedule that would resolve to a distinctive band...
+    await store.async_set_zone_schedule(
+        "office", "home", [{"at": "00:00", "low": 5.0, "high": 9.0}]
+    )
+    # ...then assign it to an empty shared schedule (no profile slots at all).
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_zone_schedule_id("office", sid)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+
+    state = await coordinator._async_update_data()
+    # Not the own-schedule band (5/9) — the dormant own schedule is bypassed —
+    # but the manual default (19.5/22.5).
+    assert (state.sched_low, state.sched_high) == (19.5, 22.5)

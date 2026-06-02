@@ -21,6 +21,7 @@ from typing import Any, NotRequired, TypedDict, cast
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
+from homeassistant.util import slugify
 
 __all__ = [
     "ComfortBandStore",
@@ -28,6 +29,7 @@ __all__ = [
     "StoredData",
     "StoredProfile",
     "StoredProfileSchedule",
+    "StoredSharedSchedule",
     "StoredTransition",
     "StoredZone",
 ]
@@ -45,6 +47,9 @@ from .const import (
     DEFAULT_PASSIVE_TOLERANCE_C,
     DEFAULT_PROFILE,
     MAX_PROFILES,
+    MAX_SHARED_SCHEDULES,
+    OWN_SCHEDULE_LABEL,
+    SIGNAL_SHARED_SCHEDULE_CHANGED,
     SIGNAL_ZONE_SCHEDULE_CHANGED,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -62,6 +67,22 @@ class StoredTransition(TypedDict):
 class StoredProfileSchedule(TypedDict):
     baseline: list[StoredTransition]
     current: list[StoredTransition]
+
+
+class StoredSharedSchedule(TypedDict):
+    """v0.14.0: a store-level, profile-aware schedule that any number of zones
+    can be assigned to (via `StoredZone.schedule_id`) so grouped rooms target
+    the same band and don't fight.
+
+    `name` is the user-facing label (mutable, unique case-insensitively). The
+    dict KEY in `StoredData.shared_schedules` is a stable slug id *divorced*
+    from the name, so rename is a pure `name` update with zero zone-pointer
+    fan-out. `schedules` is byte-identical to a zone's own `schedules`
+    (per-profile), so home/away still differ for assigned rooms.
+    """
+
+    name: str
+    schedules: dict[str, StoredProfileSchedule]
 
 
 class SerializedSample(TypedDict):
@@ -177,6 +198,13 @@ class StoredZone(TypedDict):
     fan_control_enabled: bool
     active_fan_mode: str | None
     idle_fan_mode: str | None
+    # v0.14.0: when non-None, this zone resolves its scheduled band from the
+    # shared schedule with this id (StoredData.shared_schedules) instead of its
+    # own `schedules` above. None = "Own schedule". A dangling id (shared
+    # schedule deleted) falls back safely to the own schedule at resolution
+    # time. The zone's own `schedules` stays dormant while assigned and is
+    # restored losslessly on unassign.
+    schedule_id: str | None
 
 
 class StoredProfile(TypedDict):
@@ -187,6 +215,10 @@ class StoredProfile(TypedDict):
 class StoredData(TypedDict):
     zones: dict[str, StoredZone]
     profiles: dict[str, StoredProfile]
+    # v0.14.0 named shared schedules, keyed by stable slug id. A zone with a
+    # non-None `schedule_id` resolves its band from the matching entry here
+    # instead of its own `schedules` (see `coordinator._async_update_data`).
+    shared_schedules: dict[str, StoredSharedSchedule]
     active_profile: str
     # Rename-aware fallback target. Initialised to DEFAULT_PROFILE on first
     # load; updated when that profile is renamed. Used by `async_remove_profile`
@@ -208,6 +240,7 @@ def _default_data() -> StoredData:
             name: {"name": name, "description": _BUILTIN_DESCRIPTIONS.get(name, "")}
             for name in BUILTIN_PROFILES
         },
+        "shared_schedules": {},
         "active_profile": DEFAULT_PROFILE,
         "default_profile": DEFAULT_PROFILE,
     }
@@ -243,6 +276,7 @@ def _default_zone(zone_name: str) -> StoredZone:
         "fan_control_enabled": False,
         "active_fan_mode": None,
         "idle_fan_mode": None,
+        "schedule_id": None,
     }
 
 
@@ -291,6 +325,12 @@ class ComfortBandStore:
         # raise KeyError on every state push.
         if raw.get("active_profile") not in raw.get("profiles", {}):
             raw["active_profile"] = raw["default_profile"]
+            migrated = True
+        # v0.13 → v0.14: named shared schedules. Top-level collection, default
+        # empty so existing installs see no change. Presence-keyed like the
+        # per-zone fields below.
+        if "shared_schedules" not in raw:
+            raw["shared_schedules"] = {}
             migrated = True
         # Per-zone backfill: every new field added since v0.3 gets a safe
         # default if absent. Each `if "field" not in zone` branch is
@@ -386,6 +426,11 @@ class ComfortBandStore:
                 migrated = True
             if "idle_fan_mode" not in zone:
                 zone["idle_fan_mode"] = None
+                migrated = True
+            # v0.13 → v0.14: shared-schedule assignment. Default None ("Own
+            # schedule") so existing zones keep resolving their own schedules.
+            if "schedule_id" not in zone:
+                zone["schedule_id"] = None
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)
@@ -563,4 +608,168 @@ class ComfortBandStore:
             zone["schedules"].pop(name, None)
         if self._data["active_profile"] == name:
             self._data["active_profile"] = self._data["default_profile"]
+        await self.async_save()
+
+    # ----- shared schedules (v0.14.0) -----
+
+    def list_shared_schedule_ids(self) -> list[str]:
+        return sorted(self._data["shared_schedules"].keys())
+
+    def has_shared_schedule(self, shared_id: str) -> bool:
+        return shared_id in self._data["shared_schedules"]
+
+    def get_shared_schedule(self, shared_id: str) -> StoredSharedSchedule:
+        if shared_id not in self._data["shared_schedules"]:
+            raise KeyError(shared_id)
+        return copy.deepcopy(self._data["shared_schedules"][shared_id])
+
+    def get_shared_schedule_slot(
+        self, shared_id: str, profile_name: str
+    ) -> StoredProfileSchedule | None:
+        """The `{baseline, current}` for one (shared schedule, profile), or None."""
+        if shared_id not in self._data["shared_schedules"]:
+            raise KeyError(shared_id)
+        schedule = self._data["shared_schedules"][shared_id]["schedules"].get(profile_name)
+        return copy.deepcopy(schedule) if schedule is not None else None
+
+    def zones_using_shared_schedule(self, shared_id: str) -> list[str]:
+        """Zone names currently assigned to this shared schedule (sorted)."""
+        return sorted(
+            name for name, zone in self._data["zones"].items() if zone["schedule_id"] == shared_id
+        )
+
+    def get_shared_schedule_name(self, shared_id: str) -> str | None:
+        """The display name, or None if the id is unknown (dangling pointer)."""
+        s = self._data["shared_schedules"].get(shared_id)
+        return s["name"] if s is not None else None
+
+    def shared_schedule_summaries(self) -> list[dict[str, Any]]:
+        """Lightweight `[{id, name, members}]` per shared schedule (no transition
+        deep-copy), sorted by name — drives the assignment select's attributes so
+        the card reads everything from `hass.states`."""
+        zones = self._data["zones"]
+        out: list[dict[str, Any]] = [
+            {
+                "id": sid,
+                "name": s["name"],
+                "members": sorted(z for z, zone in zones.items() if zone["schedule_id"] == sid),
+            }
+            for sid, s in self._data["shared_schedules"].items()
+        ]
+        out.sort(key=lambda d: str(d["name"]).casefold())
+        return out
+
+    def _new_shared_schedule_id(self, name: str) -> str:
+        """A stable, collision-free slug id for a new shared schedule. The id is
+        divorced from the name (so rename never moves zone pointers)."""
+        base = slugify(name) or "schedule"
+        existing = self._data["shared_schedules"]
+        if base not in existing:
+            return base
+        i = 2
+        while f"{base}_{i}" in existing:
+            i += 1
+        return f"{base}_{i}"
+
+    def _clean_shared_name(self, name: str) -> str:
+        """Normalise + validate a shared-schedule display name: strip surrounding
+        whitespace, reject blank, and reject the reserved "Own schedule" label
+        (which would collide with the assignment select's unassigned sentinel)."""
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("Shared schedule name cannot be empty")
+        if cleaned.casefold() == OWN_SCHEDULE_LABEL.casefold():
+            raise ValueError(f"{OWN_SCHEDULE_LABEL!r} is a reserved name")
+        return cleaned
+
+    def _shared_name_taken(self, name: str, *, exclude_id: str | None = None) -> bool:
+        lowered = name.casefold()
+        return any(
+            sid != exclude_id and s["name"].casefold() == lowered
+            for sid, s in self._data["shared_schedules"].items()
+        )
+
+    async def async_add_shared_schedule(
+        self,
+        name: str,
+        schedules: dict[str, StoredProfileSchedule] | None = None,
+    ) -> str:
+        """Create a shared schedule; returns its generated id. `schedules` seeds
+        the per-profile transition sets (deep-copied); None = empty."""
+        name = self._clean_shared_name(name)
+        if self._shared_name_taken(name):
+            raise ValueError(f"A shared schedule named {name!r} already exists")
+        if len(self._data["shared_schedules"]) >= MAX_SHARED_SCHEDULES:
+            raise ValueError(
+                f"Cannot create more than {MAX_SHARED_SCHEDULES} shared schedules "
+                f"(currently {len(self._data['shared_schedules'])})"
+            )
+        shared_id = self._new_shared_schedule_id(name)
+        self._data["shared_schedules"][shared_id] = {
+            "name": name,
+            "schedules": copy.deepcopy(schedules) if schedules is not None else {},
+        }
+        await self.async_save()
+        return shared_id
+
+    async def async_rename_shared_schedule(self, shared_id: str, new_name: str) -> None:
+        if shared_id not in self._data["shared_schedules"]:
+            raise KeyError(shared_id)
+        new_name = self._clean_shared_name(new_name)
+        if self._shared_name_taken(new_name, exclude_id=shared_id):
+            raise ValueError(f"A shared schedule named {new_name!r} already exists")
+        # id is stable + divorced from name, so this is a pure `name` update —
+        # no zone `schedule_id` pointers move (unlike profile rename).
+        self._data["shared_schedules"][shared_id]["name"] = new_name
+        await self.async_save()
+
+    async def async_remove_shared_schedule(self, shared_id: str) -> list[str]:
+        """Delete a shared schedule and unassign every zone that referenced it
+        (back to "Own schedule"). Returns the affected zone names so the caller
+        can refresh their coordinators."""
+        if shared_id not in self._data["shared_schedules"]:
+            raise KeyError(shared_id)
+        affected = self.zones_using_shared_schedule(shared_id)
+        for name in affected:
+            self._data["zones"][name]["schedule_id"] = None
+        del self._data["shared_schedules"][shared_id]
+        await self.async_save()
+        return affected
+
+    async def async_set_shared_schedule(
+        self,
+        shared_id: str,
+        profile_name: str,
+        baseline: list[StoredTransition],
+        current: list[StoredTransition] | None = None,
+    ) -> None:
+        """Write the `{baseline, current}` for one (shared schedule, profile)
+        and fire SIGNAL_SHARED_SCHEDULE_CHANGED so the WS layer pushes to every
+        subscriber of this id. Mirrors `async_set_zone_schedule`."""
+        if shared_id not in self._data["shared_schedules"]:
+            raise KeyError(shared_id)
+        if profile_name not in self._data["profiles"]:
+            raise ValueError(f"Profile {profile_name!r} does not exist")
+        persisted: StoredProfileSchedule = {
+            "baseline": copy.deepcopy(baseline),
+            "current": copy.deepcopy(current) if current is not None else copy.deepcopy(baseline),
+        }
+        self._data["shared_schedules"][shared_id]["schedules"][profile_name] = persisted
+        await self.async_save()
+        async_dispatcher_send(
+            self._hass,
+            SIGNAL_SHARED_SCHEDULE_CHANGED,
+            shared_id,
+            profile_name,
+            copy.deepcopy(persisted),
+        )
+
+    async def async_set_zone_schedule_id(self, zone_name: str, shared_id: str | None) -> None:
+        """Assign a zone to a shared schedule (or None = "Own schedule").
+        Validates the id exists."""
+        if zone_name not in self._data["zones"]:
+            raise KeyError(zone_name)
+        if shared_id is not None and shared_id not in self._data["shared_schedules"]:
+            raise ValueError(f"Shared schedule {shared_id!r} does not exist")
+        self._data["zones"][zone_name]["schedule_id"] = shared_id
         await self.async_save()

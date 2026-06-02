@@ -372,3 +372,135 @@ async def test_get_feedback_since_filter(
     assert conn.errors == []
     labels = [e["label"] for e in conn.results[0][1]["entries"]]
     assert labels == ["too_hot"]
+
+
+# ----- v0.14.0 shared-schedule refs -----
+
+
+async def test_get_schedule_by_shared_id(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    store = hass.data[DOMAIN].store
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(sid, "home", [{"at": "06:00", "low": 21.0, "high": 24.0}])
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 1, "type": "comfort_band/get_schedule", "shared_id": sid, "profile": "home"},
+    )
+    assert conn.errors == []
+    assert conn.results[0][1]["current"][0]["low"] == 21.0
+
+
+async def test_get_schedule_unknown_shared_id_errors(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 2, "type": "comfort_band/get_schedule", "shared_id": "ghost", "profile": "home"},
+    )
+    assert conn.results == []
+    assert conn.errors[0][1] == "shared_schedule_not_found"
+
+
+async def test_get_schedule_requires_exactly_one_ref(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    conn = _FakeConnection()
+    ws_get_schedule(
+        hass,
+        conn,  # type: ignore[arg-type]
+        {"id": 3, "type": "comfort_band/get_schedule", "profile": "home"},
+    )
+    assert conn.results == []
+    assert conn.errors[0][1] == "invalid_format"
+
+
+async def test_subscribe_shared_pushes_and_isolates_from_zone(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """A shared-schedule edit fans out to EVERY shared-id subscriber (two rooms'
+    cards editing the same schedule stay in sync) but NOT to a zone subscriber
+    (the two signals are distinct)."""
+    store = hass.data[DOMAIN].store
+    sid = await store.async_add_shared_schedule("Bedrooms")
+
+    # Two independent cards subscribed to the same shared schedule.
+    shared_conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        shared_conn,  # type: ignore[arg-type]
+        {"id": 10, "type": "comfort_band/subscribe_schedule", "shared_id": sid, "profile": "home"},
+    )
+    shared_conn2 = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        shared_conn2,  # type: ignore[arg-type]
+        {"id": 12, "type": "comfort_band/subscribe_schedule", "shared_id": sid, "profile": "home"},
+    )
+    zone_conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        zone_conn,  # type: ignore[arg-type]
+        {"id": 11, "type": "comfort_band/subscribe_schedule", "zone": "office", "profile": "home"},
+    )
+    await hass.async_block_till_done()
+    # Drop the initial events; only count post-edit pushes.
+    shared_conn.events.clear()
+    shared_conn2.events.clear()
+    zone_conn.events.clear()
+
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "shared_id": sid,
+            "profile": "home",
+            "transitions": [{"at": "06:00", "low": 21.0, "high": 24.0}],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # BOTH shared subscribers receive the edit...
+    assert len(shared_conn.events) == 1
+    assert shared_conn.events[0][1]["schedule"]["current"][0]["low"] == 21.0
+    assert len(shared_conn2.events) == 1
+    assert shared_conn2.events[0][1]["schedule"]["current"][0]["low"] == 21.0
+    # ...the zone subscriber is unaffected by a shared edit.
+    assert zone_conn.events == []
+
+
+async def test_zone_edit_does_not_reach_shared_subscriber(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """The mirror of the isolation guarantee: editing a ZONE's own schedule must
+    not push to a subscriber on a shared schedule (distinct signals)."""
+    store = hass.data[DOMAIN].store
+    sid = await store.async_add_shared_schedule("Bedrooms")
+
+    shared_conn = _FakeConnection()
+    ws_subscribe_schedule(
+        hass,
+        shared_conn,  # type: ignore[arg-type]
+        {"id": 20, "type": "comfort_band/subscribe_schedule", "shared_id": sid, "profile": "home"},
+    )
+    await hass.async_block_till_done()
+    shared_conn.events.clear()
+
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "zone": "office",
+            "profile": "home",
+            "transitions": [{"at": "06:00", "low": 18.0, "high": 25.0}],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert shared_conn.events == []  # shared subscriber unaffected by a zone edit

@@ -28,7 +28,7 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -45,6 +45,7 @@ from .const import (
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
     SAMPLE_PERSIST_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
+    SIGNAL_SHARED_SCHEDULE_LIST_CHANGED,
 )
 from .hysteresis import HysteresisDecision, HysteresisInputs
 from .predictor import Sample, ThermalSlopes
@@ -323,6 +324,17 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(self.zone_name, idle_fan_mode=idle_fan_mode)
         await self.async_refresh()
 
+    async def async_set_schedule_assignment(self, shared_id: str | None) -> None:
+        """Assign this zone to a shared schedule (or None = "Own schedule").
+        v0.14.0. Validates the id via the store, then refreshes so the band
+        re-resolves from the new source immediately."""
+        await self._store.async_set_zone_schedule_id(self.zone_name, shared_id)
+        await self.async_refresh()
+        # Membership changed: every zone's assignment select exposes a
+        # `shared_schedules` summary carrying each schedule's member list, so
+        # nudge them all to re-render (this zone joined/left a group).
+        async_dispatcher_send(self.hass, SIGNAL_SHARED_SCHEDULE_LIST_CHANGED)
+
     async def _set_manual_and_override(self, **manual_fields: float) -> None:
         zone = self._store.get_zone(self.zone_name)
         until = (dt_util.utcnow() + timedelta(hours=zone["override_hours"])).isoformat()
@@ -380,9 +392,22 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # name, so this still works after the user renames the original
         # "home" profile.
         default_profile = self._store.default_profile
-        schedule_data = zone["schedules"].get(active_profile) or zone["schedules"].get(
-            default_profile
-        )
+        # v0.14.0: when the zone is assigned a shared schedule, resolve its band
+        # from that shared schedule (active profile, then default) instead of
+        # the zone's own `schedules`. A dangling `schedule_id` (the shared
+        # schedule was deleted) fails the `has_shared_schedule` guard and falls
+        # back to the zone's own schedules — then to the manual band below — so
+        # a refresh never raises. Everything downstream consumes `schedule_data`
+        # unchanged (MPC lookahead, next-transition timer, ramp smoothing).
+        sid = zone["schedule_id"]
+        if sid is not None and self._store.has_shared_schedule(sid):
+            schedule_data = self._store.get_shared_schedule_slot(
+                sid, active_profile
+            ) or self._store.get_shared_schedule_slot(sid, default_profile)
+        else:
+            schedule_data = zone["schedules"].get(active_profile) or zone["schedules"].get(
+                default_profile
+            )
         sched_low, sched_high = self._resolve_schedule(
             schedule_data,
             fallback=(zone["manual_low"], zone["manual_high"]),
