@@ -136,3 +136,40 @@ async def test_fan_mode_select_none_option_clears_the_mode(
     await hass.async_block_till_done()
     assert store.get_zone("office")["active_fan_mode"] is None
     assert hass.states.get("select.office_active_fan_mode").state == "(none)"
+
+
+async def test_fan_mode_select_current_option_coercion(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Unit-level guard for `FanModeSelect.current_option`. HA's `@final`
+    `SelectEntity.state` *also* coerces a not-in-options value to None, so an
+    integration-level state assertion alone is false-confidence — assert the
+    property directly so the code's own coercion is genuinely pinned:
+    stored None -> "(none)" sentinel; stored valid -> the value; stored stale
+    (not in the unit's fan_modes) -> None."""
+    from custom_components.comfort_band.coordinator import ZoneCoordinator
+    from custom_components.comfort_band.select import FanModeSelect
+    from custom_components.comfort_band.storage import ComfortBandStore
+
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, ZONE_TEMP_ENTITY)
+    hass.states.async_set(CLIMATE_ENTITY, "off", {"fan_modes": FAN_MODES, "fan_mode": "low"})
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    sel = FanModeSelect(coordinator, "active_fan_mode", coordinator.async_set_active_fan_mode)
+
+    # Stored None -> the "(none)" sentinel (which is in options, so no warning).
+    assert sel.current_option == "(none)"
+    # Stored valid mode -> that mode.
+    await store.async_update_zone("office", active_fan_mode="high")
+    await coordinator.async_refresh()
+    assert sel.current_option == "high"
+    # Stored mode no longer offered by the unit -> blank (None), not the dead
+    # string. This is the branch HA's state property would also coerce, so it's
+    # asserted here on the property directly.
+    await store.async_update_zone("office", active_fan_mode="turbo")
+    await coordinator.async_refresh()
+    assert sel.current_option is None
+    await coordinator.async_unload()

@@ -88,6 +88,9 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | `switch` | `learning_enabled` | Gates the v0.6 predictive controller. When ON, anticipated heat/cool decisions reach climate (subject to existing min-cycle and cross-mode gates). Anticipated idle releases bypass those gates so a cycle can always stop — same contract as v0.5. Default OFF. |
 | `switch` | `mpc_enabled` | Gates the v0.8 model-predictive controller. Layered on `learning_enabled`: both must be ON, **and** `mpc_ready` must be True, for MPC's decision to reach climate. Default OFF. |
 | `switch` | `use_apparent_temperature` | When ON, hysteresis decisions use the apparent value instead of the raw room reading. Falls back to room temp automatically if humidity is unavailable. Default OFF. |
+| `switch` | `fan_control_enabled` | Gates the v0.13.0 deterministic fan-boost. When ON, the climate's fan mode is commanded by action (see the two selects below). Default OFF; a no-op until fan modes are picked. |
+| `select` | `active_fan_mode` | Fan mode commanded while heating/cooling. Options come live from the climate's `fan_modes`, plus a leading `(none)` (= don't command this side). Unset by default. |
+| `select` | `idle_fan_mode` | Fan mode commanded while idle (`fan_only`). Same options as `active_fan_mode`; pick a quiet level to stop full-speed air-cycling. Unset by default. |
 
 Plus one global entity: `select.comfort_band_profiles_active_profile`.
 

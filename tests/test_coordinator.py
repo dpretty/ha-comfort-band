@@ -2832,3 +2832,44 @@ async def test_fan_boost_suppressed_by_min_cycle(
     await hass.async_block_till_done()
     assert _calls_for(climate_calls, "set_hvac_mode") == []
     assert _calls_for(climate_calls, "set_fan_mode") == []
+
+
+async def test_fan_boost_commands_integer_fan_mode_as_string(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A unit reporting integer fan modes/levels still gets commanded: the
+    stored string '3' matches the str-coerced fan_modes [str(1),str(2),str(3)]."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="3", idle="1")
+    hass.states.async_set(CLIMATE_ENTITY, "heat", {"fan_modes": [1, 2, 3], "fan_mode": 1})
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})  # heat -> active "3", current 1
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert any(c["fan_mode"] == "3" for c in _calls_for(climate_calls, "set_fan_mode"))
+
+
+async def test_fan_boost_redundant_guard_handles_integer_fan_mode(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """The redundant-skip guard must fire even when the unit reports an INTEGER
+    `fan_mode`: the current level is str-coerced before comparison, so a unit
+    already at the desired level isn't re-commanded every cycle (the guarantee
+    a prior review flagged would otherwise break for integer-fan-mode units)."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _enable_fan_control(coordinator, active="3", idle="1")
+    # Already at level 3, reported as a bare int.
+    hass.states.async_set(CLIMATE_ENTITY, "heat", {"fan_modes": [1, 2, 3], "fan_mode": 3})
+
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})  # heat -> desired "3" == current 3
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_HEAT
+    assert _calls_for(climate_calls, "set_hvac_mode")  # the action WAS applied...
+    assert _calls_for(climate_calls, "set_fan_mode") == []  # ...but the fan is already correct

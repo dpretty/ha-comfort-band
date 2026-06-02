@@ -715,20 +715,22 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         return step
 
     def _current_climate_fan_mode(self) -> str | None:
-        """Read the climate entity's `fan_mode` attribute for sample capture.
+        """Read the climate entity's current `fan_mode` attribute, as a string.
 
-        Returns None when the entity is missing, the attribute is absent, or
-        the attribute is non-string. Stored alongside each sample so v0.9
-        can partition slope estimates by fan_mode without waiting on a
-        warm-up window.
+        Returns None only when the entity is missing or the attribute is
+        absent. A non-string value (e.g. an integer fan level) is coerced to
+        str so it compares equal to the str-coerced `_climate_fan_modes()`
+        entries — the v0.13.0 fan-boost redundant-command guard relies on that
+        (an int current vs the stored string would otherwise never match,
+        re-issuing the same fan command every cycle). It also means integer
+        fan levels are captured in samples (for future `(action, fan_mode)`
+        partitioning) instead of being dropped to None.
         """
         state = self.hass.states.get(self.climate_entity_id)
         if state is None:
             return None
         raw = state.attributes.get("fan_mode")
-        if isinstance(raw, str):
-            return raw
-        return None
+        return None if raw is None else str(raw)
 
     def _climate_fan_modes(self) -> list[str]:
         """The climate entity's supported `fan_modes`, as strings.
