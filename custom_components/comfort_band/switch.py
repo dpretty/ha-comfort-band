@@ -115,6 +115,30 @@ class UseApparentTemperatureSwitch(ComfortBandZoneEntity, SwitchEntity):
         await self.coordinator.async_set_use_apparent_temperature(False)
 
 
+class FanControlEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
+    """v0.13.0 deterministic fan-boost opt-in. When ON, the coordinator
+    commands the climate's fan mode by action -- `active_fan_mode` while
+    heating/cooling, `idle_fan_mode` while idle -- using the
+    `select.{zone}_active_fan_mode` / `_idle_fan_mode` picks. Default OFF, and
+    a no-op until the user selects fan modes, so existing zones are unaffected.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "fan_control_enabled")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.zone["fan_control_enabled"]
+
+    async def async_turn_on(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_fan_control_enabled(True)
+
+    async def async_turn_off(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_fan_control_enabled(False)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -125,5 +149,6 @@ async def async_setup_entry(
             LearningEnabledSwitch(coordinator),
             MpcEnabledSwitch(coordinator),
             UseApparentTemperatureSwitch(coordinator),
+            FanControlEnabledSwitch(coordinator),
         ]
     )

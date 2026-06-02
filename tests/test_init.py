@@ -38,6 +38,9 @@ _EXPECTED_ZONE_ENTITIES = (
     "switch.office_learning_enabled",
     "switch.office_mpc_enabled",  # v0.8
     "switch.office_use_apparent_temperature",
+    "switch.office_fan_control_enabled",  # v0.13
+    "select.office_active_fan_mode",  # v0.13 (unavailable until climate has fan_modes)
+    "select.office_idle_fan_mode",  # v0.13
 )
 
 
@@ -231,3 +234,30 @@ async def test_select_changes_active_profile(
     state = hass.states.get("select.comfort_band_profiles_active_profile")
     assert state is not None
     assert state.state == "away"
+
+
+async def test_zone_and_profile_selects_coexist(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    make_zone_entry: Any,
+    profile_manager_entry: MockConfigEntry,
+) -> None:
+    """v0.13.0: SELECT now forwards for zone entries too (it was profile-only).
+    Both the singleton profile select AND the per-zone fan selects must set up
+    when both entry kinds are loaded — proves the dual-entry-kind branch in
+    select.async_setup_entry."""
+    profile_manager_entry.add_to_hass(hass)
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(
+        "climate.office_hvac", "off", {"fan_modes": ["low", "high"], "fan_mode": "low"}
+    )
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    # Setting up one entry triggers component setup, which loads every pending
+    # entry of the domain (both kinds) — so a single setup + settle loads both.
+    assert await hass.config_entries.async_setup(profile_manager_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("select.comfort_band_profiles_active_profile") is not None
+    assert hass.states.get("select.office_active_fan_mode") is not None
+    assert hass.states.get("select.office_idle_fan_mode") is not None

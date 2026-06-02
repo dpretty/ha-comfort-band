@@ -58,6 +58,10 @@ async def test_default_zone_has_sane_initial_values(
     # v0.12.0 persisted idle slope: nothing learned yet on a fresh zone.
     assert zone["persisted_idle_slope"] is None
     assert zone["persisted_idle_slope_at"] is None
+    # v0.13.0 fan-boost: off + unset by default (no behaviour change).
+    assert zone["fan_control_enabled"] is False
+    assert zone["active_fan_mode"] is None
+    assert zone["idle_fan_mode"] is None
 
 
 # ----- round-trip persistence -----
@@ -99,6 +103,26 @@ async def test_persisted_idle_slope_round_trips_across_store_instances(
     zone = second.get_zone("office")
     assert zone["persisted_idle_slope"] == -0.004
     assert zone["persisted_idle_slope_at"] == "2026-05-19T06:55:00+00:00"
+
+
+async def test_fan_control_fields_round_trip_across_store_instances(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.13.0: the fan-boost config (enabled flag + the two mode strings)
+    survives a store reload."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone(
+        "office", fan_control_enabled=True, active_fan_mode="high", idle_fan_mode="low"
+    )
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["fan_control_enabled"] is True
+    assert zone["active_fan_mode"] == "high"
+    assert zone["idle_fan_mode"] == "low"
 
 
 async def test_partial_persisted_idle_keys_backfilled_independently(
@@ -791,6 +815,10 @@ async def test_load_legacy_v0_7_zone_backfills_mpc_horizon_minutes(
     # v0.12.0: persisted idle slope backfilled to None/None for legacy zones.
     assert store.get_zone("office")["persisted_idle_slope"] is None
     assert store.get_zone("office")["persisted_idle_slope_at"] is None
+    # v0.13.0: fan-boost fields backfilled to off/None for legacy zones.
+    assert store.get_zone("office")["fan_control_enabled"] is False
+    assert store.get_zone("office")["active_fan_mode"] is None
+    assert store.get_zone("office")["idle_fan_mode"] is None
 
 
 async def test_load_v0_8_zone_with_explicit_mpc_horizon_preserves_user_value(

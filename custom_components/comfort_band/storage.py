@@ -165,6 +165,18 @@ class StoredZone(TypedDict):
     # used to expire it after `PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`.
     persisted_idle_slope: float | None
     persisted_idle_slope_at: str | None
+    # v0.13.0: deterministic fan-boost (opt-in, per zone). When
+    # `fan_control_enabled` is True, the coordinator commands the climate's
+    # fan mode by action — `active_fan_mode` while heating/cooling,
+    # `idle_fan_mode` while idle (fan-only). Stored as the fan-mode *string*
+    # (e.g. "high" / "4"), chosen from the climate's live `fan_modes`, so a
+    # unit re-ordering its modes can't silently change the level. None = don't
+    # command that side (so enabling does nothing until the user picks, and an
+    # idle-only config is possible). One shared "active" fan covers both heat
+    # and cool; separate heat/cool fans are a future refinement.
+    fan_control_enabled: bool
+    active_fan_mode: str | None
+    idle_fan_mode: str | None
 
 
 class StoredProfile(TypedDict):
@@ -228,6 +240,9 @@ def _default_zone(zone_name: str) -> StoredZone:
         "last_action": None,
         "persisted_idle_slope": None,
         "persisted_idle_slope_at": None,
+        "fan_control_enabled": False,
+        "active_fan_mode": None,
+        "idle_fan_mode": None,
     }
 
 
@@ -357,6 +372,20 @@ class ComfortBandStore:
                 migrated = True
             if "persisted_idle_slope_at" not in zone:
                 zone["persisted_idle_slope_at"] = None
+                migrated = True
+            # v0.12 → v0.13: deterministic fan-boost. Default OFF / unset so
+            # existing zones see no behaviour change on upgrade — the feature
+            # does nothing until the user enables it and picks fan modes.
+            # Backfilled independently (each key on its own check) for the same
+            # corrupt-store robustness as the persisted-idle-slope keys above.
+            if "fan_control_enabled" not in zone:
+                zone["fan_control_enabled"] = False
+                migrated = True
+            if "active_fan_mode" not in zone:
+                zone["active_fan_mode"] = None
+                migrated = True
+            if "idle_fan_mode" not in zone:
+                zone["idle_fan_mode"] = None
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

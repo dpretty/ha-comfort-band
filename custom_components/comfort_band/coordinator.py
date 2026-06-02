@@ -27,6 +27,7 @@ from homeassistant.core import (
     HomeAssistant,
     callback,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -36,6 +37,7 @@ from . import apparent_temp, hysteresis, mpc, predictor, schedule
 from .const import (
     ACTION_COOL,
     ACTION_HEAT,
+    ACTION_IDLE,
     ACTION_UNKNOWN,
     CLIMATE_ECHO_WINDOW_S,
     LOGGER,
@@ -304,6 +306,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(
             self.zone_name, use_apparent_temperature=use_apparent_temperature
         )
+        await self.async_refresh()
+
+    async def async_set_fan_control_enabled(self, fan_control_enabled: bool) -> None:
+        """Flip the v0.13.0 deterministic fan-boost opt-in."""
+        await self._store.async_update_zone(self.zone_name, fan_control_enabled=fan_control_enabled)
+        await self.async_refresh()
+
+    async def async_set_active_fan_mode(self, active_fan_mode: str | None) -> None:
+        """Set the fan mode commanded while heating/cooling (None = don't command)."""
+        await self._store.async_update_zone(self.zone_name, active_fan_mode=active_fan_mode)
+        await self.async_refresh()
+
+    async def async_set_idle_fan_mode(self, idle_fan_mode: str | None) -> None:
+        """Set the fan mode commanded while idle (None = don't command)."""
+        await self._store.async_update_zone(self.zone_name, idle_fan_mode=idle_fan_mode)
         await self.async_refresh()
 
     async def _set_manual_and_override(self, **manual_fields: float) -> None:
@@ -698,20 +715,76 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         return step
 
     def _current_climate_fan_mode(self) -> str | None:
-        """Read the climate entity's `fan_mode` attribute for sample capture.
+        """Read the climate entity's current `fan_mode` attribute, as a string.
 
-        Returns None when the entity is missing, the attribute is absent, or
-        the attribute is non-string. Stored alongside each sample so v0.9
-        can partition slope estimates by fan_mode without waiting on a
-        warm-up window.
+        Returns None only when the entity is missing or the attribute is
+        absent. A non-string value (e.g. an integer fan level) is coerced to
+        str so it compares equal to the str-coerced `_climate_fan_modes()`
+        entries — the v0.13.0 fan-boost redundant-command guard relies on that
+        (an int current vs the stored string would otherwise never match,
+        re-issuing the same fan command every cycle). It also means integer
+        fan levels are captured in samples (for future `(action, fan_mode)`
+        partitioning) instead of being dropped to None.
         """
         state = self.hass.states.get(self.climate_entity_id)
         if state is None:
             return None
         raw = state.attributes.get("fan_mode")
-        if isinstance(raw, str):
-            return raw
-        return None
+        return None if raw is None else str(raw)
+
+    def _climate_fan_modes(self) -> list[str]:
+        """The climate entity's supported `fan_modes`, as strings.
+
+        Returns [] when the entity is missing/unavailable, exposes no
+        `fan_modes`, or the attribute isn't a list — so the fan-boost command
+        and the fan-mode selects fail closed (no command / unavailable select)
+        on a climate that doesn't support fan control. v0.13.0.
+        """
+        state = self.hass.states.get(self.climate_entity_id)
+        if state is None:
+            return []
+        raw = state.attributes.get("fan_modes")
+        if not isinstance(raw, list):
+            return []
+        return [str(mode) for mode in raw]
+
+    async def _maybe_command_fan(self, zone: StoredZone, action: str) -> None:
+        """v0.13.0 deterministic fan-boost: command the climate's fan mode by
+        action — `active_fan_mode` while heating/cooling, `idle_fan_mode` while
+        idle. Opt-in via `fan_control_enabled`.
+
+        Only ever changes the climate's `fan_mode` attribute, which the
+        manual-edit detector deliberately ignores (v0.10.1), so this can never
+        flush the learning buffer. Skips silently when: fan control is off; the
+        target side is None (user hasn't picked, or an idle-only config); the
+        mode isn't in the climate's live `fan_modes` (unavailable / fanless /
+        stale stored value); or it already equals the current `fan_mode` (no
+        redundant command — important for cloud/mesh-routed units).
+        """
+        if not zone["fan_control_enabled"]:
+            return
+        if action in (ACTION_HEAT, ACTION_COOL):
+            desired = zone["active_fan_mode"]
+        elif action == ACTION_IDLE:
+            desired = zone["idle_fan_mode"]
+        else:
+            return
+        if desired is None or desired not in self._climate_fan_modes():
+            return
+        if desired == self._current_climate_fan_mode():
+            return
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": self.climate_entity_id, "fan_mode": desired},
+                blocking=True,
+            )
+        except HomeAssistantError as err:
+            # A unit that rejects set_fan_mode (e.g. mid-transition to fan_only)
+            # must not abort the rest of _maybe_apply_action -- the sample
+            # append still needs to run.
+            LOGGER.warning("%s: climate.set_fan_mode(%s) failed: %s", self.zone_name, desired, err)
 
     def _resolve_schedule(
         self,
@@ -963,6 +1036,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
             blocking=True,
         )
+        # v0.13.0 deterministic fan-boost. Placed right after set_hvac_mode so
+        # it fires for idle (fan_only) AND heat AND cool — set_temperature below
+        # is skipped for idle. Past all suppression gates + shadow-mode, so it
+        # only runs when the action is genuinely applied.
+        await self._maybe_command_fan(zone, decision.action)
         if rounded_target_temp is not None:
             await self.hass.services.async_call(
                 "climate",
