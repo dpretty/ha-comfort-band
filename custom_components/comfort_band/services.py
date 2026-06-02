@@ -63,7 +63,9 @@ SERVICE_RENAME_SHARED_SCHEDULE = "rename_shared_schedule"
 SERVICE_DELETE_SHARED_SCHEDULE = "delete_shared_schedule"
 SERVICE_ASSIGN_SCHEDULE = "assign_schedule"
 
-_TIME_RE = r"^[0-2]\d:[0-5]\d$"
+# HH:MM, hours 00-23 only. The previous `[0-2]\d` admitted 24:00-29:59, which
+# passed the schema then raised a raw ValueError in time.fromisoformat.
+_TIME_RE = r"^([01]\d|2[0-3]):[0-5]\d$"
 
 _TRANSITION_SCHEMA = vol.Schema(
     {
@@ -278,10 +280,22 @@ async def _target_set(
         await _refresh_zone_if_active(hass, zone_name)
 
 
+def _parse_time(value: str) -> time:
+    """Parse an HH:MM `at` value, surfacing a clean ServiceValidationError rather
+    than a raw ValueError. The schema's `_TIME_RE` already rejects bad values;
+    this is defence-in-depth so any that slip through degrade gracefully."""
+    try:
+        return time.fromisoformat(value)
+    except ValueError as err:
+        raise ServiceValidationError(
+            f"Invalid time {value!r}; expected HH:MM (00:00-23:59)"
+        ) from err
+
+
 def _to_transitions(raw: list[dict[str, Any]]) -> list[Transition]:
     parsed = [
         Transition(
-            at=time.fromisoformat(item["at"]),
+            at=_parse_time(item["at"]),
             low=float(item["low"]),
             high=float(item["high"]),
         )
@@ -318,7 +332,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _add_transition(call: ServiceCall) -> None:
         target = _target_from_call(hass, call)
         new_transition = Transition(
-            at=time.fromisoformat(call.data["at"]),
+            at=_parse_time(call.data["at"]),
             low=float(call.data["low"]),
             high=float(call.data["high"]),
         )
@@ -329,7 +343,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
 
     async def _update_transition(call: ServiceCall) -> None:
         target = _target_from_call(hass, call)
-        at = time.fromisoformat(call.data["at"])
+        at = _parse_time(call.data["at"])
         existing = _target_get(hass, target)
         if existing is None:
             raise ServiceValidationError(f"{_target_label(target)} has no schedule yet")
@@ -348,7 +362,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
 
     async def _remove_transition(call: ServiceCall) -> None:
         target = _target_from_call(hass, call)
-        at = time.fromisoformat(call.data["at"])
+        at = _parse_time(call.data["at"])
         existing = _target_get(hass, target)
         if existing is None:
             raise ServiceValidationError(f"{_target_label(target)} has no schedule yet")

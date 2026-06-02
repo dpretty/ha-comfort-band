@@ -392,3 +392,68 @@ async def test_name_is_normalised_and_reserved_label_refused(
         await store.async_add_shared_schedule("own schedule")
     with pytest.raises(ValueError, match="reserved"):
         await store.async_rename_shared_schedule(sid, "Own Schedule")
+
+
+async def test_profile_rename_carries_shared_schedule_slot(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.14.1: a profile rename rekeys shared-schedule slots (like zone-own
+    schedules), so an assigned zone keeps resolving the shared band instead of
+    silently dropping to its manual band."""
+    store = await _loaded_store(hass)
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(sid, "home", [{"at": "06:00", "low": 20.0, "high": 23.0}])
+    await store.async_add_zone("nate")
+    await store.async_set_zone_schedule_id("nate", sid)
+
+    await store.async_rename_profile("home", "casa")
+
+    # The slot followed the rename (was keyed "home"); content preserved.
+    assert store.get_shared_schedule_slot(sid, "home") is None
+    moved = store.get_shared_schedule_slot(sid, "casa")
+    assert moved is not None
+    assert moved["current"][0]["low"] == 20.0
+    # active_profile followed too, so resolution lands on the carried slot.
+    assert store.list_profiles() == ["away", "casa"]
+
+
+async def test_profile_delete_drops_shared_schedule_slot(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.14.1: deleting a (non-default) profile drops its slot from shared
+    schedules too — no orphaned dead-weight under a deleted profile key."""
+    store = await _loaded_store(hass)
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(sid, "home", [{"at": "06:00", "low": 20.0, "high": 23.0}])
+    await store.async_set_shared_schedule(sid, "away", [{"at": "06:00", "low": 16.0, "high": 26.0}])
+
+    # "away" is non-default (default is "home") -> deletable.
+    await store.async_remove_profile("away")
+
+    assert store.get_shared_schedule_slot(sid, "away") is None
+    assert "away" not in store.get_shared_schedule(sid)["schedules"]
+    # The surviving "home" slot is untouched.
+    assert store.get_shared_schedule_slot(sid, "home")["current"][0]["low"] == 20.0
+
+
+async def test_profile_clone_seeds_shared_schedule_slot(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """v0.14.1: cloning a profile seeds the cloned slot into shared schedules too
+    (an independent deep copy), matching the per-zone clone — so a shared-assigned
+    zone gets its own band under the new profile instead of diverging from
+    own-schedule zones."""
+    store = await _loaded_store(hass)
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(sid, "home", [{"at": "06:00", "low": 20.0, "high": 23.0}])
+
+    await store.async_clone_profile("home", "weekend")
+
+    cloned = store.get_shared_schedule_slot(sid, "weekend")
+    assert cloned is not None
+    assert cloned["current"][0]["low"] == 20.0
+    # Independent deep copy: editing the clone doesn't bleed into the source slot.
+    await store.async_set_shared_schedule(
+        sid, "weekend", [{"at": "06:00", "low": 30.0, "high": 31.0}]
+    )
+    assert store.get_shared_schedule_slot(sid, "home")["current"][0]["low"] == 20.0

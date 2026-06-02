@@ -2984,3 +2984,19 @@ async def test_assigned_to_empty_shared_schedule_uses_manual_not_own(
     # Not the own-schedule band (5/9) — the dormant own schedule is bypassed —
     # but the manual default (19.5/22.5).
     assert (state.sched_low, state.sched_high) == (19.5, 22.5)
+
+
+async def test_profile_rename_keeps_assigned_zone_on_shared_band(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """v0.14.1: renaming the active profile rekeys the shared schedule's slot,
+    so an assigned zone keeps resolving the shared band — it does NOT silently
+    fall back to its manual band (the bug this release fixes)."""
+    await _assign_shared(coordinator, "Bedrooms", 21.0, 24.0)
+    await coordinator._store.async_rename_profile("home", "casa")
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+
+    state = await coordinator._async_update_data()
+    # Still the shared band (now keyed "casa"), not the manual fallback.
+    assert (state.sched_low, state.sched_high) == (21.0, 24.0)
+    await coordinator.async_unload()
