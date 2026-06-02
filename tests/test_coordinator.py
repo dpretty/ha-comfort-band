@@ -2505,3 +2505,93 @@ async def test_cached_idle_does_not_leak_into_reactive_predictor(
     assert state.thermal_slopes.idle == 0.12
     # ...but the predictor ran on live slopes, so it did NOT suppress the heat.
     assert state.predicted_decision.action == ACTION_HEAT
+
+
+async def test_cached_idle_routes_final_decision_to_mpc(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """End-to-end (the literal purpose of the feature): with learning + MPC on,
+    a heating chase makes live idle None, but a fresh cached idle keeps
+    mpc_ready True — so MPC plans off (cached idle + live recovery) and the
+    three-way gate forwards MPC's heat as the FINAL decision, instead of
+    reactively falling back to the predictor."""
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", learning_enabled=True, mpc_enabled=True)
+    now = dt_util.utcnow()
+    _seed_recovery_heat_run(coordinator, now=now)  # live idle None, recovery_heat present
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.01,  # passive cooling toward ambient
+        persisted_idle_slope_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.3", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data.idle_slope_source == "cached"
+    assert coordinator.data.mpc_ready is True
+    # MPC elects heat (room below band, cached idle drifts further out, the live
+    # recovery slope brings it back) and the gate forwards it as the decision.
+    assert coordinator.data.mpc_decision.action == ACTION_HEAT
+    assert coordinator.data.decision.action == ACTION_HEAT
+    await coordinator.async_unload()
+
+
+async def test_cached_idle_at_exact_max_age_is_still_used(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """At exactly PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES the cached value is still
+    used (expiry is strict `>`), not dropped — pins the `>` vs `>=` choice."""
+    from custom_components.comfort_band.const import PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES
+
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    now = dt_util.utcnow()
+    _seed_recovery_heat_run(coordinator, now=now)
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.004,
+        persisted_idle_slope_at=(
+            now - timedelta(minutes=PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES)
+        ).isoformat(),
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.2", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "cached"
+    assert state.idle_slope_cached_age_min == pytest.approx(
+        float(PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES), abs=0.1
+    )
+    # Boundary is inclusive -> the value is NOT cleared from storage.
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.004
+
+
+async def test_cached_idle_of_zero_is_substituted(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A persisted idle slope of exactly 0.0 (a perfectly flat room) is a valid
+    cached value: the resolver keys off `is None`, not truthiness, so 0.0 must
+    still substitute and satisfy mpc_ready."""
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    now = dt_util.utcnow()
+    _seed_recovery_heat_run(coordinator, now=now)
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=0.0,
+        persisted_idle_slope_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+    hass.states.async_set(TEMP_ENTITY, "19.2", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "cached"
+    assert state.thermal_slopes.idle == 0.0
+    assert state.mpc_ready is True
