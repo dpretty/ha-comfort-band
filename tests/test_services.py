@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import time as dt_time
 from typing import Any
 
 import pytest
+import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.comfort_band.const import DOMAIN
+from custom_components.comfort_band.services import _parse_time
 
 ZONE_TEMP_ENTITY = "sensor.office_temp"
 
@@ -617,3 +620,34 @@ async def test_assign_schedule_unknown_shared_raises(
         await hass.services.async_call(
             DOMAIN, "assign_schedule", {"zone": "office", "shared_id": "ghost"}, blocking=True
         )
+
+
+# ----- transition-time validation (v0.14.1) -----
+
+
+async def test_set_schedule_rejects_out_of_range_hour(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    """An out-of-range hour (24:00) is rejected at the schema layer as a clean
+    validation error — not slipped through to a raw ValueError in the parse —
+    and the schedule is left unwritten."""
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_schedule",
+            {
+                "zone": "office",
+                "profile": "home",
+                "transitions": [{"at": "24:00", "low": 20.0, "high": 23.0}],
+            },
+            blocking=True,
+        )
+    assert hass.data[DOMAIN].store.get_zone_schedule("office", "home") is None
+
+
+def test_parse_time_wraps_bad_value_as_service_error() -> None:
+    """Defence-in-depth: any `at` value that bypasses the schema surfaces a clean
+    ServiceValidationError, never a raw ValueError."""
+    assert _parse_time("06:30") == dt_time(6, 30)
+    with pytest.raises(ServiceValidationError, match="Invalid time"):
+        _parse_time("24:00")

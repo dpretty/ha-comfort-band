@@ -571,6 +571,13 @@ class ComfortBandStore:
             src_schedule = zone["schedules"].get(source)
             if src_schedule is not None:
                 zone["schedules"][target] = copy.deepcopy(src_schedule)
+        # Shared schedules are profile-keyed too (v0.14.0/v0.14.1) — seed the
+        # cloned profile's slot so an assigned zone gets an independent copy
+        # under `target`, matching the per-zone clone above.
+        for shared in self._data["shared_schedules"].values():
+            src_slot = shared["schedules"].get(source)
+            if src_slot is not None:
+                shared["schedules"][target] = copy.deepcopy(src_slot)
         await self.async_save()
 
     async def async_rename_profile(self, old: str, new: str) -> None:
@@ -586,6 +593,12 @@ class ComfortBandStore:
         for zone in self._data["zones"].values():
             if old in zone["schedules"]:
                 zone["schedules"][new] = zone["schedules"].pop(old)
+        # Shared schedules are profile-keyed too (v0.14.0) — carry the rename so
+        # an assigned zone keeps resolving the shared band instead of silently
+        # dropping to its manual band.
+        for shared in self._data["shared_schedules"].values():
+            if old in shared["schedules"]:
+                shared["schedules"][new] = shared["schedules"].pop(old)
         if self._data["active_profile"] == old:
             self._data["active_profile"] = new
         if self._data["default_profile"] == old:
@@ -606,6 +619,9 @@ class ComfortBandStore:
         # Clean up orphan per-zone schedules — otherwise dead-weight on disk.
         for zone in self._data["zones"].values():
             zone["schedules"].pop(name, None)
+        # Same for shared schedules (v0.14.0): drop the deleted profile's slot.
+        for shared in self._data["shared_schedules"].values():
+            shared["schedules"].pop(name, None)
         if self._data["active_profile"] == name:
             self._data["active_profile"] = self._data["default_profile"]
         await self.async_save()

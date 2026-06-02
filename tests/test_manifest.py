@@ -23,7 +23,7 @@ def test_manifest_shape() -> None:
     assert manifest["integration_type"] == "helper"
     assert manifest["iot_class"] == "local_push"
     assert manifest["codeowners"] == ["@dpretty"]
-    assert manifest["version"] == "0.14.0"
+    assert manifest["version"] == "0.14.1"
     assert manifest["documentation"].startswith("https://")
     assert manifest["issue_tracker"].startswith("https://")
     assert manifest["requirements"] == []
