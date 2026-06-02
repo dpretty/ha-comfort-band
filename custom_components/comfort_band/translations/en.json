@@ -102,6 +102,9 @@
       },
       "idle_fan_mode": {
         "name": "Idle fan mode"
+      },
+      "schedule_assignment": {
+        "name": "Schedule assignment"
       }
     },
     "sensor": {

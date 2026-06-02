@@ -41,6 +41,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "switch.office_fan_control_enabled",  # v0.13
     "select.office_active_fan_mode",  # v0.13 (unavailable until climate has fan_modes)
     "select.office_idle_fan_mode",  # v0.13
+    "select.office_schedule_assignment",  # v0.14
 )
 
 

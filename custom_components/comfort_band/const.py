@@ -152,6 +152,17 @@ BUILTIN_PROFILES: Final = ("home", "away")
 # the .storage file.
 MAX_PROFILES: Final = 50
 
+# Named shared schedules (v0.14.0). A shared schedule is a store-level,
+# profile-aware schedule that any number of zones can be assigned to (via
+# `StoredZone.schedule_id`) so grouped rooms target the same band. Same
+# generous cap rationale as MAX_PROFILES.
+MAX_SHARED_SCHEDULES: Final = 50
+
+# The per-zone schedule-assignment select's "unassigned" sentinel option. Also a
+# reserved shared-schedule name (a real schedule named this would collide with
+# the sentinel in the option list), so create/rename refuse it.
+OWN_SCHEDULE_LABEL: Final = "Own schedule"
+
 # Action labels (returned by hysteresis.decide; surfaced via the current_action sensor).
 ACTION_HEAT: Final = "heating"
 ACTION_COOL: Final = "cooling"
@@ -192,3 +203,11 @@ PLATFORMS_PROFILE_MANAGER: Final = (Platform.SELECT,)
 SIGNAL_ACTIVE_PROFILE_CHANGED: Final = f"{DOMAIN}_active_profile_changed"
 SIGNAL_PROFILE_LIST_CHANGED: Final = f"{DOMAIN}_profile_list_changed"
 SIGNAL_ZONE_SCHEDULE_CHANGED: Final = f"{DOMAIN}_zone_schedule_changed"
+# v0.14.0 named shared schedules. SHARED_SCHEDULE_CHANGED fires on a content
+# edit (carries the shared-schedule id + profile) so the WS layer can push to
+# every subscriber of that id and every assigned zone refreshes; the additive
+# sibling of SIGNAL_ZONE_SCHEDULE_CHANGED (the per-zone path is left untouched).
+# SHARED_SCHEDULE_LIST_CHANGED fires on create/rename/delete so the per-zone
+# assignment selects re-render their option list.
+SIGNAL_SHARED_SCHEDULE_CHANGED: Final = f"{DOMAIN}_shared_schedule_changed"
+SIGNAL_SHARED_SCHEDULE_LIST_CHANGED: Final = f"{DOMAIN}_shared_schedule_list_changed"
