@@ -450,6 +450,25 @@ def test_plan_defers_at_exact_high_edge_without_cool_slope() -> None:
     assert result == predictor_decision
 
 
+def test_plan_heats_far_below_band_when_heat_slope_rejected() -> None:
+    """v0.15.0: when the heat slope was sign-rejected (None) and the room is
+    well below the band, MPC must defer to the predictor (which heats) rather
+    than idle. This is the gym bug: a garbage *negative* heat-slope estimate let
+    MPC's forward sim believe "heating cools the room" and pick idle while the
+    room sat ~5 °C under the rising band. The predictor produces None for that
+    slope (see test_predictor), and here `is_ready` stays True via idle +
+    recovery_cool, so the bail-out (not the not-ready early return) fires.
+    """
+    predictor_decision = heat_decision(26.0)
+    result = plan(
+        _slopes(idle=0.05, recovery_heat=None, recovery_cool=-0.05),
+        _inputs(17.0, low=22.0, high=26.0),  # ~5 °C below the low edge
+        horizon_minutes=60,
+        predictor_decision=predictor_decision,
+    )
+    assert result == predictor_decision  # heat, not idle
+
+
 def test_plan_picks_idle_when_idle_stays_in_band_longer_than_heat_or_cool() -> None:
     """Synthetic scenario: room at midpoint, idle slope flat (full horizon in
     band), heat slope drives out the top, cool slope drives out the bottom.
