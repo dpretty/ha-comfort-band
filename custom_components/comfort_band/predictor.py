@@ -113,9 +113,12 @@ class ThermalSlopes:
         throughout the window — the slope estimate is unreliable
         regardless of sample count. Distinguishes "stable room" from
         "stable-looking sensor that's masking real drift".
-      - ``method_*``: which slope-estimator produced each value
-        (currently always "wls" or "none"; reserved string field for
-        future fallback methods without changing the attribute shape).
+      - ``method_*``: which slope-estimator produced each value —
+        "wls" (used as-is), "none" (too few samples / singular fit), or
+        (recovery slopes only) "rejected" when the WLS fit had a
+        physically-impossible sign and was discarded (see
+        ``_reject_wrong_sign``). Reserved string field so future
+        fallback methods can be added without changing the shape.
 
     Defaults on the new fields preserve backward compatibility with any
     tests that construct ThermalSlopes positionally (additions at the end
@@ -375,6 +378,33 @@ def _segment_slope(segment: list[Sample], *, now: datetime) -> tuple[float | Non
     return wls, "wls"
 
 
+def _reject_wrong_sign(
+    slope: float | None, method: str, *, want_positive: bool
+) -> tuple[float | None, str]:
+    """Discard a recovery slope whose sign is physically impossible.
+
+    A *heating* segment cannot have a non-positive slope and a *cooling*
+    segment cannot have a non-negative one — over a real segment, running the
+    HVAC moves the room in the commanded direction. A wrong-sign estimate is
+    sensor/segment noise (typically a handful of samples scraped from a few
+    sub-minute action blips). Left in place it is actively harmful: MPC's
+    forward simulation would believe "heating cools the room" and pick *idle*
+    while the room sits below band, stranding it (and starving the estimator of
+    the clean heat samples that would fix the slope — a self-reinforcing loop).
+
+    Discarding it (→ ``None``, method ``"rejected"``) routes the decision to the
+    reactive predictor / MPC bail-out, which heats when below band. Idle drift is
+    legitimately ±, so this guard applies only to the recovery slopes.
+    """
+    if slope is None:
+        return None, method
+    if want_positive and slope <= 0:
+        return None, "rejected"
+    if not want_positive and slope >= 0:
+        return None, "rejected"
+    return slope, method
+
+
 def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
     """Compute per-action slopes over the most recent contiguous run of each
     action class, plus buffer bookkeeping for the sensor's attributes.
@@ -390,8 +420,16 @@ def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
         window_min = (samples[-1].t - samples[0].t).total_seconds() / 60.0
 
     idle_slope, idle_method = _segment_slope(idle_run, now=now)
-    heat_slope, heat_method = _segment_slope(heat_run, now=now)
-    cool_slope, cool_method = _segment_slope(cool_run, now=now)
+    # Recovery slopes are sign-guarded: a heating segment that fits a
+    # non-positive slope (or a cooling segment a non-negative one) is noise, and
+    # using it makes MPC believe the HVAC pushes the room the wrong way -> it
+    # idles below band. Idle drift keeps both signs.
+    heat_slope, heat_method = _reject_wrong_sign(
+        *_segment_slope(heat_run, now=now), want_positive=True
+    )
+    cool_slope, cool_method = _reject_wrong_sign(
+        *_segment_slope(cool_run, now=now), want_positive=False
+    )
 
     return ThermalSlopes(
         idle=idle_slope,

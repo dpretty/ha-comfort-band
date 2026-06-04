@@ -155,6 +155,52 @@ def test_recovery_heat_slope_distinct_from_idle() -> None:
     assert slopes.recovery_heat * 60.0 == pytest.approx(2.5, abs=0.01)
     assert slopes.idle is None
     assert slopes.recovery_cool is None
+    assert slopes.method_recovery_heat == "wls"  # valid positive slope kept
+
+
+# ----- v0.15.0: recovery-slope sign guard -----
+
+
+def test_negative_heat_slope_is_rejected() -> None:
+    """A heating segment that fits a NEGATIVE slope (sensor/segment noise from a
+    few sub-minute blips) is discarded: the model must never believe heating
+    cools the room (which made MPC idle while below band — the gym bug)."""
+    samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=21.0, slope_per_h=-1.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.recovery_heat is None
+    assert slopes.method_recovery_heat == "rejected"
+    # The segment is still reported in the diagnostics (it existed; only the
+    # slope value was discarded) so the rejection is visible, not silent.
+    assert slopes.sample_count_recovery_heat == 10
+
+
+def test_positive_cool_slope_is_rejected() -> None:
+    """Symmetric guard: a cooling segment that fits a NON-negative slope is
+    discarded (cooling cannot warm the room)."""
+    samples = _samples_at(120, 10, action=ACTION_COOL, start_temp=25.0, slope_per_h=1.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.recovery_cool is None
+    assert slopes.method_recovery_cool == "rejected"
+    assert slopes.sample_count_recovery_cool == 10
+
+
+def test_valid_cool_slope_kept() -> None:
+    """A correctly-signed cooling slope (negative) is untouched."""
+    samples = _samples_at(120, 10, action=ACTION_COOL, start_temp=25.0, slope_per_h=-2.0)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.recovery_cool is not None
+    assert slopes.recovery_cool * 60.0 == pytest.approx(-2.0, abs=0.01)
+    assert slopes.method_recovery_cool == "wls"
+
+
+def test_idle_slope_keeps_both_signs() -> None:
+    """The guard applies only to recovery slopes; idle drift is legitimately ±
+    (a room can passively warm or cool), so a negative idle slope is kept."""
+    samples = _samples_at(120, 10, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-1.5)
+    slopes = estimate_slopes(samples, now=samples[-1].t)
+    assert slopes.idle is not None
+    assert slopes.idle * 60.0 == pytest.approx(-1.5, abs=0.01)
+    assert slopes.method_idle == "wls"
 
 
 def test_segment_below_min_samples_yields_none() -> None:
@@ -433,8 +479,12 @@ def test_shutoff_falls_through_when_slope_shallow() -> None:
 
 def test_shutoff_falls_through_when_heat_slope_negative() -> None:
     # Pathological: action is heat but temp is dropping (e.g., HVAC not
-    # responding). The shutoff predicate requires `recovery_heat > epsilon`;
-    # a negative slope must fall through.
+    # responding). Invariant: a wrong-sign heat segment must never trigger
+    # shutoff anticipation. v0.15.0 enforces this upstream — estimate_slopes
+    # sign-rejects the negative fit (recovery_heat -> None), so shutoff can't
+    # fire and the decision falls through to hysteresis. (decide() also defends
+    # the `recovery_heat > epsilon` predicate directly; the shallow-positive
+    # path is covered by test_shutoff_falls_through_when_heat_slope_shallow.)
     samples = _samples_at(120, 10, action=ACTION_HEAT, start_temp=22.0, slope_per_h=-1.0)
     inputs = _inputs(19.5, current=ACTION_HEAT)
     decision = _decide_from_samples(
@@ -448,7 +498,9 @@ def test_shutoff_falls_through_when_heat_slope_negative() -> None:
 
 
 def test_shutoff_falls_through_when_cool_slope_positive() -> None:
-    # Symmetric: cool action but temp is rising. Must fall through.
+    # Symmetric: cool action but temp is rising. v0.15.0 sign-rejects the
+    # wrong-sign cool slope (recovery_cool -> None), so shutoff can't fire and
+    # the decision falls through to hysteresis.
     samples = _samples_at(120, 10, action=ACTION_COOL, start_temp=21.0, slope_per_h=+1.0)
     inputs = _inputs(24.0, current=ACTION_COOL)
     decision = _decide_from_samples(
