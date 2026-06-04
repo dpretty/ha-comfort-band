@@ -187,8 +187,9 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # many samples signals the sensor is reporting one quantized
             # value throughout the window (the slope estimate is then
             # unreliable, regardless of sample count). `method_*` records
-            # which estimator produced the slope; currently always "wls"
-            # or "none", reserved string for future fallback methods.
+            # which estimator produced the slope: "wls", "none", "cached"
+            # (idle only — the v0.12 persisted-slope fallback), or "rejected"
+            # (recovery only — v0.15 sign guard discarded a wrong-sign fit).
             "sample_count_idle": s.sample_count_idle,
             "sample_count_recovery_heat": s.sample_count_recovery_heat,
             "sample_count_recovery_cool": s.sample_count_recovery_cool,
