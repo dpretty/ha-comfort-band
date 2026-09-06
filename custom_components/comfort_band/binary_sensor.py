@@ -69,8 +69,10 @@ class RoomSensorUnavailableBinarySensor(ComfortBandZoneEntity, BinarySensorEntit
     controlling."
 
     Deliberately a first-class (non-diagnostic) `problem` sensor rather than an
-    attribute: `on` means "this room is no longer being controlled", which is
-    exactly the condition worth a notification. Pair it with a `for:` of a few
+    attribute: `on` means "this room has no reading to control from", which is
+    exactly the condition worth a notification. (A zone still in shadow mode
+    wasn't controlling either way -- the entity is just as true there, it simply
+    matters less, which is why only the log distinguishes them.) Pair it with a `for:` of a few
     minutes to ride out routine sensor blips:
 
         - trigger: state
