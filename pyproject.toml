@@ -16,6 +16,21 @@ exclude = ["tests/"]
 module = "homeassistant.*"
 ignore_missing_imports = true
 
+# The test-harness package ships no py.typed marker. Tests are excluded from the
+# CI mypy run, but this keeps an ad-hoc `mypy tests/...` quiet too.
+[[tool.mypy.overrides]]
+module = "pytest_homeassistant_custom_component.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+# Unknown ini keys are ignored silently, so without this a missing
+# pytest-timeout would leave `timeout` below quietly inert.
+addopts = "--strict-config"
+# Tests run under a frozen clock, so a coroutine waiting on another task can
+# never be rescued by `asyncio.wait_for` -- its timeout is measured on the same
+# stopped clock. A wall-clock cap turns any such deadlock into a failure rather
+# than a hung CI job. Per test, and generous -- the slowest here is well under
+# a second.
+timeout = 90
