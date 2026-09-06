@@ -3166,6 +3166,49 @@ async def test_no_warning_while_home_assistant_is_still_starting(
     await coordinator.async_unload()
 
 
+async def test_a_backwards_clock_step_does_not_silence_the_log(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A clock correction must not starve the throttle.
+
+    An RTC-less Pi boots with the wrong time and corrects against NTP shortly
+    after -- and the correlated case is the one that matters, since the power cut
+    that rebooted it may well be what took the sensors out. A negative elapsed
+    time satisfies a bare `< interval`, so the log would stay silent until the
+    clock caught up.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # One outage, logged, which stamps the budget.
+    hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # The clock jumps backwards past the stamp.
+    freezer.move_to("2026-07-30 10:00:00+00:00")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("is unavailable" in r.message for r in caplog.records) == 1, [
+        r.message for r in caplog.records
+    ]
+    await coordinator.async_unload()
+
+
 async def test_a_shadow_mode_zone_does_not_warn(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],

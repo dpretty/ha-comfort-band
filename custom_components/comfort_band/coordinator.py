@@ -396,9 +396,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # anything -- routine for MQTT, Zigbee2MQTT, Matter/Thread and
             # ESPHome, which is exactly the hardware the incident involved.
             # Warning then would be a guaranteed false positive on every
-            # restart. The edge is deliberately left un-recorded rather than
-            # swallowed, so a sensor that is genuinely dead is still announced
-            # once the system is up.
+            # restart. The edge is left un-recorded rather than swallowed, so a
+            # sensor that is genuinely dead is announced by the first refresh
+            # after startup -- which for a zone with no schedule may not come,
+            # since nothing else wakes this coordinator and a dead sensor emits
+            # nothing. The binary sensor is `on` from the first refresh either
+            # way.
             and self.hass.state is CoreState.running
             and self._may_log_sensor_edge(sensor_available)
         ):
@@ -744,13 +747,25 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         zone with no schedule never comes, because nothing else wakes the
         coordinator. The record then ends on the wrong word: either "reporting
         again" while the room has been dark for hours, or nothing at all for a
-        real outage. Two timestamps double the worst-case flapping volume (24
-        lines an hour rather than 12) and remain two orders of magnitude below
-        the unlatched case this throttle exists for.
+        real outage. Two budgets double the worst-case flapping volume -- 24
+        lines an hour rather than 12, against roughly 350 unlatched.
+
+        This narrows the problem rather than eliminating it: two *drops* still
+        share a budget, so a link that blips and then dies inside one window
+        leaves the record's last word as "reporting again". A throttled edge is
+        re-offered on the next refresh, but a dead sensor emits no state changes
+        and a zone with no schedule has no timer, so for that zone there may be
+        no next refresh. The binary sensor is `on` throughout regardless, which
+        is the surface this release is actually about; closing the log gap needs
+        a wake-up of its own and is not worth the machinery here.
         """
         now = dt_util.utcnow()
         last = self._sensor_edge_logged_at[available]
-        if last is not None and (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+        # `0 <=` because a backwards clock step -- an RTC-less Pi correcting
+        # against NTP after boot -- makes the elapsed time negative, which would
+        # otherwise satisfy the throttle and silence the log until the clock
+        # caught up.
+        if last is not None and 0 <= (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
             return False
         self._sensor_edge_logged_at[available] = now
         return True

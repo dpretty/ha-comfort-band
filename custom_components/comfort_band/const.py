@@ -63,8 +63,9 @@ CLIMATE_ECHO_WINDOW_S: Final = 30
 
 # How often a zone may log that its room sensor came or went. A sensor on a
 # weak mesh or a dying battery crosses that boundary hundreds of times an hour,
-# and this is a warning, so it needs a floor. Five minutes makes a flapping
-# sensor cheap while still reporting a real dropout promptly.
+# so it needs a floor. Applied per direction, so the ceiling is two lines per
+# interval: five minutes makes a flapping sensor cheap while still reporting a
+# real dropout promptly.
 SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
 
 # Slope estimator: minimum samples per segment before WLS produces a slope;
