@@ -33,6 +33,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "sensor.office_mpc_action",  # v0.8
     "binary_sensor.office_override_active",
     "binary_sensor.office_mpc_ready",  # v0.8
+    "binary_sensor.office_room_sensor_unavailable",  # v0.16
     "button.office_cancel_override",
     "switch.office_enabled",
     "switch.office_learning_enabled",

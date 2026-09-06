@@ -51,6 +51,9 @@
       },
       "mpc_ready": {
         "name": "MPC ready"
+      },
+      "room_sensor_unavailable": {
+        "name": "Room sensor unavailable"
       }
     },
     "button": {
