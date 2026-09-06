@@ -61,6 +61,13 @@ SAMPLE_PERSIST_INTERVAL_S: Final = 300
 # to acknowledge the second one -- the listener needs to absorb both echoes.
 CLIMATE_ECHO_WINDOW_S: Final = 30
 
+# How often a zone may log that its room sensor came or went. A sensor on a
+# weak mesh or a dying battery crosses that boundary hundreds of times an hour,
+# so it needs a floor. Applied per direction, so the ceiling is two lines per
+# interval: five minutes makes a flapping sensor cheap while still reporting a
+# real dropout promptly.
+SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
+
 # Slope estimator: minimum samples per segment before WLS produces a slope;
 # exponential recency weight time constant; epsilon below which a slope is
 # treated as "flat" (predictor falls through to hysteresis).

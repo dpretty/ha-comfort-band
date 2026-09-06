@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import (
     CALLBACK_TYPE,
+    CoreState,
     Event,
     EventStateChangedData,
     HomeAssistant,
@@ -44,6 +45,7 @@ from .const import (
     MPC_SIMULATION_STEP_MINUTES,
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
     SAMPLE_PERSIST_INTERVAL_S,
+    SENSOR_EDGE_LOG_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
     SIGNAL_SHARED_SCHEDULE_LIST_CHANGED,
 )
@@ -173,6 +175,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # flushes to keep the slope estimator honest under mixed control.
         # `_last_sample_persist_at` throttles disk writes -- see _append_sample.
         self._samples_cache: list[Sample] = []
+        # What the availability log last said, tracked apart from reality so a
+        # throttled edge is re-offered on the next refresh instead of dropped.
+        self._sensor_logged_available = True
+        self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
         self._last_command_state: dict[str, Any] | None = None
         self._last_command_at: datetime | None = None
         self._unsub_climate: CALLBACK_TYPE | None = None
@@ -228,6 +234,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # repeatedly" contract. (HA normally constructs a new coordinator
         # on reload, so this is future-proofing more than current need.)
         self._samples_cache = []
+        self._sensor_logged_available = True
+        self._sensor_edge_logged_at = {True: None, False: None}
         self._last_command_state = None
         self._last_command_at = None
         self._last_sample_persist_at = None
@@ -371,6 +379,52 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         active_profile = self._store.active_profile
 
         room, sensor_available = self._read_room_temp()
+        # Log the edge, not the state. The incident that prompted this had the
+        # zone sitting *idle* when its sensor died, so nothing was commanded and
+        # nothing was logged -- the room simply drifted for hours. This is the
+        # line the binary sensor's docs point at.
+        #
+        # Rate-limited: a sensor flapping on a weak mesh crosses this boundary
+        # hundreds of times an hour. The comparison is against what was last
+        # *logged* rather than against reality, so a throttled edge is re-offered
+        # on the next refresh instead of being dropped -- a blip that used up the
+        # budget must not be able to hide the outage that follows it.
+        if (
+            sensor_available != self._sensor_logged_available
+            # Integrations load in parallel, so during startup this zone can
+            # easily refresh before the sensor's own integration has published
+            # anything -- routine for MQTT, Zigbee2MQTT, Matter/Thread and
+            # ESPHome, which is exactly the hardware the incident involved.
+            # Warning then would be a guaranteed false positive on every
+            # restart. The edge is left un-recorded rather than swallowed, so a
+            # sensor that is genuinely dead is announced by the first refresh
+            # after startup -- which for a zone with no schedule may not come,
+            # since nothing else wakes this coordinator and a dead sensor emits
+            # nothing. The binary sensor is `on` from the first refresh either
+            # way.
+            and self.hass.state is CoreState.running
+            and self._may_log_sensor_edge(sensor_available)
+        ):
+            if sensor_available:
+                LOGGER.info(
+                    "%s: room sensor %s is reporting again", self.zone_name, self.temp_entity_id
+                )
+            elif zone["enabled"]:
+                LOGGER.warning(
+                    "%s: room sensor %s is unavailable -- this zone cannot control "
+                    "until it reports again",
+                    self.zone_name,
+                    self.temp_entity_id,
+                )
+            else:
+                # Shadow mode: the zone commands nothing either way, so this is
+                # worth recording but not worth waking anybody for.
+                LOGGER.info(
+                    "%s: room sensor %s is unavailable (zone is in shadow mode)",
+                    self.zone_name,
+                    self.temp_entity_id,
+                )
+            self._sensor_logged_available = sensor_available
         humidity = self._read_humidity()
         # `apparent_temp.compute(T, None) → T`, so when humidity is
         # unavailable the apparent value silently equals the room reading.
@@ -684,11 +738,44 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             persisted_idle_slope_at=None,
         )
 
+    def _may_log_sensor_edge(self, available: bool) -> bool:
+        """Throttle sensor-availability logging to one line per direction.
+
+        Per direction, not one shared budget: with a single timestamp a recovery
+        line spends the following outage line's allowance, and the pending edge
+        is only re-offered on the next refresh -- which for a dead sensor on a
+        zone with no schedule never comes, because nothing else wakes the
+        coordinator. The record then ends on the wrong word: either "reporting
+        again" while the room has been dark for hours, or nothing at all for a
+        real outage. Two budgets double the worst-case flapping volume -- 24
+        lines an hour rather than 12, against roughly 350 unlatched.
+
+        This narrows the problem rather than eliminating it: two *drops* still
+        share a budget, so a link that blips and then dies inside one window
+        leaves the record's last word as "reporting again". A throttled edge is
+        re-offered on the next refresh, but a dead sensor emits no state changes
+        and a zone with no schedule has no timer, so for that zone there may be
+        no next refresh. The binary sensor is `on` throughout regardless, which
+        is the surface this release is actually about; closing the log gap needs
+        a wake-up of its own and is not worth the machinery here.
+        """
+        now = dt_util.utcnow()
+        last = self._sensor_edge_logged_at[available]
+        # `0 <=` because a backwards clock step -- an RTC-less Pi correcting
+        # against NTP after boot -- makes the elapsed time negative, which would
+        # otherwise satisfy the throttle and silence the log until the clock
+        # caught up.
+        if last is not None and 0 <= (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+            return False
+        self._sensor_edge_logged_at[available] = now
+        return True
+
     def _read_numeric_sensor(self, entity_id: str | None) -> float | None:
         """Shared read path for any external numeric sensor: returns the
-        float value, or None when the entity is missing, unavailable, or
-        non-numeric. Used by both the room-temp and humidity readers (and
-        any future numeric sensor input — predictive control / IAQ / etc.).
+        float value, or None when the entity is missing, unavailable,
+        non-numeric, or non-finite (NaN / ±inf). Used by both the room-temp
+        and humidity readers (and any future numeric sensor input --
+        predictive control / IAQ / etc.).
 
         Reads `state.state` only — not entity attributes. The v0.8 climate-
         attribute readers (`_target_temp_step`, `_current_climate_fan_mode`)
@@ -701,9 +788,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, "", None):
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
         except (TypeError, ValueError):
             return None
+        # `float("nan")` parses happily, and every comparison against NaN is
+        # False -- so hysteresis would read the room as below band and heat it
+        # indefinitely, while `sensor_available` stayed True so nothing alerted.
+        # A room we cannot compare is a room we cannot control, and this entity
+        # exists to say so.
+        return value if math.isfinite(value) else None
 
     def _read_room_temp(self) -> tuple[float | None, bool]:
         # `sensor_available` is True iff a numeric reading was produced.
