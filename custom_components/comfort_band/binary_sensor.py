@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
@@ -59,6 +59,59 @@ class MpcReadyBinarySensor(ComfortBandZoneEntity, BinarySensorEntity):
         return self.coordinator.data.mpc_ready
 
 
+class RoomSensorUnavailableBinarySensor(ComfortBandZoneEntity, BinarySensorEntity):
+    """True while the zone's configured temperature sensor isn't reporting.
+
+    A zone with no room reading cannot control: the decider returns `unknown`
+    and the room is left to drift. On its own that is silent -- the failure that
+    prompted this entity went unnoticed for hours while a bedroom sat several
+    degrees below its band, because nothing surfaced "this zone has stopped
+    controlling."
+
+    Deliberately a first-class (non-diagnostic) `problem` sensor rather than an
+    attribute: `on` means "this room is no longer being controlled", which is
+    exactly the condition worth a notification. Pair it with a `for:` of a few
+    minutes to ride out routine sensor blips:
+
+        - trigger: state
+          entity_id: binary_sensor.mbr_room_sensor_unavailable
+          to: "on"
+          for: "00:05:00"
+
+    Tracks the *configured external* sensor specifically, so it stays a truthful
+    health signal for the device that actually needs attention.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "room_sensor_unavailable")
+
+    @property
+    def available(self) -> bool:
+        """Stay available as long as there is any state worth reporting.
+
+        `CoordinatorEntity` ties availability to the last refresh succeeding, so
+        a failed refresh -- a read-only SD card, say -- would turn this entity
+        `unavailable` rather than `on`, and an automation triggering `to: "on"`
+        would silently never fire at exactly the moment the zone stopped
+        controlling.
+
+        Only in the alarming direction, though: `data` is refreshed only on
+        success, so if refreshes start failing while the sensor is still healthy
+        the snapshot would keep asserting `off` -- confidently claiming "no
+        problem" about a room that has since gone dark. A stale `on` is worth
+        keeping; a stale `off` is worse than `unavailable`.
+        """
+        return self.coordinator.data is not None and (
+            self.coordinator.last_update_success or not self.coordinator.data.sensor_available
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return not self.coordinator.data.sensor_available
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -67,5 +120,6 @@ async def async_setup_entry(
         [
             OverrideActiveBinarySensor(coordinator),
             MpcReadyBinarySensor(coordinator),
+            RoomSensorUnavailableBinarySensor(coordinator),
         ]
     )

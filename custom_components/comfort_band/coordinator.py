@@ -44,6 +44,7 @@ from .const import (
     MPC_SIMULATION_STEP_MINUTES,
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
     SAMPLE_PERSIST_INTERVAL_S,
+    SENSOR_EDGE_LOG_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
     SIGNAL_SHARED_SCHEDULE_LIST_CHANGED,
 )
@@ -173,6 +174,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # flushes to keep the slope estimator honest under mixed control.
         # `_last_sample_persist_at` throttles disk writes -- see _append_sample.
         self._samples_cache: list[Sample] = []
+        # What the availability log last said, tracked apart from reality so a
+        # throttled edge is re-offered on the next refresh instead of dropped.
+        self._sensor_logged_available = True
+        self._sensor_edge_logged_at: datetime | None = None
         self._last_command_state: dict[str, Any] | None = None
         self._last_command_at: datetime | None = None
         self._unsub_climate: CALLBACK_TYPE | None = None
@@ -371,6 +376,29 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         active_profile = self._store.active_profile
 
         room, sensor_available = self._read_room_temp()
+        # Log the edge, not the state. The incident that prompted this had the
+        # zone sitting *idle* when its sensor died, so nothing was commanded and
+        # nothing was logged -- the room simply drifted for hours. This is the
+        # line the binary sensor's docs point at.
+        #
+        # Rate-limited: a sensor flapping on a weak mesh crosses this boundary
+        # hundreds of times an hour. The comparison is against what was last
+        # *logged* rather than against reality, so a throttled edge is re-offered
+        # on the next refresh instead of being dropped -- a blip that used up the
+        # budget must not be able to hide the outage that follows it.
+        if sensor_available != self._sensor_logged_available and self._may_log_sensor_edge():
+            if sensor_available:
+                LOGGER.info(
+                    "%s: room sensor %s is reporting again", self.zone_name, self.temp_entity_id
+                )
+            else:
+                LOGGER.warning(
+                    "%s: room sensor %s is unavailable -- this zone cannot control "
+                    "until it reports again",
+                    self.zone_name,
+                    self.temp_entity_id,
+                )
+            self._sensor_logged_available = sensor_available
         humidity = self._read_humidity()
         # `apparent_temp.compute(T, None) → T`, so when humidity is
         # unavailable the apparent value silently equals the room reading.
@@ -684,6 +712,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             persisted_idle_slope_at=None,
         )
 
+    def _may_log_sensor_edge(self) -> bool:
+        """Throttle sensor-availability logging to one edge per interval."""
+        now = dt_util.utcnow()
+        last = self._sensor_edge_logged_at
+        if last is not None and (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+            return False
+        self._sensor_edge_logged_at = now
+        return True
+
     def _read_numeric_sensor(self, entity_id: str | None) -> float | None:
         """Shared read path for any external numeric sensor: returns the
         float value, or None when the entity is missing, unavailable, or
@@ -701,9 +738,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, "", None):
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
         except (TypeError, ValueError):
             return None
+        # `float("nan")` parses happily, and every comparison against NaN is
+        # False -- so hysteresis would read the room as below band and heat it
+        # indefinitely, while `sensor_available` stayed True so nothing alerted.
+        # A room we cannot compare is a room we cannot control, and this entity
+        # exists to say so.
+        return value if math.isfinite(value) else None
 
     def _read_room_temp(self) -> tuple[float | None, bool]:
         # `sensor_available` is True iff a numeric reading was produced.

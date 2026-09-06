@@ -7,6 +7,7 @@ pytest-freezer `freezer` fixture for time travel.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -2999,4 +3000,145 @@ async def test_profile_rename_keeps_assigned_zone_on_shared_band(
     state = await coordinator._async_update_data()
     # Still the shared band (now keyed "casa"), not the manual fallback.
     assert (state.sched_low, state.sched_high) == (21.0, 24.0)
+    await coordinator.async_unload()
+
+
+# ---------------------------------------------------------------------------
+# v0.16.0: room-sensor availability logging.
+# ---------------------------------------------------------------------------
+
+
+async def test_losing_the_sensor_is_logged_even_when_idle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The incident that prompted v0.16.0 had the zone idle when its sensor died.
+
+    Nothing was commanded, so the control path stayed quiet and the room drifted
+    for hours with nothing in the log. The edge is logged once -- not on every
+    refresh -- and again when the sensor returns.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+        for _ in range(3):
+            freezer.tick(timedelta(minutes=1))
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+    assert sum("is unavailable" in r.message for r in caplog.records) == 1
+    await coordinator.async_unload()
+
+
+async def test_flapping_sensor_does_not_flood_the_log(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A weak-mesh sensor crosses this boundary hundreds of times an hour.
+
+    Unlatched, that measured 8,352 lines a day. This is a warning, so it needs a
+    floor.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(30):
+            freezer.tick(timedelta(seconds=30))
+            hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+            freezer.tick(timedelta(seconds=30))
+            hass.states.async_set(TEMP_ENTITY, "20.0", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+    losses = sum("is unavailable" in r.message for r in caplog.records)
+    assert 0 < losses <= 4, losses
+    await coordinator.async_unload()
+
+
+async def test_a_throttled_edge_resyncs_on_the_next_report(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The throttle tracks what was last *logged*, so it re-syncs on its own.
+
+    A blip can use up the budget and leave the log's last word out of date. That
+    self-corrects, because the comparison is against the last logged state --
+    the alternative, comparing against reality, would drop the correction and
+    leave the log asserting the wrong thing indefinitely.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    with caplog.at_level(logging.INFO):
+        # Blip: the drop is logged, the recovery 20 s later is throttled away.
+        hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        freezer.tick(timedelta(seconds=20))
+        hass.states.async_set(TEMP_ENTITY, "21.0", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert not any("reporting again" in r.message for r in caplog.records)
+
+        # The next ordinary report past the window corrects the record...
+        freezer.tick(timedelta(seconds=310))
+        hass.states.async_set(TEMP_ENTITY, "21.1", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert sum("reporting again" in r.message for r in caplog.records) == 1
+
+        # ...so a later genuine outage is still announced.
+        caplog.clear()
+        freezer.tick(timedelta(seconds=310))
+        hass.states.async_set(TEMP_ENTITY, "unavailable", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("is unavailable" in r.message for r in caplog.records) == 1, [
+        r.message for r in caplog.records
+    ]
+    await coordinator.async_unload()
+
+
+async def test_a_nan_reading_counts_as_no_reading(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`nan` parses as a float but can't be compared, so it isn't a reading.
+
+    Every comparison against NaN is False, so hysteresis would read the room as
+    below band and heat it indefinitely, while `sensor_available` stayed True so
+    nothing alerted.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    for value in ("nan", "NaN", "inf", "-inf"):
+        hass.states.async_set(TEMP_ENTITY, value, {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.data.sensor_available is False, value
     await coordinator.async_unload()

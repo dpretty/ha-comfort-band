@@ -145,3 +145,167 @@ async def test_use_apparent_temperature_switch_defaults_off_and_toggles(
     assert hass.states.get("switch.office_use_apparent_temperature").state == "on"
     store = hass.data[DOMAIN].store
     assert store.get_zone("office")["use_apparent_temperature"] is True
+
+
+async def test_room_sensor_unavailable_binary_sensor(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """v0.16.0: a zone that has stopped controlling must say so somewhere alertable.
+
+    The incident this came from went unnoticed for hours while a bedroom sat
+    below its band, because a dead sensor produced no user-visible signal at all.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("binary_sensor.office_room_sensor_unavailable")
+    assert state is not None
+    assert state.state == "off"
+    # `problem` so it reads as an alertable fault, not a diagnostic curiosity.
+    assert state.attributes.get("device_class") == "problem"
+    # Deliberately first-class: a diagnostic entity is hidden by default, and
+    # this is the one signal saying the room is no longer being controlled.
+    # Checked on the registry entry -- `entity_category` is a registry property,
+    # not a state attribute, so asserting on `state.attributes` proves nothing.
+    from homeassistant.helpers import entity_registry as er
+
+    reg_entry = er.async_get(hass).async_get("binary_sensor.office_room_sensor_unavailable")
+    assert reg_entry is not None and reg_entry.entity_category is None
+
+    # Sensor drops out -> problem asserted. Room-temp changes are debounced 2 s.
+    hass.states.async_set(ZONE_TEMP_ENTITY, "unavailable", {})
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=5))
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "on"
+
+    # ...and clears when it comes back.
+    hass.states.async_set(ZONE_TEMP_ENTITY, "20.5", {})
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "off"
+
+
+async def test_a_nan_reading_raises_the_alert(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """`nan` parses as a float but can't be compared, so it isn't a reading.
+
+    Every comparison against NaN is False, so hysteresis reads the room as below
+    band and heats it indefinitely -- while `sensor_available` stayed True, so
+    nothing alerted. It is the one dropout shape this entity would otherwise
+    miss entirely.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "off"
+
+    hass.states.async_set(ZONE_TEMP_ENTITY, "nan", {})
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=5))
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "on"
+
+
+async def test_alert_stays_on_when_a_refresh_fails(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """A failed refresh must not hide an alarm that is already raised.
+
+    The entity is a `CoordinatorEntity`, so availability follows the last
+    refresh succeeding -- a read-only card would turn it `unavailable` rather
+    than `on`, and an automation triggering `to: "on"` would then never fire, at
+    exactly the moment the zone has stopped controlling.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    import custom_components.comfort_band.coordinator as coord_mod
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.states.async_set(ZONE_TEMP_ENTITY, "unavailable", {})
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=5))
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "on"
+
+    real = coord_mod.predictor.estimate_slopes
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("read-only file system")
+
+    coord_mod.predictor.estimate_slopes = _boom
+    try:
+        coordinator = next(iter(hass.data[DOMAIN].zone_coordinators.values()))
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.last_update_success is False
+        # The alarm must survive, not become `unavailable`.
+        assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "on"
+    finally:
+        coord_mod.predictor.estimate_slopes = real
+
+
+async def test_alert_does_not_claim_health_from_a_stale_snapshot(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """A stale `off` is worse than `unavailable`.
+
+    `data` is only replaced on a successful refresh, so if refreshes start
+    failing while the sensor is still healthy, the snapshot keeps saying
+    `sensor_available=True`. Reporting that as `off` would assert "no problem"
+    about a room that has since gone dark.
+    """
+    import custom_components.comfort_band.coordinator as coord_mod
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state == "off"
+
+    real = coord_mod.predictor.estimate_slopes
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("read-only file system")
+
+    coord_mod.predictor.estimate_slopes = _boom
+    try:
+        coordinator = next(iter(hass.data[DOMAIN].zone_coordinators.values()))
+        # Refreshes break first, while the sensor still looks fine...
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        # ...and only then does the sensor actually die.
+        hass.states.async_set(ZONE_TEMP_ENTITY, "unavailable", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        assert coordinator.last_update_success is False
+        assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state != "off"
+    finally:
+        coord_mod.predictor.estimate_slopes = real
