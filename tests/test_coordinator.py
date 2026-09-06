@@ -3066,24 +3066,33 @@ async def test_flapping_sensor_does_not_flood_the_log(
             await coordinator.async_refresh()
             await hass.async_block_till_done()
 
+    # Two-sided on purpose. An upper bound alone passes a throttle that logs
+    # once and then never again -- which would silence a permanent outage that
+    # followed the flapping. Over 30 minutes at one line per 5 minutes per
+    # direction, expect roughly six.
     losses = sum("is unavailable" in r.message for r in caplog.records)
-    assert 0 < losses <= 4, losses
+    assert 4 <= losses <= 8, losses
     await coordinator.async_unload()
 
 
-async def test_a_throttled_edge_resyncs_on_the_next_report(
+async def test_each_direction_gets_its_own_log_budget(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The throttle tracks what was last *logged*, so it re-syncs on its own.
+    """A recovery line must not spend the outage line's allowance.
 
-    A blip can use up the budget and leave the log's last word out of date. That
-    self-corrects, because the comparison is against the last logged state --
-    the alternative, comparing against reality, would drop the correction and
-    leave the log asserting the wrong thing indefinitely.
+    With one shared timestamp, a drop followed shortly by a recovery left the
+    recovery throttled away -- and the pending edge is only re-offered on the
+    next refresh, which for this coordinator may never come: a zone with no
+    schedule has no timer, and a settled sensor emits no further state changes.
+    The record then ends on "unavailable" for a sensor that is fine, and the
+    mirror case ends on "reporting again" for a room that has gone dark.
+
+    Short drop-then-recover is the ordinary shape of a weak mesh link, so it is
+    the case the throttle has to get right rather than the exception.
     """
     freezer.move_to("2026-07-30 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
@@ -3091,34 +3100,107 @@ async def test_a_throttled_edge_resyncs_on_the_next_report(
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 
+    caplog.clear()
     with caplog.at_level(logging.INFO):
-        # Blip: the drop is logged, the recovery 20 s later is throttled away.
         hass.states.async_set(TEMP_ENTITY, "unavailable", {})
         await coordinator.async_refresh()
         await hass.async_block_till_done()
+        # Well inside the throttle window, so a shared budget would swallow this.
         freezer.tick(timedelta(seconds=20))
         hass.states.async_set(TEMP_ENTITY, "21.0", {})
         await coordinator.async_refresh()
         await hass.async_block_till_done()
-        assert not any("reporting again" in r.message for r in caplog.records)
 
-        # The next ordinary report past the window corrects the record...
-        freezer.tick(timedelta(seconds=310))
-        hass.states.async_set(TEMP_ENTITY, "21.1", {})
-        await coordinator.async_refresh()
-        await hass.async_block_till_done()
-        assert sum("reporting again" in r.message for r in caplog.records) == 1
+    assert sum("is unavailable" in r.message for r in caplog.records) == 1
+    assert sum("reporting again" in r.message for r in caplog.records) == 1, [
+        r.message for r in caplog.records
+    ]
+    await coordinator.async_unload()
 
-        # ...so a later genuine outage is still announced.
+
+async def test_no_warning_while_home_assistant_is_still_starting(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Don't cry wolf while the sensor's own integration is still loading.
+
+    Integrations load in parallel, so this zone can easily refresh before the
+    sensor has published anything -- routine for MQTT, Zigbee2MQTT,
+    Matter/Thread and ESPHome, which is exactly the hardware the incident behind
+    this release involved. Warning then is a guaranteed false positive on every
+    restart, on the one channel the release is about.
+
+    The edge is left un-recorded rather than swallowed, so a sensor that really
+    is dead is still announced once the system is up.
+    """
+    from homeassistant.core import CoreState
+
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    original = hass.state
+    hass.set_state(CoreState.starting)
+    caplog.clear()
+    try:
+        with caplog.at_level(logging.INFO):
+            # The sensor's integration hasn't published yet.
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+        assert not any("is unavailable" in r.message for r in caplog.records), [
+            r.message for r in caplog.records
+        ]
+
+        # Once HA is up and the sensor is still missing, it is announced.
+        hass.set_state(CoreState.running)
         caplog.clear()
-        freezer.tick(timedelta(seconds=310))
+        with caplog.at_level(logging.INFO):
+            freezer.tick(timedelta(minutes=1))
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+        assert sum("is unavailable" in r.message for r in caplog.records) == 1
+    finally:
+        hass.set_state(original)
+    await coordinator.async_unload()
+
+
+async def test_a_shadow_mode_zone_does_not_warn(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zone that commands nothing hasn't stopped controlling.
+
+    Zones ship in shadow mode, so on a fresh multi-zone install every one of
+    them is disabled -- warning that each "cannot control" on a mesh hiccup
+    would be noise about control that was never happening. Still recorded, just
+    not at warning level; the binary sensor is unaffected either way.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert store.get_zone("office")["enabled"] is False
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
         hass.states.async_set(TEMP_ENTITY, "unavailable", {})
         await coordinator.async_refresh()
         await hass.async_block_till_done()
 
-    assert sum("is unavailable" in r.message for r in caplog.records) == 1, [
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), [
         r.message for r in caplog.records
     ]
+    assert sum("shadow mode" in r.message for r in caplog.records) == 1
+    assert coordinator.data.sensor_available is False
     await coordinator.async_unload()
 
 
