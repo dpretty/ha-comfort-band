@@ -923,10 +923,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _climate_fan_modes(self) -> list[str]:
         """The climate entity's supported `fan_modes`, as strings.
 
-        Returns [] when the entity is missing/unavailable, exposes no
-        `fan_modes`, or the attribute isn't a list — so the fan-boost command
-        and the fan-mode selects fail closed (no command / unavailable select)
-        on a climate that doesn't support fan control. v0.13.0.
+        Returns [] when the entity is missing, exposes no `fan_modes`, or the
+        attribute isn't a list — so the fan-boost command and the fan-mode
+        selects fail closed (no command / unavailable select) on a climate that
+        doesn't support fan control. v0.13.0.
+
+        Not [] merely because the entity is unavailable: `fan_modes` is a
+        *capability* attribute, and Home Assistant keeps those published while
+        dropping the state attributes (`helpers/entity.py`). An unavailable unit
+        therefore still advertises its fan modes, and the command that follows
+        is dropped at dispatch rather than here.
         """
         state = self.hass.states.get(self.climate_entity_id)
         if state is None:
@@ -1269,14 +1275,20 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # raise here escapes into the fire-and-forget apply task, which is the
         # pre-existing behaviour and not good -- there is no log of our own, and
         # because nothing is committed the same-mode gate never arms, so the
-        # zone re-enters on every refresh for the length of the fault. It is
-        # left that way on purpose: guarding it was attempted here and the
-        # attempt failed four review rounds running, because "the call raised"
-        # and "the unit never got it" are not the same statement and the
-        # difference is not answerable from inside the `except`. Both readings
-        # were tried and each was measured flushing the learned model on
-        # ordinary hardware. It wants its own change, with the two round-12
-        # findings as its starting point:
+        # zone re-enters on every refresh for the length of the fault. Worse,
+        # the echo-window stamp written just above is not rolled back on that
+        # path -- and since it re-enters every refresh, the window never closes
+        # for the length of the fault, so a wall edit made during it is absorbed
+        # as an echo rather than compared. (The dropped-command path below rolls
+        # back for exactly this reason; the asymmetry is the missing guard, not
+        # a judgement.) It is left that way on purpose. Guarding it was attempted here and taken
+        # out again, because "the call raised" and "the unit never got it" are
+        # not the same statement and the difference is not answerable from
+        # inside the `except`. Both readings were tried and each was measured
+        # flushing the learned model on ordinary hardware: assuming delivery
+        # holds the echo window open and swallows wall edits, assuming
+        # non-delivery makes the unit's own late echo look like one. It wants
+        # its own change, and these are the two findings to start from:
         #
         #   * whatever is recorded on the raise must *narrow* the commanded
         #     state rather than replace it, or a previous successful
@@ -1582,7 +1594,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         bounded on both ends. The caller moves the baseline on for every
         observation this accepts, so the two collapse to one as soon as the unit
         agrees with us; and a detected edit clears the commanded side outright,
-        so a second edit is judged against the occupant's own state alone.
+        so a second edit is judged against the occupant's own state alone. The
+        first of those bounds is weaker than it sounds for a unit that coerces
+        the setpoint *permanently* -- it never agrees, so its accepted pair
+        stands until the next command or flush rather than for a lag window.
 
         What remains is a hand edit made during the lag window that lands on
         one of the two values in each field. Landing on both of ours is a change
