@@ -4089,14 +4089,27 @@ async def test_an_undelivered_command_leaves_nothing_to_be_trusted(
     assert coordinator._commanded_state is None
 
 
+@pytest.mark.parametrize(
+    ("raised", "needle"),
+    [
+        (HomeAssistantError("the unit will not take that fan mode"), "set_fan_mode"),
+        # Not a `HomeAssistantError`, so `_maybe_command_fan` doesn't catch it
+        # and the wrapper in `_maybe_apply_action` does. One fault, one budget,
+        # whichever site catches it -- so both sites need the throttle.
+        (TimeoutError("the cloud never answered"), "could not set its fan mode"),
+    ],
+    ids=["refused", "timed-out"],
+)
 async def test_a_fan_mode_a_unit_will_never_take_is_not_shouted_about(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
     caplog: pytest.LogCaptureFixture,
+    raised: Exception,
+    needle: str,
 ) -> None:
-    """The fan warning repeats hardest of the three, so it is throttled too.
+    """A fan mode a unit will never take can repeat forever, so it is throttled.
 
     `_maybe_command_fan` only skips the call when the unit already reports the
     mode we want, so a stored fan mode it advertises but will not accept is
@@ -4111,7 +4124,7 @@ async def test_a_fan_mode_a_unit_will_never_take_is_not_shouted_about(
     _register_climate_with_fan(hass, fan_modes=["low", "mid", "high"], fan_mode="mid")
 
     async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("the unit will not take that fan mode")
+        raise raised
 
     async def _accept(call: Any) -> None:
         climate_calls.append((call.service, dict(call.data)))
@@ -4128,7 +4141,7 @@ async def test_a_fan_mode_a_unit_will_never_take_is_not_shouted_about(
 
     # Two-sided: an upper bound alone passes a throttle that logs once and then
     # never again, which would hide the fault returning.
-    warnings = sum("set_fan_mode" in r.getMessage() for r in caplog.records)
+    warnings = sum(needle in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
 
     # A fan command lands, so the fault is over...
@@ -4147,9 +4160,134 @@ async def test_a_fan_mode_a_unit_will_never_take_is_not_shouted_about(
         await coordinator.async_refresh()
         await hass.async_block_till_done()
 
-    assert sum("set_fan_mode" in r.getMessage() for r in caplog.records) == 1, [
+    assert sum(needle in r.getMessage() for r in caplog.records) == 1, [
         r.getMessage() for r in caplog.records
     ]
+
+
+async def test_a_flushed_edit_is_only_reported_once(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """After an edit is caught, the occupant's own state becomes the baseline.
+
+    Otherwise every subsequent attribute the unit publishes -- a room reading a
+    minute later, on a unit now doing what the occupant asked -- mismatches the
+    superseded baseline and is reported as another edit, re-flushing a buffer
+    that is already empty and re-clearing a slope that is already gone.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    def _observe(state: str, temp: float) -> None:
+        event: Event[EventStateChangedData] = Event(
+            "state_changed",
+            {
+                "entity_id": CLIMATE_ENTITY,
+                "old_state": State(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5}),
+                "new_state": State(CLIMATE_ENTITY, state, {"temperature": temp}),
+            },
+        )
+        coordinator._on_climate_state_change(event)
+
+    # The edit, caught.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    _observe(HVAC_MODE_COOL, 24.0)
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+    # The unit then goes on publishing that same state, as units do.
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    for _ in range(3):
+        freezer.tick(timedelta(minutes=1))
+        _observe(HVAC_MODE_COOL, 24.0)
+        await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_a_setpoint_we_never_sent_is_not_ours_to_vouch_for(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An idle release sends no setpoint, so we have no opinion to offer.
+
+    The commanded side carries the `target_temp` key only when one was actually
+    delivered, and the difference from carrying it as `None` is reachable: a
+    unit that drops its `temperature` attribute while fanning reports `None`,
+    which a `None`-valued key would wave through. It flushes instead, which is
+    the conservative side of a genuinely arguable call -- a setpoint vanishing
+    in `fan_only` may or may not mean the regime changed, and discarding
+    learned data is the cheaper mistake.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Back inside the band -> idle release, which sends no setpoint. The unit
+    # keeps reporting the one it already had.
+    freezer.tick(timedelta(minutes=10))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "20.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_FAN_ONLY}
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    dropped: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {}),
+        },
+    )
+    coordinator._on_climate_state_change(dropped)
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_climate_entity_that_does_not_exist_yet_is_not_an_outage(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The delivery check is narrowed to `unavailable`, not to a missing entity.
+
+    An entity absent from the state machine is a misconfiguration, or a platform
+    that has not finished loading -- either way not the transient bridge blip the
+    check exists for. Widening it to cover `None` would make a zone whose climate
+    loads after this integration record nothing at all until it appears, so the
+    commit stands and the ordinary machinery deals with the rest.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    assert hass.states.get(CLIMATE_ENTITY) is None, "the entity must be absent"
+
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_hvac_mode"), "nothing was commanded"
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
 
 
 async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(

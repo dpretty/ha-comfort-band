@@ -782,13 +782,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _may_log_command_warning(self, key: str) -> bool:
         """Throttle a command-path warning to one line per interval, per fault.
 
-        Both faults repeat on every refresh: nothing is committed on the dropped
-        path, so the same-mode gate never arms and a room-temp-driven zone
-        re-enters it every couple of seconds; and a unit that will not take a
-        plain setpoint refuses it again on every apply, for good, since that is
-        a property of the hardware rather than a passing fault. Each key is
-        cleared when its own fault stops, so the next occurrence is announced
-        rather than sitting inside a stale budget.
+        All three faults repeat. The dropped command repeats hardest -- nothing
+        is committed on that path, so the same-mode gate never arms and a
+        room-temp-driven zone re-enters it every refresh for the length of the
+        outage. The setpoint and fan faults repeat once per applied action, but
+        can be permanent: a unit that will not take a plain setpoint, or a
+        stored fan mode it advertises and refuses, is a property of the hardware
+        rather than a passing fault.
+
+        Each key is cleared when a call of its own kind next succeeds, so a
+        fault's return is announced rather than sitting inside a stale budget.
+        Note the "next succeeds": an episode that ends without one -- a fan the
+        unit adopts by itself, so the call is skipped -- keeps its stamp until
+        the budget expires, delaying the next announcement by up to an interval.
         """
         now = dt_util.utcnow()
         last = self._command_warn_logged_at.get(key)
@@ -966,10 +972,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # must not abort the rest of _maybe_apply_action -- the sample
             # append still needs to run.
             #
-            # Throttled for the same reason as the other command-path warnings,
-            # and this one repeats hardest: the guard above only skips the call
+            # Throttled for the same reason as the other command-path warnings.
+            # This one can be permanent: the guard above only skips the call
             # when the unit already reports the mode we want, so a stored fan
-            # mode it will never accept is retried on every apply, forever.
+            # mode it advertises and refuses is retried on every apply, forever.
+            # The wrapper in `_maybe_apply_action` shares this key -- one fault,
+            # one budget, whichever of the two sites catches it.
             if self._may_log_command_warning("fan"):
                 LOGGER.warning(
                     "%s: climate.set_fan_mode(%s) failed: %s", self.zone_name, desired, err
@@ -1223,11 +1231,20 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         #
         # Deliberately no baseline write here. It used to snapshot our intent,
         # but on the success path the tail below overwrites it from the entity
-        # anyway, so the only paths it survived on were the ones where nothing
-        # reached the unit -- a dropped command, or `set_hvac_mode` raising --
-        # and those are exactly where our intent must not stand in for what the
-        # unit is reporting. What we asked for is vouched for separately, and
-        # only once it has actually been delivered.
+        # anyway, so the only paths it survived on were ones where the unit
+        # never got what it describes -- a dropped command, `set_hvac_mode`
+        # raising, and (before this change guarded them) a raising setpoint or
+        # fan call. Those are exactly where our intent must not stand in for
+        # what the unit is reporting. What we asked for is vouched for
+        # separately, and only once it has actually been delivered.
+        #
+        # The cost of committing nothing on the dropped path is that
+        # `last_action_at` never advances, so the same-mode gate never arms and
+        # the zone re-issues the command on every refresh for the length of an
+        # outage -- up to 120 dispatches an hour against `main`'s 8. They are
+        # filtered out at dispatch, so no device traffic leaves the machine and
+        # the warning stays throttled; it self-limits on the first commit that
+        # lands. A backoff would be an improvement, not a correctness fix.
         self._last_command_at = now_utc
 
         # HA filters on availability *at dispatch*, so that is what has to be
@@ -1393,6 +1410,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # this, which is what covers the lag in both fields without letting our
         # intent stand in for the unit's own report.
         self._last_command_state = {
+            # The `fresh is None` fallbacks are the one exception, and they are
+            # unreachable in practice: an entity absent from the state machine
+            # emits no state-change events for the listener to compare against.
             "hvac_mode": fresh.state if fresh is not None else decision.target_mode,
             "target_temp": fresh.attributes.get("temperature") if fresh is not None else None,
         }
