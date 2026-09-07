@@ -2,6 +2,9 @@ homeassistant>=2024.12.0
 pytest>=8.0
 pytest-asyncio>=0.24
 pytest-homeassistant-custom-component>=0.13
+# Declared explicitly rather than relied on transitively: pyproject sets a
+# wall-clock `timeout`, and losing this package would silently disable it.
+pytest-timeout>=2.3
 mypy>=1.13
 ruff>=0.7
 pre-commit>=3.8

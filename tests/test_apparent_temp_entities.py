@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 
 from custom_components.comfort_band.const import DOMAIN
@@ -309,3 +310,68 @@ async def test_alert_does_not_claim_health_from_a_stale_snapshot(
         assert hass.states.get("binary_sensor.office_room_sensor_unavailable").state != "off"
     finally:
         coord_mod.predictor.estimate_slopes = real
+
+
+async def test_setup_does_not_truncate_the_learned_history(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    make_zone_entry: Any,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`async_setup` must hydrate the sample buffer before its first refresh.
+
+    `_append_sample` persists the whole list, and a freshly built coordinator
+    has no persist throttle yet, so its first append writes immediately. Refresh
+    before restoring the buffer and that write truncates the stored history to
+    one sample -- the learned thermal model wiped on every restart, and
+    `mpc.is_ready` permanently False.
+
+    Only reachable through a real config entry, because
+    `async_config_entry_first_refresh` requires one; the coordinator-level tests
+    call `subscribe_and_hydrate` directly and so cannot see the ordering at all.
+    """
+    from datetime import timedelta
+
+    from homeassistant.core import ServiceCall
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.comfort_band.const import DOMAIN as CB_DOMAIN
+    from custom_components.comfort_band.storage import ComfortBandStore
+
+    async def _noop(call: ServiceCall) -> None:
+        return None
+
+    for service in ("set_hvac_mode", "set_temperature", "set_fan_mode"):
+        hass.services.async_register("climate", service, _noop)
+
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+
+    # A zone with a learned history, exactly as a restart would find on disk.
+    seed_store = ComfortBandStore(hass)
+    await seed_store.async_load()
+    await seed_store.async_add_zone("office")
+    await seed_store.async_update_zone(
+        "office",
+        enabled=True,
+        samples=[
+            {
+                "t": (dt_util.utcnow() - timedelta(minutes=n)).isoformat(),
+                "temp": 20.0 + n * 0.1,
+                "action": "idle",
+                "fan_mode": None,
+            }
+            for n in range(8, 0, -1)
+        ],
+    )
+    seeded = len(seed_store.get_zone("office")["samples"])
+    assert seeded == 8
+
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set("climate.office_hvac", "fan_only", {})
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    kept = len(hass.data[CB_DOMAIN].store.get_zone("office")["samples"])
+    assert kept >= seeded, f"setup truncated the learned history: {seeded} -> {kept}"
