@@ -268,6 +268,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._samples_cache = []
         self._sensor_logged_available = True
         self._sensor_edge_logged_at = {True: None, False: None}
+        self._dropped_command_logged_at = None
         self._last_command_state = None
         self._last_command_at = None
         self._last_sample_persist_at = None
@@ -1217,12 +1218,25 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # an absent climate entity is a misconfiguration that breaks the zone
         # outright, while `unavailable` is the transient bridge or cloud blip
         # this is here for.
-        # Both sides, because reading only *after* the call cannot tell a dropped
-        # command from a delivered one whose unit then blinked -- and plenty of
-        # integrations end `async_set_hvac_mode` with a refresh that briefly
-        # marks a just-commanded unit unreachable. Discarding the commit there is
-        # worse than the bug being fixed: nothing is ever recorded, so the
-        # min-cycle guard never arms and the zone re-commands on every refresh.
+        # `was_unavailable` is the half that matters: HA filters at dispatch, so
+        # the state *before* the call is what decides whether it was delivered.
+        # Reading only afterwards cannot tell a dropped command from a delivered
+        # one whose unit then blinked -- and plenty of integrations end
+        # `async_set_hvac_mode` with a refresh that briefly marks a
+        # just-commanded unit unreachable. Discarding the commit there is worse
+        # than the bug being fixed: nothing is ever recorded, so the min-cycle
+        # guard never arms and the zone re-commands on every refresh.
+        #
+        # The post-call half only narrows this further, to units still
+        # unavailable once the call returns. Two reviewers read that differently
+        # -- whether a state machine lagging a reconnect means the entity was
+        # really available at the filter -- and neither could construct the race.
+        # It is kept because the two failure directions are not symmetric: a
+        # wrongly skipped commit re-commands every refresh and is unbounded,
+        # while a wrongly kept one costs at most one min-cycle of suppression.
+        # Both halves read the state machine, which can itself disagree with
+        # `entity.available` during a reconnect; that residual is unfixable from
+        # here and is the same on either side of this change.
         live = self.hass.states.get(self.climate_entity_id)
         if was_unavailable and live is not None and live.state == STATE_UNAVAILABLE:
             if self._may_log_dropped_command():
@@ -1233,11 +1247,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     self.climate_entity_id,
                     decision.target_mode,
                 )
-            # Sample under the action the unit is still performing, the same way
-            # the suppression gates above do: the room keeps responding to
-            # whatever is actually running, and starving the predictor through a
-            # climate outage costs learning we could otherwise keep.
-            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
+            # Deliberately no sample. Labelling one under `last_action` looks
+            # right -- it is what the suppression gates do -- but measurement
+            # says otherwise: with `last_action=heating` and a unit that has
+            # actually stopped, an hour of perfectly good idle drift is recorded
+            # as a heat run that the v0.15.0 sign guard then rejects, so the
+            # idle slope reads None where it would otherwise have been learned.
+            # We do not know what an unreachable unit is doing, and guessing
+            # displaces data we already have.
             return
 
         # Record the commitment on the strength of `set_hvac_mode` alone: that
@@ -1263,6 +1280,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             last_action_at=now_utc.isoformat(),
             previous_action=new_previous_action,
         )
+
+        self._dropped_command_logged_at = None
 
         # v0.13.0 deterministic fan-boost. Placed right after set_hvac_mode so
         # it fires for idle (fan_only) AND heat AND cool — set_temperature below

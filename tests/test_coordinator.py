@@ -7,7 +7,6 @@ pytest-freezer `freezer` fixture for time travel.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -328,24 +327,6 @@ async def _unload_helper_coordinators(hass: HomeAssistant) -> AsyncIterator[None
     _HELPER_COORDINATORS.clear()
     if failures:
         raise ExceptionGroup("failed to unload test coordinators", failures)
-
-
-@contextlib.contextmanager
-def caplog_at_warning() -> Any:
-    """Collect WARNING records from the integration for the duration."""
-    records: list[logging.LogRecord] = []
-
-    class _Sink(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            records.append(record)
-
-    logger = logging.getLogger("custom_components.comfort_band")
-    sink = _Sink(level=logging.WARNING)
-    logger.addHandler(sink)
-    try:
-        yield records
-    finally:
-        logger.removeHandler(sink)
 
 
 async def _setup_enabled_zone(
@@ -3697,6 +3678,97 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
+async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A climate outage must leave the learned model alone, and not shout.
+
+    No sample is recorded: we don't know what an unreachable unit is doing, and
+    guessing displaces data we already have. Labelling under `last_action` was
+    tried and measured -- with `last_action=heating` and a unit that has really
+    stopped, an hour of good idle drift becomes a heat run the v0.15.0 sign
+    guard rejects, so the idle slope reads None where it would have been
+    learned.
+
+    And the warning is throttled, because nothing is committed on this path so
+    the same-mode gate never arms and every refresh re-enters it.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+    before = list(coordinator._samples_cache)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for n in range(8):
+            freezer.tick(timedelta(minutes=1))
+            hass.states.async_set(TEMP_ENTITY, f"{16.0 + n * 0.1:.1f}", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+    assert coordinator._samples_cache == before, "an outage must not add samples"
+    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
+    # Two-sided: an upper bound alone passes a throttle that logs once and then
+    # never again, which would silence a later outage entirely.
+    warnings = sum("was dropped" in r.getMessage() for r in caplog.records)
+    assert 2 <= warnings <= 3, warnings
+
+
+async def test_a_new_outage_is_announced_after_the_unit_recovers(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The throttle must not carry across a recovery.
+
+    Otherwise a second outage shortly after the first is silent -- and a unit
+    that drops out repeatedly is exactly the one worth hearing about.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # A short min-cycle so the second outage can land inside the 5-minute
+    # throttle window without the same-mode gate suppressing the command first.
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+
+    async def _drop_then_recover(unavailable: bool, temp: str) -> None:
+        hass.states.async_set(
+            CLIMATE_ENTITY, STATE_UNAVAILABLE if unavailable else HVAC_MODE_FAN_ONLY, {}
+        )
+        hass.states.async_set(TEMP_ENTITY, temp, {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await _drop_then_recover(True, "16.0")
+        # The unit comes back and a command lands, which clears the latch.
+        freezer.tick(timedelta(seconds=30))
+        await _drop_then_recover(False, "15.9")
+        assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+        # It drops out again, well inside the 5-minute throttle window -- so
+        # only the latch clearing on the successful command can let this speak.
+        # Past the (shortened) min-cycle, or the same-mode gate would suppress
+        # the command and it would never reach the delivery check at all.
+        freezer.tick(timedelta(minutes=2))
+        await _drop_then_recover(True, "15.8")
+
+    assert sum("was dropped" in r.getMessage() for r in caplog.records) == 2, [
+        r.getMessage() for r in caplog.records
+    ]
+
+
 async def test_a_unit_that_blinks_after_accepting_is_still_recorded(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -3732,37 +3804,98 @@ async def test_a_unit_that_blinks_after_accepting_is_still_recorded(
     assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
 
 
-async def test_an_undeliverable_command_still_feeds_the_predictor(
+async def test_a_fan_failure_does_not_abort_the_rest_of_the_apply(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """A climate outage must not starve the model while the room sensor is fine.
+    """The fan command is a refinement, not a precondition.
 
-    The room keeps responding to whatever the unit is actually still doing, so
-    the sample is recorded under `last_action` -- the same convention both
-    suppression gates already follow. And the warning is throttled, because
-    nothing is committed on this path so every refresh re-enters it.
+    `_maybe_command_fan` catches only `HomeAssistantError`, so a cloud unit's
+    timeout escaped into the fire-and-forget apply task -- taking the setpoint,
+    the echo baseline and the sample with it, for a cycle that was already
+    running.
     """
     freezer.move_to("2026-09-07 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
-    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator._store.async_update_zone(
+        "office", fan_control_enabled=True, active_fan_mode="high"
+    )
+
+    async def _fan_timeout(call: Any) -> None:
+        raise TimeoutError("cloud gateway did not respond")
+
+    hass.services.async_register("climate", "set_fan_mode", _fan_timeout)
+    hass.states.async_set(
+        CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"fan_modes": ["low", "high"], "fan_mode": "low"}
+    )
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 
-    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
-    before = len(coordinator._samples_cache)
-    warnings = 0
-    with caplog_at_warning() as records:
-        for n in range(6):
-            freezer.tick(timedelta(minutes=1))
-            hass.states.async_set(TEMP_ENTITY, f"{16.0 + n * 0.1:.1f}", {})
-            await coordinator.async_refresh()
-            await hass.async_block_till_done()
-        warnings = sum("was dropped" in r.message for r in records)
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    # The setpoint still went out, and the sample was still recorded.
+    assert _calls_for(climate_calls, "set_temperature"), climate_calls
+    assert coordinator._samples_cache
 
-    assert len(coordinator._samples_cache) > before, "the predictor was starved"
-    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
-    assert warnings <= 2, warnings
+
+async def test_delivery_is_judged_before_the_call_not_after(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Only a unit that was already unreachable had its command dropped.
+
+    Home Assistant filters on availability at dispatch, so the state *before*
+    the call is what decides delivery. This pins the pre-call half specifically:
+    with the entity available beforehand the commit must stand no matter what
+    the entity reports afterwards.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    async def _accept_then_vanish(call: Any) -> None:
+        climate_calls.append(("set_hvac_mode", dict(call.data)))
+        hass.states.async_remove(CLIMATE_ENTITY)
+
+    hass.services.async_register("climate", "set_hvac_mode", _accept_then_vanish)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+
+async def test_the_commit_lands_before_the_setpoint_call(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Ordering, not just the guard, is what makes the commit safe.
+
+    `except Exception` doesn't catch `BaseException`, and the apply task is
+    cancelled on shutdown and on a config-entry reload -- so if the commit sat
+    after the setpoint call, a cancellation there would still leave the unit
+    conditioning with nothing recorded. Pinning the order rather than the
+    guard: with the commit moved back below the setpoint, this fails.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    seen: list[str | None] = []
+
+    async def _observe(call: Any) -> None:
+        # What the store already says at the moment the setpoint is issued.
+        seen.append(coordinator._store.get_zone("office")["last_action"])
+        climate_calls.append(("set_temperature", dict(call.data)))
+
+    hass.services.async_register("climate", "set_temperature", _observe)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert seen == [ACTION_HEAT], seen
