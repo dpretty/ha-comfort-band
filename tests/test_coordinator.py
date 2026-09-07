@@ -4290,6 +4290,122 @@ async def test_a_climate_entity_that_does_not_exist_yet_is_not_an_outage(
     assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
 
 
+async def _heat_then_go_offline(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Command heat against a healthy unit, then take the unit off the network.
+
+    Leaves the zone re-trying a dropped command, a planted idle slope to watch,
+    and the outage's own state event well outside the echo window.
+    """
+    # Short min-cycle, or the retry below is suppressed before it ever reaches
+    # the delivery check and the outage never re-enters the dropped path.
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    freezer.tick(timedelta(minutes=5))
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+    await hass.async_block_till_done()
+    hass.states.async_set(TEMP_ENTITY, "15.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+
+async def test_a_wall_edit_during_an_outage_is_caught_on_reconnect(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A dropped command must not hold the echo window open across an outage.
+
+    Nothing is committed on that path, so the same-mode gate never arms and the
+    zone re-enters it on every refresh. Re-stamping the window each time meant
+    that for any room sensor reporting faster than `CLIMATE_ECHO_WINDOW_S` the
+    window never closed for the length of the outage -- so the reconnect
+    carrying somebody's wall edit was absorbed as an echo of ours instead of
+    compared against the baseline. Measured at a 30-second sensor, that missed
+    the edit every time, where the previous release caught it every time.
+    Nothing was delivered, so there is no echo of ours to wait for.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _heat_then_go_offline(hass, coordinator, freezer)
+
+    # It comes back a few seconds later -- well inside the window the retry
+    # would have re-armed -- carrying somebody else's settings.
+    freezer.tick(timedelta(seconds=10))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_COOL, {"temperature": 24.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_unit_that_comes_back_as_we_left_it_is_not_an_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Going unavailable is the network, not somebody at the wall.
+
+    `{unavailable, None}` matches nothing, so comparing it flushed the learned
+    model on every bridge blip -- and the blip is exactly when the model is
+    worth keeping, because nothing about the room changed. Ignoring the
+    transition also leaves the baseline describing the last state the unit was
+    really in, which is what the reconnect then gets judged against.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await _heat_then_go_offline(hass, coordinator, freezer)
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+    # And it returns doing exactly what it was doing before.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_an_entity_that_appears_during_the_call_is_recorded(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Absent at dispatch is not unavailable at dispatch.
+
+    A climate platform still loading is absent from the state machine, and
+    Home Assistant does not filter on that -- it filters on `entity.available`,
+    which an entity that is not there yet cannot fail. Reading a missing entity
+    as an outage would discard the commit for a call that may well have landed,
+    and the entity registering as `unavailable` a moment later is an ordinary
+    startup sequence, not evidence about the call.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    assert hass.states.get(CLIMATE_ENTITY) is None, "the entity must start absent"
+
+    async def _appears(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+        hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    hass.services.async_register("climate", "set_hvac_mode", _appears)
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_hvac_mode"), "nothing was commanded"
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+
 async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],

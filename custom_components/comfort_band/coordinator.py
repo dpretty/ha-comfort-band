@@ -180,7 +180,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
-        # Per-fault stamps for the command-path warnings ("dropped", "setpoint").
+        # Per-fault stamps for the command-path warnings: "dropped",
+        # "setpoint", "fan".
         self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
         # What we last actually asked the climate for, kept apart from the
@@ -1240,11 +1241,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         #
         # The cost of committing nothing on the dropped path is that
         # `last_action_at` never advances, so the same-mode gate never arms and
-        # the zone re-issues the command on every refresh for the length of an
-        # outage -- up to 120 dispatches an hour against `main`'s 8. They are
-        # filtered out at dispatch, so no device traffic leaves the machine and
-        # the warning stays throttled; it self-limits on the first commit that
+        # the zone re-issues the command once per refresh for the length of an
+        # outage. That is bounded by the request-refresh debounce rather than by
+        # any dwell here, so it scales with how fast the room sensor reports:
+        # measured at roughly 120 an hour for a 30-second sensor and over 300
+        # for a 10-second one, against a handful on `main`. They are filtered
+        # out at dispatch, so no device traffic leaves the machine and the
+        # warning stays throttled; it self-limits on the first commit that
         # lands. A backoff would be an improvement, not a correctness fix.
+        previous_command_at = self._last_command_at
         self._last_command_at = now_utc
 
         # HA filters on availability *at dispatch*, so that is what has to be
@@ -1307,6 +1312,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # idle slope reads None where it would otherwise have been learned.
             # We do not know what an unreachable unit is doing, and guessing
             # displaces data we already have.
+            #
+            # And un-arm the echo window: nothing was delivered, so there is no
+            # echo of ours coming. Leaving it armed was measured as a real hole,
+            # because this path re-enters on every refresh -- for any sensor
+            # reporting faster than CLIMATE_ECHO_WINDOW_S the window never
+            # closed for the length of the outage, so the reconnect carrying
+            # somebody's wall edit was absorbed as an echo instead of compared.
+            # At a 30-second sensor that missed the edit every time, where
+            # `main` caught it every time.
+            self._last_command_at = previous_command_at
             return
 
         # Record the commitment on the strength of `set_hvac_mode` alone: that
@@ -1410,9 +1425,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # this, which is what covers the lag in both fields without letting our
         # intent stand in for the unit's own report.
         self._last_command_state = {
-            # The `fresh is None` fallbacks are the one exception, and they are
-            # unreachable in practice: an entity absent from the state machine
-            # emits no state-change events for the listener to compare against.
+            # The `fresh is None` fallbacks are the one exception. They are
+            # reached only for an entity absent from the state machine -- a
+            # misconfigured zone, or a climate platform that loads after this
+            # one -- and in the latter case the entity does eventually appear,
+            # so its second report is compared against our intent and may flush
+            # a buffer holding a sample or two. Small, and self-correcting on
+            # the next command.
             "hvac_mode": fresh.state if fresh is not None else decision.target_mode,
             "target_temp": fresh.attributes.get("temperature") if fresh is not None else None,
         }
@@ -1560,6 +1579,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         new_state = event.data["new_state"]
         if old_state is None or new_state is None:
             # Initial state-added or entity-removed -- not a manual edit.
+            return
+        if new_state.state == STATE_UNAVAILABLE:
+            # A unit dropping off the network is not somebody at the wall, and
+            # `{unavailable, None}` matches nothing, so comparing it flushed the
+            # learned model on every bridge blip. Ignoring it also leaves the
+            # baseline describing the last state the unit was really in, which
+            # is what the reconnect has to be judged against: if it comes back
+            # as we left it there is nothing to flush, and if somebody changed
+            # it meanwhile that is caught then.
             return
         observed = {
             "hvac_mode": new_state.state,
