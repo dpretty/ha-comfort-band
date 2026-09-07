@@ -41,6 +41,7 @@ from .const import (
     ACTION_IDLE,
     ACTION_UNKNOWN,
     CLIMATE_ECHO_WINDOW_S,
+    COMMAND_WARN_INTERVAL_S,
     LOGGER,
     MPC_SIMULATION_STEP_MINUTES,
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
@@ -179,7 +180,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
-        self._dropped_command_logged_at: datetime | None = None
+        # Per-fault stamps for the command-path warnings ("dropped", "setpoint").
+        self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
         # What we last actually asked the climate for, kept apart from the
         # baseline above because the listener overwrites that with whatever the
@@ -273,7 +275,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._samples_cache = []
         self._sensor_logged_available = True
         self._sensor_edge_logged_at = {True: None, False: None}
-        self._dropped_command_logged_at = None
+        self._command_warn_logged_at = {}
         self._last_command_state = None
         self._commanded_state = None
         self._last_command_at = None
@@ -777,18 +779,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             persisted_idle_slope_at=None,
         )
 
-    def _may_log_dropped_command(self) -> bool:
-        """Throttle the undeliverable-command warning to once per interval.
+    def _may_log_command_warning(self, key: str) -> bool:
+        """Throttle a command-path warning to one line per interval, per fault.
 
-        Nothing is committed on that path, so the same-mode gate never arms and
-        every refresh re-enters it -- which for a room-temp-driven zone means a
-        warning every couple of seconds for the length of a bridge outage.
+        Both faults repeat on every refresh: nothing is committed on the dropped
+        path, so the same-mode gate never arms and a room-temp-driven zone
+        re-enters it every couple of seconds; and a unit that will not take a
+        plain setpoint refuses it again on every apply, for good, since that is
+        a property of the hardware rather than a passing fault. Each key is
+        cleared when its own fault stops, so the next occurrence is announced
+        rather than sitting inside a stale budget.
         """
         now = dt_util.utcnow()
-        last = self._dropped_command_logged_at
-        if last is not None and 0 <= (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+        last = self._command_warn_logged_at.get(key)
+        # `0 <=` because a backwards clock step -- an RTC-less Pi correcting
+        # against NTP after boot -- makes the elapsed time negative, which would
+        # otherwise satisfy the throttle and silence the log until the clock
+        # caught up.
+        if last is not None and 0 <= (now - last).total_seconds() < COMMAND_WARN_INTERVAL_S:
             return False
-        self._dropped_command_logged_at = now
+        self._command_warn_logged_at[key] = now
         return True
 
     def _may_log_sensor_edge(self, available: bool) -> bool:
@@ -1250,7 +1260,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # here and is the same on either side of this change.
         live = self.hass.states.get(self.climate_entity_id)
         if was_unavailable and live is not None and live.state == STATE_UNAVAILABLE:
-            if self._may_log_dropped_command():
+            if self._may_log_command_warning("dropped"):
                 LOGGER.warning(
                     "%s: commanded %s to %s but it is unavailable, so the call "
                     "was dropped -- not recording it; will retry",
@@ -1292,7 +1302,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             previous_action=new_previous_action,
         )
 
-        self._dropped_command_logged_at = None
+        self._command_warn_logged_at.pop("dropped", None)
 
         # v0.13.0 deterministic fan-boost. Placed right after set_hvac_mode so
         # it fires for idle (fan_only) AND heat AND cool — set_temperature below
@@ -1326,17 +1336,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     blocking=True,
                 )
                 setpoint_applied = rounded_target_temp
+                self._command_warn_logged_at.pop("setpoint", None)
             except Exception as err:
-                LOGGER.warning(
-                    "%s: commanded %s to %s but could not set the target "
-                    "temperature to %s (%s) -- the unit is running against its "
-                    "own setpoint",
-                    self.zone_name,
-                    self.climate_entity_id,
-                    decision.target_mode,
-                    rounded_target_temp,
-                    err,
-                )
+                if self._may_log_command_warning("setpoint"):
+                    LOGGER.warning(
+                        "%s: commanded %s to %s but could not set the target "
+                        "temperature to %s (%s) -- the unit is running against "
+                        "its own setpoint",
+                        self.zone_name,
+                        self.climate_entity_id,
+                        decision.target_mode,
+                        rounded_target_temp,
+                        err,
+                    )
         # Snapshot the climate's actual state after our commands settle. The
         # service calls leave `decision.target_temp=None` for idle releases,
         # but the climate often keeps a stale `temperature` attribute from
@@ -1349,26 +1361,24 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # honest answer: it isn't emitting state-change events for the listener
         # to compare against either.
         fresh = self.hass.states.get(self.climate_entity_id)
+        # Both fields come from the entity, never from our intent. Pinning what
+        # we commanded here was tried on both fields and measured worse on both.
+        # For the setpoint: `ClimateEntity.state_attributes` puts `temperature`
+        # through `display_temp`, which rounds to the entity's own `precision` --
+        # unrelated to the `target_temp_step` we rounded to, and absent from
+        # `capability_attributes` when the platform publishes no step -- so a
+        # whole-degree unit commanded 19.5 reports 20 forever, and a same-mode
+        # re-commit changes nothing it reports, so no echo ever corrects the
+        # baseline. For the mode: a unit that adopts it late keeps publishing its
+        # other attributes meanwhile (`current_temperature` on its own MQTT topic
+        # is the ubiquitous case), and each of those carries the old mode -- read
+        # as a hand edit, six flushes an hour against `main`'s two.
+        #
+        # What we asked for is recorded separately below and accepted alongside
+        # this, which is what covers the lag in both fields without letting our
+        # intent stand in for the unit's own report.
         self._last_command_state = {
-            # The mode we commanded, NOT the one the entity is reporting. A slow
-            # or cloud-backed unit still shows its old mode here, and adopting
-            # that made the baseline a value the unit can never report again --
-            # so its real echo, arriving outside CLIMATE_ECHO_WINDOW_S, was read
-            # as somebody editing the thermostat by hand. That flushes the
-            # sample buffer and clears the persisted idle slope, taking MPC
-            # readiness with it, on every single command to such a unit. A mode
-            # is safe to pin because it is echoed back verbatim.
-            "hvac_mode": decision.target_mode,
-            # A setpoint is not. `ClimateEntity.state_attributes` puts
-            # `temperature` through `display_temp`, which rounds to the entity's
-            # own `precision` -- unrelated to the `target_temp_step` we rounded
-            # to, and absent from `capability_attributes` when the platform
-            # publishes no step -- so a whole-degree unit commanded 19.5 reports
-            # 20 forever. Pinning our value here would mismatch on every later
-            # attribute update, and a same-mode re-commit changes nothing the
-            # unit reports, so no echo ever arrives to correct it. The entity's
-            # own report is the honest baseline; what we asked for is recorded
-            # separately below and accepted alongside it.
+            "hvac_mode": fresh.state if fresh is not None else decision.target_mode,
             "target_temp": fresh.attributes.get("temperature") if fresh is not None else None,
         }
         # Only what actually landed: a raised `set_temperature` never reached the

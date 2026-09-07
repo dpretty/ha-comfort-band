@@ -3842,6 +3842,162 @@ async def test_shadow_mode_stops_vouching_for_the_last_command(
     assert not _calls_for(climate_calls, "set_hvac_mode")[1:], "shadow mode commanded"
     assert coordinator._commanded_state is None
 
+    # And that is what makes the wall remote visible again: the unit was still
+    # lagging when the zone went to shadow, so somebody setting it to exactly
+    # what Comfort Band last asked for is now an edit like any other. Fed as a
+    # synthetic event, like the other manual-edit tests, so no refresh can
+    # interleave with it.
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    edit: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5}),
+        },
+    )
+    coordinator._on_climate_state_change(edit)
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_lagging_units_other_attributes_are_not_a_manual_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A unit that has not adopted the mode yet still publishes everything else.
+
+    `current_temperature` on its own MQTT topic is the ubiquitous case, and ZHA,
+    Z2M and ESPHome all report per-attribute too. Each of those events carries
+    the mode the unit is still in, so recording the mode we *asked* for as the
+    baseline made every one of them a hand edit -- flushing the buffer and the
+    persisted idle slope several times an hour, worse than before this work.
+    What we asked for is accepted from `_commanded_state`; the baseline has to
+    stay on what the unit actually reports.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # The unit lags: it is still in fan_only when we command heat.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 17.0})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    assert coordinator._samples_cache
+
+    # Well outside the echo window it pushes a room reading, and nothing else.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(
+        CLIMATE_ENTITY,
+        HVAC_MODE_FAN_ONLY,
+        {"temperature": 17.0, "current_temperature": 16.2},
+    )
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache, "a room reading read as a manual edit"
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is not None
+
+
+async def test_a_unit_that_reconnects_during_the_call_is_recorded(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The delivery check reads both sides of the call, and needs to.
+
+    `entity.available` is what Home Assistant filters on, and the state machine
+    can lag it: a bridge that reconnects just as the call is dispatched leaves
+    `unavailable` in the machine while the entity itself is back, so the command
+    *is* delivered. The integration's own post-command write then publishes the
+    real state. Judging on the before-state alone would discard that commit --
+    and `last_action` unset for a running heat cycle is the unbounded
+    re-command this check exists to prevent.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    async def _reconnects(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {})
+
+    hass.services.async_register("climate", "set_hvac_mode", _reconnects)
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert _calls_for(climate_calls, "set_hvac_mode"), "nothing was commanded"
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+
+async def test_a_setpoint_a_unit_will_never_take_is_not_shouted_about(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """This fault is permanent, so its warning has to be throttled.
+
+    An entity advertising only TARGET_TEMPERATURE_RANGE refuses a plain
+    setpoint on every apply, for the life of the zone -- it is a property of the
+    hardware, not a passing fault. Unthrottled that is hundreds of WARNING lines
+    a day. And the budget is per-fault: once a setpoint lands, the next failure
+    is news again rather than sitting inside a stale window.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+
+    async def _refuse(call: Any) -> None:
+        raise HomeAssistantError("the entity does not support it")
+
+    async def _accept(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+
+    hass.services.async_register("climate", "set_temperature", _refuse)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for n in range(8):
+            freezer.tick(timedelta(minutes=1))
+            hass.states.async_set(TEMP_ENTITY, f"{16.0 + n * 0.1:.1f}", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+    # Two-sided: an upper bound alone passes a throttle that logs once and then
+    # never again, which would hide the fault returning on a different unit.
+    warnings = sum("own setpoint" in r.getMessage() for r in caplog.records)
+    assert 2 <= warnings <= 3, warnings
+
+    # A setpoint lands, so the fault is over...
+    hass.services.async_register("climate", "set_temperature", _accept)
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(TEMP_ENTITY, "16.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # ...and its return is announced, well inside the throttle window.
+    hass.services.async_register("climate", "set_temperature", _refuse)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        freezer.tick(timedelta(minutes=1))
+        hass.states.async_set(TEMP_ENTITY, "16.8", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("own setpoint" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
+
 
 async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
     hass: HomeAssistant,
@@ -3850,7 +4006,12 @@ async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
     freezer: FrozenDateTimeFactory,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A climate outage must leave the learned model alone, and not shout.
+    """A climate outage must leave the store and the buffer alone, and not shout.
+
+    Scoped to what the apply path does about it. Whether the entity's own
+    transition to `unavailable` reaches the manual-edit detector as an edit is a
+    separate, pre-existing question -- it does, once the transition lands outside
+    the echo window -- and is not what this covers.
 
     No sample is recorded: we don't know what an unreachable unit is doing, and
     guessing displaces data we already have. Labelling under `last_action` was
