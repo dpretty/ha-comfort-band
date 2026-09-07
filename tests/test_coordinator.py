@@ -4562,6 +4562,11 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     assert coordinator._store.get_zone("office")["last_action"] is None
     warnings = sum("could not command" in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
+    # Named, because several of these stringify to a bare translation key and
+    # the traceback that used to carry the type is gone.
+    assert any(type(raised).__name__ in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
 
     # A mode command lands, so the fault is over -- and its return is announced
     # rather than sitting inside the stale budget.
@@ -4716,41 +4721,156 @@ async def test_a_dial_turned_while_the_mode_is_unknown_is_still_an_edit(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
 
 
-async def test_a_mode_call_that_lands_then_fails_keeps_its_echo_window(
+async def test_a_mode_call_that_raises_still_vouches_for_the_mode(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """Un-arming the window is for a call that touched nothing.
+    """A raise says the call did not complete, not that the unit never got it.
 
-    A cloud unit that publishes the mode and then times out on its confirming
-    poll has already produced an echo. Rolling the stamp back regardless sent
-    that echo outside the window to be compared -- against a baseline still
-    holding the pre-command state, and a commanded side the raise never
-    advanced -- so the unit's own answer read as somebody at the wall, six
-    flushes an hour on a unit like that.
+    A cloud round-trip that times out on its confirming poll may well have
+    applied the mode and will publish it seconds later. Recognising that echo
+    cannot depend on the echo window still being open -- the window is un-armed
+    precisely because we do not know the call landed -- so the mode is vouched
+    for instead, and only the mode, since `set_temperature` never ran.
+
+    An attempt to answer "did it land?" from the state machine was tried and
+    measured wrong in both directions, which is why this does not try.
     """
     freezer.move_to("2026-09-07 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
-
-    async def _lands_then_fails(call: Any) -> None:
-        climate_calls.append((call.service, dict(call.data)))
-        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 21.0})
-        raise HomeAssistantError("the confirming poll timed out")
-
-    hass.services.async_register("climate", "set_hvac_mode", _lands_then_fails)
     hass.states.async_set(TEMP_ENTITY, "16.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
-
-    # Its own echo, late but inside the window the command armed.
-    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S - 5))
+    # Its echo, inside the window: a real baseline to be judged against later.
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
     await hass.async_block_till_done()
 
+    async def _refuse(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+        raise HomeAssistantError("the confirming poll timed out")
+
+    hass.services.async_register("climate", "set_hvac_mode", _refuse)
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    # It applied the release after all, and says so well outside the window.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+    # The mode, and nothing else: `set_temperature` never ran on that path, so
+    # the setpoint side of the same command is not ours to vouch for.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_setpoint_that_never_left_is_not_offered_as_a_baseline(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The last-resort baseline obeys the same rule as the commanded side.
+
+    With no baseline yet and an unreadable climate there is nothing to leave
+    standing, so the apply path writes its own intent. The setpoint half of that
+    has to be what actually landed: a `set_temperature` that raised never
+    reached the unit, and offering its value here would let a wall edit that
+    happens to land on it pass unnoticed -- an entity advertising only a
+    temperature range makes Home Assistant itself raise, so that pairing is
+    ordinary hardware, not a corner.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    assert hass.states.get(CLIMATE_ENTITY) is None, "the entity must start absent"
+
+    async def _reject_setpoint(call: Any) -> None:
+        raise HomeAssistantError(
+            "Set temperature action was used with the target temperature "
+            "parameter but the entity does not support it"
+        )
+
+    hass.services.async_register("climate", "set_temperature", _reject_setpoint)
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    # The entity appears, and somebody sets it to exactly the setpoint that
+    # never reached it.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 21.0})
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_restart_mid_blip_does_not_flush_the_restored_model(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`unknown` with nothing to compare against is not a baseline either.
+
+    An MQTT climate with an availability topic and a non-retained mode topic
+    comes up `unavailable`, then `unknown`, then its real mode -- before this
+    integration has commanded anything. Adopting the `unknown` would leave the
+    baseline holding a value the unit can never report again, so the mode
+    arriving a moment later reads as a hand edit and flushes the buffer just
+    restored from disk.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    from custom_components.comfort_band import predictor
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=-0.02,
+        samples=[{"t": "2026-09-07T11:30:00+00:00", "temp": 19.0, "action": ACTION_IDLE}],
+    )
+    coordinator._samples_cache = predictor.load_samples(
+        coordinator._store.get_zone("office")["samples"]
+    )
+    assert coordinator._samples_cache
+
+    def _observe(previous: str, state: str, attrs: dict[str, Any]) -> None:
+        event: Event[EventStateChangedData] = Event(
+            "state_changed",
+            {
+                "entity_id": CLIMATE_ENTITY,
+                "old_state": State(CLIMATE_ENTITY, previous, {}),
+                "new_state": State(CLIMATE_ENTITY, state, attrs),
+            },
+        )
+        coordinator._on_climate_state_change(event)
+
+    _observe(STATE_UNAVAILABLE, STATE_UNKNOWN, {"temperature": 19.5})
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(STATE_UNKNOWN, HVAC_MODE_HEAT, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache, "the restored buffer was flushed"
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 

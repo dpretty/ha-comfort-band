@@ -1295,19 +1295,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     type(err).__name__,
                     err,
                 )
-            # Un-arm the window only if the failed call left the entity
-            # untouched. A cloud unit that publishes the mode and *then* times
-            # out on its confirming poll has already produced an echo, and
-            # rolling back unconditionally sent that echo outside the window to
-            # be compared -- against a baseline still holding the pre-command
-            # state and a commanded side the raise never advanced, so the unit's
-            # own answer read as a hand edit. Measured at six flushes an hour on
-            # a unit like that, where `main` had none. `async_set` returns early
-            # without replacing the State object when nothing changed, so
-            # identity is the test for "wrote nothing"; anything else keeps the
-            # window armed, which is what `main` did throughout.
-            if self.hass.states.get(self.climate_entity_id) is before:
-                self._last_command_at = previous_command_at
+            # A raise says the call did not complete. It does not say the unit
+            # never got it: a cloud round-trip that times out on its confirming
+            # poll may well have applied the mode and will publish it seconds
+            # later. So vouch for the mode -- and only the mode, since
+            # `set_temperature` never ran -- and that late echo is recognised
+            # whenever it lands, rather than depending on a window still being
+            # open. This is the honest reading of "we asked, and we do not know
+            # whether it arrived".
+            #
+            # An attempt to answer that question from the state machine was
+            # tried and measured wrong in both directions: `async_set` does
+            # return early without replacing the State object when nothing
+            # changed, but identity across the call then answers "did anything
+            # about this entity change", not "did our call land". A unit ticking
+            # `current_temperature` on its own topic mid-call held the window
+            # open and swallowed a wall edit two seconds later, while a unit
+            # publishing its mode just *after* the call still had its own echo
+            # read as a hand edit. Vouching sidesteps the question.
+            self._commanded_state = {"hvac_mode": decision.target_mode}
+            self._last_command_at = previous_command_at
             return
         self._command_warn_logged_at.pop("mode", None)
 
@@ -1473,12 +1480,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # this, which is what covers the lag in both fields without letting our
         # intent stand in for the unit's own report.
         #
-        # `unavailable` / `unknown` are not states to record, for the same
-        # reason the listener refuses to compare them: a just-commanded unit
-        # reading unreachable for a moment is ordinary, and `{unavailable,
-        # None}` as a baseline matches nothing the unit will ever report. Leave
-        # the previous baseline standing instead -- it still describes the last
-        # state the unit was really in.
+        # `unavailable` / `unknown` are not states to record. A just-commanded
+        # unit reading unreachable for a moment is ordinary, and either as a
+        # baseline matches nothing the unit will ever report -- so when it
+        # recovers to the mode it was really in, with nothing commanded to cover
+        # for it (after a flush, or in shadow mode), that reads as a hand edit.
+        # Leave the previous baseline standing instead: it still describes the
+        # last state the unit was really in. The listener declines to *compare*
+        # these for the same reason, though not identically -- it has a live
+        # setpoint to judge under `unknown`, and here there is a command in
+        # flight that makes the whole reading momentary.
         if fresh is not None and fresh.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self._last_command_state = {
                 "hvac_mode": fresh.state,
@@ -1649,9 +1660,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             return
         if new_state.state == STATE_UNAVAILABLE:
             # A unit dropping off the network is not somebody at the wall, and
-            # an unavailable entity publishes no attributes either
-            # (`helpers/entity.py` fills them in only when `available`), so
-            # there is nothing here to compare -- `{unavailable, None}` matched
+            # an unavailable entity publishes no *state* attributes either
+            # (`helpers/entity.py` adds those only when `available`; the
+            # capability ones survive), so there is no setpoint here to compare
+            # -- `{unavailable, None}` matched
             # nothing and flushed the learned model on every bridge blip.
             # Ignoring it leaves the baseline describing the last state the unit
             # was really in, which is what the reconnect gets judged against: if
@@ -1662,7 +1674,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
-        if new_state.state == STATE_UNKNOWN and self._last_command_state is not None:
+        if new_state.state == STATE_UNKNOWN:
             # `unknown` is not the same thing as `unavailable`, though it is
             # easy to treat it as one. Home Assistant writes it whenever
             # `ClimateEntity.hvac_mode` is None -- an MQTT climate that is
@@ -1679,9 +1691,18 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # entity mid-initialisation says nothing rather than reading as
             # somebody having cleared the dial. Once the mode arrives, the full
             # comparison resumes.
-            observed["hvac_mode"] = self._last_command_state["hvac_mode"]
+            carried = self._last_command_state
+            if carried is None:
+                # Nothing to carry forward and nothing to compare against.
+                # Adopting `unknown` as the baseline instead would leave it
+                # holding a value the unit can never report again, so its first
+                # real state -- the mode topic arriving after a restart -- would
+                # read as a hand edit and flush the buffer just restored from
+                # disk.
+                return
+            observed["hvac_mode"] = carried["hvac_mode"]
             if observed["target_temp"] is None:
-                observed["target_temp"] = self._last_command_state["target_temp"]
+                observed["target_temp"] = carried["target_temp"]
         now = dt_util.utcnow()
         # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)
         # doesn't trip the negative `< window` branch and suppress legitimate
