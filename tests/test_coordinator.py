@@ -4442,11 +4442,21 @@ async def test_a_unit_that_blips_through_unknown_is_not_an_edit(
         )
         coordinator._on_climate_state_change(event)
 
+    # An entity in `unknown` is *available*, so it goes on publishing its
+    # attributes -- the setpoint is still there and unchanged.
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
-    _observe(HVAC_MODE_HEAT, STATE_UNKNOWN, {})
+    _observe(HVAC_MODE_HEAT, STATE_UNKNOWN, {"temperature": 19.5})
     await hass.async_block_till_done()
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
     _observe(STATE_UNKNOWN, HVAC_MODE_HEAT, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+    # And one coming up cold, reporting neither, says nothing rather than
+    # reading as somebody having cleared the dial.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(HVAC_MODE_HEAT, STATE_UNKNOWN, {})
     await hass.async_block_till_done()
 
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
@@ -4500,12 +4510,24 @@ async def test_an_outage_does_not_erase_what_the_unit_was_last_doing(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [
+        HomeAssistantError("that mode is not supported by this entity"),
+        # Not a `HomeAssistantError`: the guard is deliberately broad because a
+        # cloud unit's timeout is the case it was written for, and there is
+        # nothing waiting to catch it in the fire-and-forget apply task.
+        TimeoutError("the cloud never answered"),
+    ],
+    ids=["refused", "timed-out"],
+)
 async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
     caplog: pytest.LogCaptureFixture,
+    raised: Exception,
 ) -> None:
     """The call the whole commitment rests on was the only one left bare.
 
@@ -4522,7 +4544,10 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
 
     async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("that mode is not supported by this entity")
+        raise raised
+
+    async def _accept(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
 
     hass.services.async_register("climate", "set_hvac_mode", _refuse)
 
@@ -4534,9 +4559,27 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
             await coordinator.async_refresh()
             await hass.async_block_till_done()
 
-    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
+    assert coordinator._store.get_zone("office")["last_action"] is None
     warnings = sum("could not command" in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
+
+    # A mode command lands, so the fault is over -- and its return is announced
+    # rather than sitting inside the stale budget.
+    hass.services.async_register("climate", "set_hvac_mode", _accept)
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(TEMP_ENTITY, "16.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.services.async_register("climate", "set_hvac_mode", _refuse)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        freezer.tick(timedelta(minutes=1))
+        hass.states.async_set(TEMP_ENTITY, "16.8", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+    assert sum("could not command" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
 
     # And the echo window was never armed by those attempts, so somebody at the
     # wall is still visible -- seconds after the last one, not minutes.
@@ -4629,6 +4672,83 @@ async def test_a_blink_while_commanding_does_not_become_the_baseline(
     await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_a_dial_turned_while_the_mode_is_unknown_is_still_an_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`unknown` costs us the mode, and only the mode.
+
+    An entity whose `hvac_mode` is None is still available, so it publishes its
+    attributes as usual -- and the setpoint is exactly where a wall edit shows.
+    Treating `unknown` as a non-state and skipping the whole observation was
+    measured swallowing three consecutive dial turns on an MQTT climate whose
+    mode topic had not arrived.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    turned: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, STATE_UNKNOWN, {"temperature": 19.5}),
+            "new_state": State(CLIMATE_ENTITY, STATE_UNKNOWN, {"temperature": 26.0}),
+        },
+    )
+    coordinator._on_climate_state_change(turned)
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_mode_call_that_lands_then_fails_keeps_its_echo_window(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Un-arming the window is for a call that touched nothing.
+
+    A cloud unit that publishes the mode and then times out on its confirming
+    poll has already produced an echo. Rolling the stamp back regardless sent
+    that echo outside the window to be compared -- against a baseline still
+    holding the pre-command state, and a commanded side the raise never
+    advanced -- so the unit's own answer read as somebody at the wall, six
+    flushes an hour on a unit like that.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+
+    async def _lands_then_fails(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 21.0})
+        raise HomeAssistantError("the confirming poll timed out")
+
+    hass.services.async_register("climate", "set_hvac_mode", _lands_then_fails)
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    # Its own echo, late but inside the window the command armed.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S - 5))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
     await hass.async_block_till_done()
 
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02

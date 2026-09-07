@@ -180,7 +180,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
-        # Per-fault stamps for the command-path warnings: "dropped",
+        # Per-fault stamps for the command-path warnings: "mode", "dropped",
         # "setpoint", "fan".
         self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
@@ -783,10 +783,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _may_log_command_warning(self, key: str) -> bool:
         """Throttle a command-path warning to one line per interval, per fault.
 
-        All three faults repeat. The dropped command repeats hardest -- nothing
-        is committed on that path, so the same-mode gate never arms and a
-        room-temp-driven zone re-enters it every refresh for the length of the
-        outage. The setpoint and fan faults repeat once per applied action, but
+        All four faults repeat. A dropped command and a raising `set_hvac_mode`
+        repeat hardest -- neither commits, so the same-mode gate never arms and
+        a room-temp-driven zone re-enters on every refresh for the length of the
+        fault. The setpoint and fan faults repeat once per applied action, but
         can be permanent: a unit that will not take a plain setpoint, or a
         stored fan mode it advertises and refuses, is a property of the hardware
         rather than a passing fault.
@@ -1288,13 +1288,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # integration commands `fan_only` on every idle release.
             if self._may_log_command_warning("mode"):
                 LOGGER.warning(
-                    "%s: could not command %s to %s (%s) -- not recording it; will retry",
+                    "%s: could not command %s to %s (%s: %s) -- not recording it; will retry",
                     self.zone_name,
                     self.climate_entity_id,
                     decision.target_mode,
+                    type(err).__name__,
                     err,
                 )
-            self._last_command_at = previous_command_at
+            # Un-arm the window only if the failed call left the entity
+            # untouched. A cloud unit that publishes the mode and *then* times
+            # out on its confirming poll has already produced an echo, and
+            # rolling back unconditionally sent that echo outside the window to
+            # be compared -- against a baseline still holding the pre-command
+            # state and a commanded side the raise never advanced, so the unit's
+            # own answer read as a hand edit. Measured at six flushes an hour on
+            # a unit like that, where `main` had none. `async_set` returns early
+            # without replacing the State object when nothing changed, so
+            # identity is the test for "wrote nothing"; anything else keeps the
+            # window armed, which is what `main` did throughout.
+            if self.hass.states.get(self.climate_entity_id) is before:
+                self._last_command_at = previous_command_at
             return
         self._command_warn_logged_at.pop("mode", None)
 
@@ -1474,10 +1487,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         elif self._last_command_state is None:
             # Nothing to leave standing. Our intent is a poor baseline, but a
             # missing one makes the listener adopt whatever arrives first, and
-            # for an entity that is merely slow to appear that is worse.
+            # for an entity that is merely slow to appear that is worse. The
+            # setpoint is what actually landed, by the same rule as the
+            # commanded side below: a `set_temperature` that raised never
+            # reached the unit, and offering its value here would let a wall
+            # edit that happens to land on it pass unnoticed.
             self._last_command_state = {
                 "hvac_mode": decision.target_mode,
-                "target_temp": rounded_target_temp,
+                "target_temp": setpoint_applied,
             }
         # Only what actually landed: a raised `set_temperature` never reached the
         # unit, so its value must not be treated as something the unit may
@@ -1630,27 +1647,41 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if old_state is None or new_state is None:
             # Initial state-added or entity-removed -- not a manual edit.
             return
-        if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        if new_state.state == STATE_UNAVAILABLE:
             # A unit dropping off the network is not somebody at the wall, and
-            # `{unavailable, None}` matches nothing, so comparing it flushed the
-            # learned model on every bridge blip. Ignoring it also leaves the
-            # baseline describing the last state the unit was really in, which
-            # is what the reconnect has to be judged against: if it comes back
-            # as we left it there is nothing to flush, and if somebody changed
-            # it meanwhile that is caught then.
-            #
-            # `unknown` for the same reason and by the same route: Home
-            # Assistant writes it whenever `ClimateEntity.hvac_mode` is None,
-            # which is the ordinary shape of an MQTT climate that is reachable
-            # again but has not received its mode topic yet. Covering only
-            # `unavailable` left that whole class flushing twice per blip --
-            # once on the way out and once on the way back, because the first
-            # comparison leaves the baseline holding `unknown`.
+            # an unavailable entity publishes no attributes either
+            # (`helpers/entity.py` fills them in only when `available`), so
+            # there is nothing here to compare -- `{unavailable, None}` matched
+            # nothing and flushed the learned model on every bridge blip.
+            # Ignoring it leaves the baseline describing the last state the unit
+            # was really in, which is what the reconnect gets judged against: if
+            # it comes back as we left it there is nothing to flush, and if
+            # somebody changed it meanwhile that is caught then.
             return
         observed = {
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
+        if new_state.state == STATE_UNKNOWN and self._last_command_state is not None:
+            # `unknown` is not the same thing as `unavailable`, though it is
+            # easy to treat it as one. Home Assistant writes it whenever
+            # `ClimateEntity.hvac_mode` is None -- an MQTT climate that is
+            # reachable again but has not had its mode topic yet -- and such an
+            # entity is *available*, so it goes on publishing its attributes.
+            # The mode is uncomparable; the setpoint is live and is exactly
+            # where a wall edit would show. So carry the last known mode
+            # forward, which makes that field say nothing, and let the setpoint
+            # be judged. Skipping the whole observation instead was measured
+            # swallowing three consecutive dial turns.
+            #
+            # A setpoint it isn't reporting either -- a climate coming up cold
+            # has neither -- is carried forward on the same reasoning, so an
+            # entity mid-initialisation says nothing rather than reading as
+            # somebody having cleared the dial. Once the mode arrives, the full
+            # comparison resumes.
+            observed["hvac_mode"] = self._last_command_state["hvac_mode"]
+            if observed["target_temp"] is None:
+                observed["target_temp"] = self._last_command_state["target_temp"]
         now = dt_util.utcnow()
         # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)
         # doesn't trip the negative `< window` branch and suppress legitimate
