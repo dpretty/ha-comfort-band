@@ -14,7 +14,9 @@ from typing import Any
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
+from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
@@ -3545,3 +3547,124 @@ async def test_subscribing_twice_does_not_leak_a_listener(
     async_fire_time_changed(hass, dt_util.utcnow())
     await hass.async_block_till_done()
     assert refreshes == 0, f"a listener survived unload and drove {refreshes} refreshes"
+
+
+# ---------------------------------------------------------------------------
+# Control-path bookkeeping: what the store records must match what the unit was
+# actually told to do. `last_action` drives both dwell gates and every later
+# decision, so a wrong value there is not cosmetic.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_failed_setpoint_still_records_the_started_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`set_hvac_mode` landing is what commits the zone, not the setpoint.
+
+    The unit starts conditioning on `set_hvac_mode`. Recording that only after
+    `set_temperature` meant any raise in between left the unit heating while the
+    store still said otherwise -- and `last_action` is what the min-cycle and
+    cross-mode dwells key off, so the zone's own bookkeeping stayed wrong from
+    then on.
+
+    Not a hypothetical fault: an entity advertising only
+    TARGET_TEMPERATURE_RANGE -- Ecobee, Nest, many `heat_cool` mini-splits --
+    makes Home Assistant itself raise for a plain `temperature`, so on that
+    whole class of hardware every heat/cool entry raised and `last_action` never
+    became correct at all.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    async def _reject_setpoint(call: Any) -> None:
+        raise HomeAssistantError(
+            "Set temperature action was used with the target temperature "
+            "parameter but the entity does not support it"
+        )
+
+    hass.services.async_register("climate", "set_temperature", _reject_setpoint)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert any(
+        c["hvac_mode"] == HVAC_MODE_HEAT for c in _calls_for(climate_calls, "set_hvac_mode")
+    ), climate_calls
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    # And the sample is still recorded, so the run isn't invisible to the model.
+    assert coordinator._samples_cache
+
+
+async def test_a_dropped_command_is_not_recorded(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A clean return from the service call is not proof of delivery.
+
+    Home Assistant answers a call it cannot deliver by skipping the entity and
+    returning normally -- verified against its real entity-service dispatch: an
+    available entity receives `set_hvac_mode`, an unavailable one receives
+    nothing and no exception is raised. Recording the action anyway leaves the
+    store describing something the unit never did, which the dwell gates and
+    every later decision then trust.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
+
+    # It retries once the unit is reachable again.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(TEMP_ENTITY, "15.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+
+async def test_a_slow_units_late_echo_is_not_a_manual_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The command baseline must record the mode we asked for, not the old one.
+
+    A slow or cloud-backed unit still reports its previous mode immediately
+    after the call, so snapshotting the live state made the baseline a value the
+    unit can never report again. Its own echo, arriving outside
+    `CLIMATE_ECHO_WINDOW_S`, then mismatched and was read as somebody editing
+    the thermostat by hand -- flushing the sample buffer and clearing the
+    persisted idle slope, so MPC lost readiness on every command to such a unit.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    # The unit has not caught up: it still reports the mode it was in before.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    assert coordinator._samples_cache
+
+    commanded = _calls_for(climate_calls, "set_hvac_mode")[-1]["hvac_mode"]
+    setpoint = _calls_for(climate_calls, "set_temperature")[-1]["temperature"]
+
+    # It finally catches up, well outside the echo window.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, commanded, {"temperature": setpoint})
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache, "the unit's own echo flushed the buffer"
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02

@@ -1185,21 +1185,97 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
             blocking=True,
         )
+
+        # A clean return is not proof of delivery. Home Assistant answers a call
+        # it cannot deliver by skipping the entity and returning normally
+        # (`helpers/service.py`: `if not entity.available: continue`), so an
+        # unavailable climate silently swallows the command. Recording it anyway
+        # leaves the store describing an action the unit never took, which the
+        # dwell gates and every later decision then trust. Leaving `last_action`
+        # alone makes the next refresh simply try again.
+        #
+        # Narrowed to `unavailable` rather than also covering a missing entity:
+        # an absent climate entity is a misconfiguration that breaks the zone
+        # outright, while `unavailable` is the transient bridge or cloud blip
+        # this is here for.
+        live = self.hass.states.get(self.climate_entity_id)
+        if live is not None and live.state == STATE_UNAVAILABLE:
+            LOGGER.warning(
+                "%s: commanded %s to %s but it is unavailable, so the call was "
+                "dropped -- not recording it; will retry",
+                self.zone_name,
+                self.climate_entity_id,
+                decision.target_mode,
+            )
+            return
+
+        # Record the commitment on the strength of `set_hvac_mode` alone: that
+        # is the call that makes the unit start conditioning, so from here on the
+        # store has to say so. Everything below refines a cycle that is already
+        # running.
+        #
+        # This ordering is load-bearing. `last_action` drives the min-cycle and
+        # cross-mode dwells and every later decision, so a raise from either
+        # call below used to leave the unit conditioning while the store said
+        # otherwise -- and one of them raises on ordinary hardware: an entity
+        # advertising only TARGET_TEMPERATURE_RANGE (Ecobee, Nest, many
+        # heat_cool mini-splits) makes Home Assistant itself raise for a plain
+        # `temperature`, so on that whole class the zone's bookkeeping never
+        # became correct at all. Committing before the setpoint lands can only
+        # widen the dwell slightly, which is the safe direction to err.
+        new_previous_action = (
+            last_action if last_action != decision.action else zone["previous_action"]
+        )
+        await self._store.async_update_zone(
+            self.zone_name,
+            last_action=decision.action,
+            last_action_at=now_utc.isoformat(),
+            previous_action=new_previous_action,
+        )
+
         # v0.13.0 deterministic fan-boost. Placed right after set_hvac_mode so
         # it fires for idle (fan_only) AND heat AND cool — set_temperature below
         # is skipped for idle. Past all suppression gates + shadow-mode, so it
         # only runs when the action is genuinely applied.
-        await self._maybe_command_fan(zone, decision.action)
-        if rounded_target_temp is not None:
-            await self.hass.services.async_call(
-                "climate",
-                "set_temperature",
-                {
-                    "entity_id": self.climate_entity_id,
-                    "temperature": rounded_target_temp,
-                },
-                blocking=True,
+        #
+        # Both of the following are best-effort: neither failing changes what the
+        # unit is doing, and neither may skip the bookkeeping above or the sample
+        # below. `_maybe_command_fan` catches only `HomeAssistantError`, so a
+        # cloud unit's timeout would otherwise escape into the fire-and-forget
+        # apply task.
+        try:
+            await self._maybe_command_fan(zone, decision.action)
+        except Exception as err:
+            LOGGER.warning(
+                "%s: commanded %s but could not set its fan mode (%s)",
+                self.zone_name,
+                self.climate_entity_id,
+                err,
             )
+        setpoint_applied: float | None = None
+        if rounded_target_temp is not None:
+            try:
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_temperature",
+                    {
+                        "entity_id": self.climate_entity_id,
+                        "temperature": rounded_target_temp,
+                    },
+                    blocking=True,
+                )
+                setpoint_applied = rounded_target_temp
+            except Exception as err:
+                LOGGER.warning(
+                    "%s: commanded %s to %s but could not set the target "
+                    "temperature to %s (%s) -- the unit is running against its "
+                    "own setpoint",
+                    self.zone_name,
+                    self.climate_entity_id,
+                    decision.target_mode,
+                    rounded_target_temp,
+                    err,
+                )
         # Snapshot the climate's actual state after our commands settle. The
         # service calls leave `decision.target_temp=None` for idle releases,
         # but the climate often keeps a stale `temperature` attribute from
@@ -1214,31 +1290,30 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # for the listener to compare against. Resetting to None here would
         # silently disable manual-edit detection on the next event.
         fresh = self.hass.states.get(self.climate_entity_id)
-        if fresh is not None:
-            self._last_command_state = {
-                "hvac_mode": fresh.state,
-                "target_temp": fresh.attributes.get("temperature"),
-            }
-            # Reuse the pre-call `now_utc` rather than calling utcnow() again:
-            # the small delta from slow climate calls would just slightly
-            # narrow the echo window without changing correctness, but staying
-            # in lockstep with `now_utc` matches the surrounding code's pattern
-            # of "one timestamp per refresh."
-            self._last_command_at = now_utc
-        # Roll `previous_action` forward on real transitions; leave it alone
-        # on same-mode re-commits (after the min-cycle window expires the
-        # coordinator re-issues the same hvac_mode — that's a refresh, not
-        # a transition, and the prior non-idle action shouldn't be
-        # overwritten by a same-action self-reference).
-        new_previous_action = (
-            last_action if last_action != decision.action else zone["previous_action"]
-        )
-        await self._store.async_update_zone(
-            self.zone_name,
-            last_action=decision.action,
-            last_action_at=now_utc.isoformat(),
-            previous_action=new_previous_action,
-        )
+        self._last_command_state = {
+            # The mode we commanded, NOT the one the entity is reporting. A slow
+            # or cloud-backed unit still shows its old mode here, and adopting
+            # that made the baseline a value the unit can never report again --
+            # so its real echo, arriving outside CLIMATE_ECHO_WINDOW_S, was read
+            # as somebody editing the thermostat by hand. That flushes the
+            # sample buffer and clears the persisted idle slope, taking MPC
+            # readiness with it, on every single command to such a unit.
+            "hvac_mode": decision.target_mode,
+            # The setpoint, though, does come from the entity when we didn't set
+            # one: an idle release leaves `target_temp` None while the unit keeps
+            # its stale `temperature`, and the echo carries that stale value.
+            # When our own setpoint landed it is the better answer, since that is
+            # what the unit will report once it catches up.
+            "target_temp": setpoint_applied
+            if setpoint_applied is not None
+            else (fresh.attributes.get("temperature") if fresh is not None else None),
+        }
+        # Reuse the pre-call `now_utc` rather than calling utcnow() again:
+        # the small delta from slow climate calls would just slightly
+        # narrow the echo window without changing correctness, but staying
+        # in lockstep with `now_utc` matches the surrounding code's pattern
+        # of "one timestamp per refresh."
+        self._last_command_at = now_utc
         # Record a sample under the newly-committed action — the predictor's
         # next refresh will see this sample in the trailing run for
         # decision.action and compute the slope from it.
