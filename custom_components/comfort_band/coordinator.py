@@ -180,7 +180,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
-        # Per-fault stamps for the command-path warnings: "mode", "dropped",
+        # Per-fault stamps for the command-path warnings: "dropped",
         # "setpoint", "fan".
         self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
@@ -783,10 +783,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _may_log_command_warning(self, key: str) -> bool:
         """Throttle a command-path warning to one line per interval, per fault.
 
-        All four faults repeat. A dropped command and a raising `set_hvac_mode`
-        repeat hardest -- neither commits, so the same-mode gate never arms and
-        a room-temp-driven zone re-enters on every refresh for the length of the
-        fault. The setpoint and fan faults repeat once per applied action, but
+        All three faults repeat. The dropped command repeats hardest -- nothing
+        is committed on that path, so the same-mode gate never arms and a
+        room-temp-driven zone re-enters on every refresh for the length of the
+        outage. The setpoint and fan faults repeat once per applied action, but
         can be permanent: a unit that will not take a plain setpoint, or a
         stored fan mode it advertises and refuses, is a property of the hardware
         rather than a passing fault.
@@ -1265,58 +1265,37 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # sampled -- see the delivery check below.
         before = self.hass.states.get(self.climate_entity_id)
         was_unavailable = before is not None and before.state == STATE_UNAVAILABLE
-        try:
-            await self.hass.services.async_call(
-                "climate",
-                "set_hvac_mode",
-                {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
-                blocking=True,
-            )
-        except Exception as err:
-            # The load-bearing call, and until now the only one still bare. A
-            # raise here escaped into the fire-and-forget apply task, which
-            # meant no log of our own, no commit, and -- because the same-mode
-            # gate never arms without one -- the same re-entry on every refresh
-            # that used to hold the echo window open across an outage. Same
-            # treatment as a dropped command: say so once per interval, un-arm
-            # the window, and leave the store describing what the unit was last
-            # actually told.
-            #
-            # Not hypothetical: a cloud unit can time out, and from Home
-            # Assistant 2025.4 `climate.set_hvac_mode` raises for a mode the
-            # entity does not advertise, where 2024.12 only warns. This
-            # integration commands `fan_only` on every idle release.
-            if self._may_log_command_warning("mode"):
-                LOGGER.warning(
-                    "%s: could not command %s to %s (%s: %s) -- not recording it; will retry",
-                    self.zone_name,
-                    self.climate_entity_id,
-                    decision.target_mode,
-                    type(err).__name__,
-                    err,
-                )
-            # A raise says the call did not complete. It does not say the unit
-            # never got it: a cloud round-trip that times out on its confirming
-            # poll may well have applied the mode and will publish it seconds
-            # later. So vouch for the mode -- and only the mode, since
-            # `set_temperature` never ran -- and that late echo is recognised
-            # whenever it lands, rather than depending on a window still being
-            # open. This is the honest reading of "we asked, and we do not know
-            # whether it arrived".
-            #
-            # An attempt to answer that question from the state machine was
-            # tried and measured wrong in both directions: `async_set` does
-            # return early without replacing the State object when nothing
-            # changed, but identity across the call then answers "did anything
-            # about this entity change", not "did our call land". A unit ticking
-            # `current_temperature` on its own topic mid-call held the window
-            # open and swallowed a wall edit two seconds later, while a unit
-            # publishing its mode just *after* the call still had its own echo
-            # read as a hand edit. Vouching sidesteps the question.
-            self._commanded_state = {"hvac_mode": decision.target_mode}
-            self._last_command_at = previous_command_at
-            return
-        self._command_warn_logged_at.pop("mode", None)
+        # Deliberately unguarded, unlike the fan and setpoint calls below. A
+        # raise here escapes into the fire-and-forget apply task, which is the
+        # pre-existing behaviour and not good -- there is no log of our own, and
+        # because nothing is committed the same-mode gate never arms, so the
+        # zone re-enters on every refresh for the length of the fault. It is
+        # left that way on purpose: guarding it was attempted here and the
+        # attempt failed four review rounds running, because "the call raised"
+        # and "the unit never got it" are not the same statement and the
+        # difference is not answerable from inside the `except`. Both readings
+        # were tried and each was measured flushing the learned model on
+        # ordinary hardware. It wants its own change, with the two round-12
+        # findings as its starting point:
+        #
+        #   * whatever is recorded on the raise must *narrow* the commanded
+        #     state rather than replace it, or a previous successful
+        #     `set_temperature` loses a vouch its echo is still relying on;
+        #   * and vouching for the mode alone leaves the setpoint half of the
+        #     same echo uncovered, which bites every unit that drops its
+        #     `temperature` attribute on reaching `fan_only` -- commanded on
+        #     every idle release -- or that restores a per-mode setpoint.
+        #
+        # It also matters beyond a cloud timeout: from Home Assistant 2025.4
+        # `climate.set_hvac_mode` raises for a mode the entity does not
+        # advertise, where 2024.12 only warns, and `fan_only` is exactly such a
+        # mode on many units.
+        await self.hass.services.async_call(
+            "climate",
+            "set_hvac_mode",
+            {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
+            blocking=True,
+        )
 
         # A clean return is not proof of delivery. Home Assistant answers a call
         # it cannot deliver by skipping the entity and returning normally
