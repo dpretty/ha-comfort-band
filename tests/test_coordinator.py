@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
-from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -4406,6 +4406,234 @@ async def test_an_entity_that_appears_during_the_call_is_recorded(
     assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
 
 
+async def test_a_unit_that_blips_through_unknown_is_not_an_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """`unknown` is the same non-state as `unavailable`, by the same route.
+
+    Home Assistant writes it whenever `ClimateEntity.hvac_mode` is None -- the
+    ordinary shape of an MQTT climate that is reachable again but has not
+    received its mode topic yet, and of anything that clears its mode before
+    first data. Covering only `unavailable` left that class flushing twice per
+    blip: once on the way out, and once on the way back, because the first
+    comparison leaves the baseline holding `unknown`.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    def _observe(previous: str, state: str, attrs: dict[str, Any]) -> None:
+        event: Event[EventStateChangedData] = Event(
+            "state_changed",
+            {
+                "entity_id": CLIMATE_ENTITY,
+                "old_state": State(CLIMATE_ENTITY, previous, {"temperature": 19.5}),
+                "new_state": State(CLIMATE_ENTITY, state, attrs),
+            },
+        )
+        coordinator._on_climate_state_change(event)
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(HVAC_MODE_HEAT, STATE_UNKNOWN, {})
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(STATE_UNKNOWN, HVAC_MODE_HEAT, {"temperature": 19.5})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_an_outage_does_not_erase_what_the_unit_was_last_doing(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Ignoring the transition has to mean ignoring it, baseline included.
+
+    Adopting `{unavailable, None}` on the way past would be worse than
+    comparing it: the reconnect is then judged against a state no unit ever
+    reports. It shows up on any unit whose report differs from what we asked
+    for -- one that snaps 19.5 to its own whole degree, say -- because then the
+    commanded side cannot cover for the lost baseline either.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # A whole-degree unit: we command 19.5, it reports 20.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    def _observe(previous: str, state: str, attrs: dict[str, Any]) -> None:
+        event: Event[EventStateChangedData] = Event(
+            "state_changed",
+            {
+                "entity_id": CLIMATE_ENTITY,
+                "old_state": State(CLIMATE_ENTITY, previous, {"temperature": 20.0}),
+                "new_state": State(CLIMATE_ENTITY, state, attrs),
+            },
+        )
+        coordinator._on_climate_state_change(event)
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(HVAC_MODE_HEAT, STATE_UNAVAILABLE, {})
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    _observe(STATE_UNAVAILABLE, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The call the whole commitment rests on was the only one left bare.
+
+    A raise escaped into the fire-and-forget apply task: no log of our own, no
+    commit, and -- because the same-mode gate never arms without one -- the same
+    re-entry on every refresh that used to hold the echo window open, so a wall
+    edit during the fault went unnoticed. Reachable from any cloud unit's
+    timeout, and from Home Assistant 2025.4 for a mode the entity does not
+    advertise, which this integration risks on every idle release.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+
+    async def _refuse(call: Any) -> None:
+        raise HomeAssistantError("that mode is not supported by this entity")
+
+    hass.services.async_register("climate", "set_hvac_mode", _refuse)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        for n in range(8):
+            freezer.tick(timedelta(minutes=1))
+            hass.states.async_set(TEMP_ENTITY, f"{16.0 + n * 0.1:.1f}", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
+    warnings = sum("could not command" in r.getMessage() for r in caplog.records)
+    assert 2 <= warnings <= 3, warnings
+
+    # And the echo window was never armed by those attempts, so somebody at the
+    # wall is still visible -- seconds after the last one, not minutes.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    freezer.tick(timedelta(seconds=5))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_COOL, {"temperature": 24.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_backwards_clock_step_does_not_hide_a_manual_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An RTC-less Pi correcting against NTP must not open the echo window.
+
+    A negative elapsed time satisfies a bare `< window`, so every climate change
+    would be taken for an echo of ours until the clock caught up -- and a wall
+    edit made in that stretch is adopted silently.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    freezer.move_to("2026-09-07 11:00:00+00:00")
+    edit: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_COOL, {"temperature": 24.0}),
+        },
+    )
+    coordinator._on_climate_state_change(edit)
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_blink_while_commanding_does_not_become_the_baseline(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The apply path may not record a non-state either.
+
+    Plenty of integrations end `async_set_hvac_mode` by refreshing the device,
+    and that refresh can briefly mark a just-commanded unit unreachable -- so
+    the state read after the calls is sometimes `unavailable`. Adopting it as
+    the baseline is the same mistake the listener refuses to make: the reconnect
+    is then judged against a state no unit ever reports. The unit here snaps
+    19.5 to its own whole degree, so what it reports differs from what we asked
+    and the commanded side cannot cover for a lost baseline.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    # Its echo, inside the window: the snapped setpoint becomes the baseline.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+
+    async def _accepts_then_blinks(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+        hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    hass.services.async_register("climate", "set_hvac_mode", _accepts_then_blinks)
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "15.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+    # It comes back doing exactly what it was doing.
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
 async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -4415,10 +4643,9 @@ async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
 ) -> None:
     """A climate outage must leave the store and the buffer alone, and not shout.
 
-    Scoped to what the apply path does about it. Whether the entity's own
-    transition to `unavailable` reaches the manual-edit detector as an edit is a
-    separate, pre-existing question -- it does, once the transition lands outside
-    the echo window -- and is not what this covers.
+    Scoped to what the apply path does about it. What the detector makes of the
+    entity's own transition to `unavailable` is a separate question, covered by
+    `test_a_unit_that_comes_back_as_we_left_it_is_not_an_edit`.
 
     No sample is recorded: we don't know what an unreachable unit is doing, and
     guessing displaces data we already have. Labelling under `last_action` was

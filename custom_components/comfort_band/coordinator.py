@@ -1093,17 +1093,25 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     ) -> None:
         """Translate the decision into climate.set_hvac_mode + set_temperature.
 
-        Skipped entirely when `enabled=False` (shadow mode -- log only).
-        Min-cycle suppression filters re-issue of the *same* action;
-        cross-mode-cycle suppression blocks heat↔cool flips within a short
-        dwell. Idle releases (heat→idle, cool→idle) pass through unchecked
-        so a heat or cool cycle can always stop.
+        No commands are issued when `enabled=False` (shadow mode -- log only);
+        it still records a sample, and drops what it had asked for so the
+        manual-edit detector stops vouching for it. Min-cycle suppression
+        filters re-issue of the *same* action; cross-mode-cycle suppression
+        blocks heat↔cool flips within a short dwell. Idle releases (heat→idle,
+        cool→idle) pass through unchecked so a heat or cool cycle can always
+        stop.
 
-        After applying (or holding), appends a sample to the v0.6 predictor
-        buffer reflecting the action the HVAC is actually in for the next
-        interval -- either the newly-committed `decision.action` (when
-        climate calls succeeded) or the prior `last_action` (when a gate
-        suppressed).
+        The commitment rests on `set_hvac_mode` alone -- that is the call that
+        makes the unit start conditioning. The fan and setpoint calls that
+        follow are best-effort: they refine a cycle that is already running, and
+        a raise from either is warned about but changes nothing that was
+        recorded.
+
+        Appends a sample reflecting the action the HVAC is actually in for the
+        next interval -- the newly-committed `decision.action` once
+        `set_hvac_mode` has landed, or the prior `last_action` when a gate
+        suppressed the re-issue. Nothing at all when the command did not reach
+        the unit: an unreachable climate is not doing anything we can label.
         """
         now_utc = dt_util.utcnow()
         if not enabled:
@@ -1243,9 +1251,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # `last_action_at` never advances, so the same-mode gate never arms and
         # the zone re-issues the command once per refresh for the length of an
         # outage. That is bounded by the request-refresh debounce rather than by
-        # any dwell here, so it scales with how fast the room sensor reports:
-        # measured at roughly 120 an hour for a 30-second sensor and over 300
-        # for a 10-second one, against a handful on `main`. They are filtered
+        # any dwell here, so it scales with how fast the room sensor reports --
+        # order of a hundred an hour for a 30-second sensor and several hundred
+        # for a 10-second one, where a committed action holds it to one per
+        # min-cycle however fast the sensor is. They are filtered
         # out at dispatch, so no device traffic leaves the machine and the
         # warning stays throttled; it self-limits on the first commit that
         # lands. A backoff would be an improvement, not a correctness fix.
@@ -1256,12 +1265,38 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # sampled -- see the delivery check below.
         before = self.hass.states.get(self.climate_entity_id)
         was_unavailable = before is not None and before.state == STATE_UNAVAILABLE
-        await self.hass.services.async_call(
-            "climate",
-            "set_hvac_mode",
-            {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
-            blocking=True,
-        )
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_hvac_mode",
+                {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
+                blocking=True,
+            )
+        except Exception as err:
+            # The load-bearing call, and until now the only one still bare. A
+            # raise here escaped into the fire-and-forget apply task, which
+            # meant no log of our own, no commit, and -- because the same-mode
+            # gate never arms without one -- the same re-entry on every refresh
+            # that used to hold the echo window open across an outage. Same
+            # treatment as a dropped command: say so once per interval, un-arm
+            # the window, and leave the store describing what the unit was last
+            # actually told.
+            #
+            # Not hypothetical: a cloud unit can time out, and from Home
+            # Assistant 2025.4 `climate.set_hvac_mode` raises for a mode the
+            # entity does not advertise, where 2024.12 only warns. This
+            # integration commands `fan_only` on every idle release.
+            if self._may_log_command_warning("mode"):
+                LOGGER.warning(
+                    "%s: could not command %s to %s (%s) -- not recording it; will retry",
+                    self.zone_name,
+                    self.climate_entity_id,
+                    decision.target_mode,
+                    err,
+                )
+            self._last_command_at = previous_command_at
+            return
+        self._command_warn_logged_at.pop("mode", None)
 
         # A clean return is not proof of delivery. Home Assistant answers a call
         # it cannot deliver by skipping the entity and returning normally
@@ -1424,17 +1459,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # What we asked for is recorded separately below and accepted alongside
         # this, which is what covers the lag in both fields without letting our
         # intent stand in for the unit's own report.
-        self._last_command_state = {
-            # The `fresh is None` fallbacks are the one exception. They are
-            # reached only for an entity absent from the state machine -- a
-            # misconfigured zone, or a climate platform that loads after this
-            # one -- and in the latter case the entity does eventually appear,
-            # so its second report is compared against our intent and may flush
-            # a buffer holding a sample or two. Small, and self-correcting on
-            # the next command.
-            "hvac_mode": fresh.state if fresh is not None else decision.target_mode,
-            "target_temp": fresh.attributes.get("temperature") if fresh is not None else None,
-        }
+        #
+        # `unavailable` / `unknown` are not states to record, for the same
+        # reason the listener refuses to compare them: a just-commanded unit
+        # reading unreachable for a moment is ordinary, and `{unavailable,
+        # None}` as a baseline matches nothing the unit will ever report. Leave
+        # the previous baseline standing instead -- it still describes the last
+        # state the unit was really in.
+        if fresh is not None and fresh.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self._last_command_state = {
+                "hvac_mode": fresh.state,
+                "target_temp": fresh.attributes.get("temperature"),
+            }
+        elif self._last_command_state is None:
+            # Nothing to leave standing. Our intent is a poor baseline, but a
+            # missing one makes the listener adopt whatever arrives first, and
+            # for an entity that is merely slow to appear that is worse.
+            self._last_command_state = {
+                "hvac_mode": decision.target_mode,
+                "target_temp": rounded_target_temp,
+            }
         # Only what actually landed: a raised `set_temperature` never reached the
         # unit, so its value must not be treated as something the unit may
         # report. Absent key rather than None -- None is a setpoint a climate can
@@ -1531,9 +1575,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         bounded on both ends. The caller moves the baseline on for every
         observation this accepts, so the two collapse to one as soon as the unit
         agrees with us; and a detected edit clears the commanded side outright,
-        so a second edit is judged against the occupant's own state alone. What
-        remains is a hand edit made during the lag window that lands on what we
-        just asked for, which is a change we would have made anyway.
+        so a second edit is judged against the occupant's own state alone.
+
+        What remains is a hand edit made during the lag window that lands on
+        one of the two values in each field. Landing on both of ours is a change
+        we would have made anyway; the mixtures are not, and turning the heating
+        off at the wall while leaving our setpoint alone is the one that costs
+        something -- it goes unflushed until the unit catches up or we command
+        again. That is the price of not flushing on every lagging unit's own
+        echo, which is the far commoner event.
         """
         baseline = self._last_command_state or {}
         commanded = self._commanded_state or {}
@@ -1580,7 +1630,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if old_state is None or new_state is None:
             # Initial state-added or entity-removed -- not a manual edit.
             return
-        if new_state.state == STATE_UNAVAILABLE:
+        if new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             # A unit dropping off the network is not somebody at the wall, and
             # `{unavailable, None}` matches nothing, so comparing it flushed the
             # learned model on every bridge blip. Ignoring it also leaves the
@@ -1588,6 +1638,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # is what the reconnect has to be judged against: if it comes back
             # as we left it there is nothing to flush, and if somebody changed
             # it meanwhile that is caught then.
+            #
+            # `unknown` for the same reason and by the same route: Home
+            # Assistant writes it whenever `ClimateEntity.hvac_mode` is None,
+            # which is the ordinary shape of an MQTT climate that is reachable
+            # again but has not received its mode topic yet. Covering only
+            # `unavailable` left that whole class flushing twice per blip --
+            # once on the way out and once on the way back, because the first
+            # comparison leaves the baseline holding `unknown`.
             return
         observed = {
             "hvac_mode": new_state.state,
