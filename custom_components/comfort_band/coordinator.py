@@ -179,6 +179,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
+        self._dropped_command_logged_at: datetime | None = None
         self._last_command_state: dict[str, Any] | None = None
         self._last_command_at: datetime | None = None
         self._unsub_climate: CALLBACK_TYPE | None = None
@@ -769,6 +770,20 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             persisted_idle_slope_at=None,
         )
 
+    def _may_log_dropped_command(self) -> bool:
+        """Throttle the undeliverable-command warning to once per interval.
+
+        Nothing is committed on that path, so the same-mode gate never arms and
+        every refresh re-enters it -- which for a room-temp-driven zone means a
+        warning every couple of seconds for the length of a bridge outage.
+        """
+        now = dt_util.utcnow()
+        last = self._dropped_command_logged_at
+        if last is not None and 0 <= (now - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+            return False
+        self._dropped_command_logged_at = now
+        return True
+
     def _may_log_sensor_edge(self, available: bool) -> bool:
         """Throttle sensor-availability logging to one line per direction.
 
@@ -1179,6 +1194,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         }
         self._last_command_at = now_utc
 
+        # HA filters on availability *at dispatch*, so that is what has to be
+        # sampled -- see the delivery check below.
+        before = self.hass.states.get(self.climate_entity_id)
+        was_unavailable = before is not None and before.state == STATE_UNAVAILABLE
         await self.hass.services.async_call(
             "climate",
             "set_hvac_mode",
@@ -1198,15 +1217,27 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # an absent climate entity is a misconfiguration that breaks the zone
         # outright, while `unavailable` is the transient bridge or cloud blip
         # this is here for.
+        # Both sides, because reading only *after* the call cannot tell a dropped
+        # command from a delivered one whose unit then blinked -- and plenty of
+        # integrations end `async_set_hvac_mode` with a refresh that briefly
+        # marks a just-commanded unit unreachable. Discarding the commit there is
+        # worse than the bug being fixed: nothing is ever recorded, so the
+        # min-cycle guard never arms and the zone re-commands on every refresh.
         live = self.hass.states.get(self.climate_entity_id)
-        if live is not None and live.state == STATE_UNAVAILABLE:
-            LOGGER.warning(
-                "%s: commanded %s to %s but it is unavailable, so the call was "
-                "dropped -- not recording it; will retry",
-                self.zone_name,
-                self.climate_entity_id,
-                decision.target_mode,
-            )
+        if was_unavailable and live is not None and live.state == STATE_UNAVAILABLE:
+            if self._may_log_dropped_command():
+                LOGGER.warning(
+                    "%s: commanded %s to %s but it is unavailable, so the call "
+                    "was dropped -- not recording it; will retry",
+                    self.zone_name,
+                    self.climate_entity_id,
+                    decision.target_mode,
+                )
+            # Sample under the action the unit is still performing, the same way
+            # the suppression gates above do: the room keeps responding to
+            # whatever is actually running, and starving the predictor through a
+            # climate outage costs learning we could otherwise keep.
+            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
             return
 
         # Record the commitment on the strength of `set_hvac_mode` alone: that
@@ -1284,11 +1315,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # event and spuriously flush the buffer. Reading the live state means
         # the baseline reflects reality, not our incomplete intent.
         #
-        # If the climate state isn't readable we KEEP the pre-call baseline
-        # (set just before the service calls above) -- an unreachable climate
-        # won't be emitting state-change events anyway, so there's nothing
-        # for the listener to compare against. Resetting to None here would
-        # silently disable manual-edit detection on the next event.
+        # An unreadable climate leaves `target_temp` None below, which is the
+        # honest answer: it isn't emitting state-change events for the listener
+        # to compare against either.
         fresh = self.hass.states.get(self.climate_entity_id)
         self._last_command_state = {
             # The mode we commanded, NOT the one the entity is reporting. A slow
@@ -1308,12 +1337,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             if setpoint_applied is not None
             else (fresh.attributes.get("temperature") if fresh is not None else None),
         }
-        # Reuse the pre-call `now_utc` rather than calling utcnow() again:
-        # the small delta from slow climate calls would just slightly
-        # narrow the echo window without changing correctness, but staying
-        # in lockstep with `now_utc` matches the surrounding code's pattern
-        # of "one timestamp per refresh."
-        self._last_command_at = now_utc
+        # `_last_command_at` is already `now_utc` from before the calls, so the
+        # echo window measures from when we started commanding rather than from
+        # whenever a slow unit finished -- one timestamp per refresh, as
+        # everywhere else here.
         # Record a sample under the newly-committed action — the predictor's
         # next refresh will see this sample in the trailing run for
         # decision.action and compute the slope from it.

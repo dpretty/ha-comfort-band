@@ -7,6 +7,7 @@ pytest-freezer `freezer` fixture for time travel.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -327,6 +328,24 @@ async def _unload_helper_coordinators(hass: HomeAssistant) -> AsyncIterator[None
     _HELPER_COORDINATORS.clear()
     if failures:
         raise ExceptionGroup("failed to unload test coordinators", failures)
+
+
+@contextlib.contextmanager
+def caplog_at_warning() -> Any:
+    """Collect WARNING records from the integration for the duration."""
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("custom_components.comfort_band")
+    sink = _Sink(level=logging.WARNING)
+    logger.addHandler(sink)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(sink)
 
 
 async def _setup_enabled_zone(
@@ -3651,7 +3670,10 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
     coordinator = await _setup_enabled_zone(hass, climate_calls)
 
     # The unit has not caught up: it still reports the mode it was in before.
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    # Deliberately not the setpoint we are about to command: if the stale
+    # attribute and our own value coincide, every variant of the baseline
+    # expression looks identical and the assertion below proves nothing.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 17.0})
     hass.states.async_set(TEMP_ENTITY, "16.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
@@ -3660,6 +3682,11 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
 
     commanded = _calls_for(climate_calls, "set_hvac_mode")[-1]["hvac_mode"]
     setpoint = _calls_for(climate_calls, "set_temperature")[-1]["temperature"]
+    # The baseline records what we asked for, not what the lagging unit reports.
+    assert coordinator._last_command_state == {
+        "hvac_mode": commanded,
+        "target_temp": setpoint,
+    }
 
     # It finally catches up, well outside the echo window.
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
@@ -3668,3 +3695,74 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
 
     assert coordinator._samples_cache, "the unit's own echo flushed the buffer"
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_a_unit_that_blinks_after_accepting_is_still_recorded(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Availability is judged at dispatch, not after the call returns.
+
+    Plenty of integrations end `async_set_hvac_mode` by refreshing the device,
+    and that refresh can briefly mark a just-commanded unit unreachable. Reading
+    availability only afterwards cannot tell that from a genuinely dropped call
+    -- and discarding the commit there is worse than the bug it was meant to
+    fix: nothing is ever recorded, so the min-cycle guard never arms and the
+    zone re-commands on every single refresh.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+
+    async def _accept_then_blink(call: Any) -> None:
+        climate_calls.append(("set_hvac_mode", dict(call.data)))
+        # Delivered -- and the unit drops off its bridge on the way back.
+        hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    hass.services.async_register("climate", "set_hvac_mode", _accept_then_blink)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert any(
+        c["hvac_mode"] == HVAC_MODE_HEAT for c in _calls_for(climate_calls, "set_hvac_mode")
+    ), climate_calls
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+
+async def test_an_undeliverable_command_still_feeds_the_predictor(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A climate outage must not starve the model while the room sensor is fine.
+
+    The room keeps responding to whatever the unit is actually still doing, so
+    the sample is recorded under `last_action` -- the same convention both
+    suppression gates already follow. And the warning is throttled, because
+    nothing is committed on this path so every refresh re-enters it.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+    before = len(coordinator._samples_cache)
+    warnings = 0
+    with caplog_at_warning() as records:
+        for n in range(6):
+            freezer.tick(timedelta(minutes=1))
+            hass.states.async_set(TEMP_ENTITY, f"{16.0 + n * 0.1:.1f}", {})
+            await coordinator.async_refresh()
+            await hass.async_block_till_done()
+        warnings = sum("was dropped" in r.message for r in records)
+
+    assert len(coordinator._samples_cache) > before, "the predictor was starved"
+    assert coordinator._store.get_zone("office")["last_action"] != ACTION_HEAT
+    assert warnings <= 2, warnings
