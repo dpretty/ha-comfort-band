@@ -965,7 +965,17 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # A unit that rejects set_fan_mode (e.g. mid-transition to fan_only)
             # must not abort the rest of _maybe_apply_action -- the sample
             # append still needs to run.
-            LOGGER.warning("%s: climate.set_fan_mode(%s) failed: %s", self.zone_name, desired, err)
+            #
+            # Throttled for the same reason as the other command-path warnings,
+            # and this one repeats hardest: the guard above only skips the call
+            # when the unit already reports the mode we want, so a stored fan
+            # mode it will never accept is retried on every apply, forever.
+            if self._may_log_command_warning("fan"):
+                LOGGER.warning(
+                    "%s: climate.set_fan_mode(%s) failed: %s", self.zone_name, desired, err
+                )
+        else:
+            self._command_warn_logged_at.pop("fan", None)
 
     def _resolve_schedule(
         self,
@@ -1203,17 +1213,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             step = self._target_temp_step()
             rounded_target_temp = _round_to_step(decision.target_temp, step)
 
-        # About to issue climate commands: snapshot our intent so the
-        # climate-state listener can recognise the resulting echoes and
-        # avoid mistaking them for manual edits. Only hvac_mode + target_temp
-        # are compared (see `_on_climate_state_change`): fan_mode is captured
-        # in samples but deliberately NOT part of the manual-edit comparison
+        # About to issue climate commands: stamp the echo window so the
+        # climate-state listener can recognise the resulting echoes and avoid
+        # mistaking them for manual edits. Only hvac_mode + target_temp are
+        # compared (see `_on_climate_state_change`): fan_mode is captured in
+        # samples but deliberately NOT part of the manual-edit comparison
         # (v0.10.1 -- the HVAC's own per-mode / autonomous fan changes were
         # flushing the learning buffer and starving MPC of idle samples).
-        self._last_command_state = {
-            "hvac_mode": decision.target_mode,
-            "target_temp": rounded_target_temp,
-        }
+        #
+        # Deliberately no baseline write here. It used to snapshot our intent,
+        # but on the success path the tail below overwrites it from the entity
+        # anyway, so the only paths it survived on were the ones where nothing
+        # reached the unit -- a dropped command, or `set_hvac_mode` raising --
+        # and those are exactly where our intent must not stand in for what the
+        # unit is reporting. What we asked for is vouched for separately, and
+        # only once it has actually been delivered.
         self._last_command_at = now_utc
 
         # HA filters on availability *at dispatch*, so that is what has to be
@@ -1317,12 +1331,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         try:
             await self._maybe_command_fan(zone, decision.action)
         except Exception as err:
-            LOGGER.warning(
-                "%s: commanded %s but could not set its fan mode (%s)",
-                self.zone_name,
-                self.climate_entity_id,
-                err,
-            )
+            if self._may_log_command_warning("fan"):
+                LOGGER.warning(
+                    "%s: commanded %s but could not set its fan mode (%s)",
+                    self.zone_name,
+                    self.climate_entity_id,
+                    err,
+                )
         setpoint_applied: float | None = None
         if rounded_target_temp is not None:
             try:
@@ -1471,12 +1486,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         one: a spurious "manual edit" that flushes the sample buffer and drops
         the persisted idle slope, so `mpc.is_ready` never turns true.
 
-        This does soften detection, per field, by whichever of the two values
-        the unit is not currently reporting -- but only until it agrees with us,
-        because the caller moves the baseline on for every observation this
-        accepts. Once a unit has caught up, both values are the same one again.
-        What remains softened is a human setting the thermostat to precisely
-        what we last asked for, which is a change we would have made anyway.
+        This does soften detection, per field, and by a mixture rather than a
+        single state: while the two disagree, a hand edit landing on our value
+        for one field and the unit's for the other is accepted too. It is
+        bounded on both ends. The caller moves the baseline on for every
+        observation this accepts, so the two collapse to one as soon as the unit
+        agrees with us; and a detected edit clears the commanded side outright,
+        so a second edit is judged against the occupant's own state alone. What
+        remains is a hand edit made during the lag window that lands on what we
+        just asked for, which is a change we would have made anyway.
         """
         baseline = self._last_command_state or {}
         commanded = self._commanded_state or {}
@@ -1490,8 +1508,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _on_climate_state_change(self, event: Event[EventStateChangedData]) -> None:
         """Flush the sample buffer when the climate entity changes outside our path.
 
-        Compares observed state to `_last_command_state` (what we last asked
-        the climate to be). Within the CLIMATE_ECHO_WINDOW_S window after our
+        Compares the observed state against two things: `_last_command_state`,
+        what the entity was last seen reporting, and `_commanded_state`, what we
+        last asked it for -- a field matching either is expected (see
+        `_observation_is_expected`). Within the CLIMATE_ECHO_WINDOW_S window after our
         own command the state may transition through intermediate values
         (`set_hvac_mode` + `set_temperature` fire two state-change events
         sequentially, and a slow climate can take many seconds to acknowledge
@@ -1567,6 +1587,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         )
         self._samples_cache = []
         self._last_command_state = observed
+        # And our last command stops vouching for anything. The unit is
+        # demonstrably not doing what we asked, so leaving it standing accepts,
+        # field by field, a mixture of what the occupant just set and what we
+        # asked for -- a state neither of us ever chose. Concretely: they switch
+        # to cool 24 (flush, correctly), then put the mode back to heat and keep
+        # their 24. Mode matches our command, setpoint matches what they just
+        # set, so nothing flushes and the unit heats to 24 with the model still
+        # fitted to our own cycle.
+        self._commanded_state = None
         # Reset the persist throttle so the first sample after the flush
         # writes immediately, matching the "transitions always persist"
         # contract (a flush is functionally a forced segment boundary).

@@ -71,6 +71,9 @@ SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
 # command, a setpoint the unit won't take) repeat on every refresh for as long
 # as the fault lasts, and one of those faults is permanent -- an entity that
 # advertises only a temperature *range* raises for a plain setpoint forever.
+# The budget is per fault episode, not per hour: each key is cleared as soon as
+# its own fault stops, so a unit that fails intermittently still gets a line per
+# episode. That is the trade for announcing a fault's return promptly.
 COMMAND_WARN_INTERVAL_S: Final = 300
 
 # Slope estimator: minimum samples per segment before WLS produces a slope;
