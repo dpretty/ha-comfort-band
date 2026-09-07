@@ -8,21 +8,27 @@ pytest-freezer `freezer` fixture for time travel.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.comfort_band.const import (
     ACTION_COOL,
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    CLIMATE_ECHO_WINDOW_S,
+    HVAC_MODE_COOL,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
+    SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
 from custom_components.comfort_band.coordinator import ZoneCoordinator, ZoneState
 from custom_components.comfort_band.storage import ComfortBandStore
@@ -36,7 +42,14 @@ async def coordinator(hass: HomeAssistant, hass_storage: dict[str, Any]) -> Zone
     store = ComfortBandStore(hass)
     await store.async_load()
     await store.async_add_zone("office")
-    return ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    zone_coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    # Subscribed and registered for teardown for the same reason as
+    # `_setup_enabled_zone` -- this fixture builds coordinators for ~25 tests,
+    # and leaving it on the old unsubscribed path would preserve exactly the
+    # harness-versus-production divergence this is meant to remove.
+    zone_coordinator.subscribe_and_hydrate()
+    _HELPER_COORDINATORS.append(zone_coordinator)
+    return zone_coordinator
 
 
 async def test_returns_zone_state_with_room_reading(
@@ -276,6 +289,44 @@ def _calls_for(
     return [data for srv, data in climate_calls if srv == service]
 
 
+_HELPER_COORDINATORS: list[ZoneCoordinator] = []
+
+
+@pytest.fixture(autouse=True)
+async def _unload_helper_coordinators(hass: HomeAssistant) -> AsyncIterator[None]:
+    """Unload every coordinator the fixtures in this module built.
+
+    The helper wires the real listeners, so a state change arms the coordinator's
+    2 s debounce; a test that ends without unloading leaves that timer pending
+    and HA's lingering-timer check fails it. Doing it here rather than in each
+    test keeps it impossible to forget -- and `async_unload` is documented safe
+    to call repeatedly, so tests that already unload explicitly are unaffected.
+    """
+    _HELPER_COORDINATORS.clear()
+    yield
+    failures: list[Exception] = []
+    for coordinator in _HELPER_COORDINATORS:
+        # Guarded per coordinator so one failure doesn't skip the rest and turn
+        # into a cascade of confusing lingering-timer errors -- but collected
+        # and re-raised below rather than swallowed. 41 tests never unload
+        # themselves, so logging alone would turn a real `async_unload`
+        # regression into a log line for exactly those.
+        try:
+            await coordinator.async_unload()
+            # Also stop the coordinator's own request-refresh debouncer. In
+            # production `DataUpdateCoordinator.__init__` registers
+            # `config_entry.async_on_unload(self.async_shutdown)`, but only when
+            # it has a config entry -- which a coordinator built directly like
+            # this one does not, so nothing would ever cancel its pending
+            # debounce.
+            await coordinator.async_shutdown()
+        except Exception as err:
+            failures.append(err)
+    _HELPER_COORDINATORS.clear()
+    if failures:
+        raise ExceptionGroup("failed to unload test coordinators", failures)
+
+
 async def _setup_enabled_zone(
     hass: HomeAssistant, climate_calls: list[tuple[str, dict[str, Any]]]
 ) -> ZoneCoordinator:
@@ -286,6 +337,13 @@ async def _setup_enabled_zone(
     coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
     # Force enabled before any refresh fires.
     await store.async_update_zone("office", enabled=True)
+    # Wire the real listeners, exactly as `async_setup` does in production.
+    # Without them a sensor change reaches the coordinator only through a test's
+    # own `async_refresh()`, so the event-driven path these tests are supposed to
+    # be covering never runs -- and `_on_climate_state_change` never fires, which
+    # makes every "no manual edit was detected" assertion vacuous.
+    coordinator.subscribe_and_hydrate()
+    _HELPER_COORDINATORS.append(coordinator)
     return coordinator
 
 
@@ -3267,3 +3325,223 @@ async def test_a_nan_reading_counts_as_no_reading(
         await hass.async_block_till_done()
         assert coordinator.data.sensor_available is False, value
     await coordinator.async_unload()
+
+
+# ---------------------------------------------------------------------------
+# The event-driven path itself. This coordinator has `update_interval=None`, so
+# every decision it ever makes is triggered by a state change -- yet for a long
+# time the harness built coordinators without subscribing, and every test drove
+# them with an explicit `async_refresh()`. That is a different code path from
+# production, and it hid a real defect through five review rounds. These two
+# tests exist to fail if the wiring is ever dropped again.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_sensor_change_alone_drives_a_decision(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A room-temp change must reach the coordinator on its own.
+
+    No `async_refresh()` anywhere in this test: the sensor moving below band is
+    the only input, and the resulting climate command is proof the subscription
+    is live. Every other test in this file drives refreshes by hand, so without
+    this one the harness could stop subscribing entirely and stay green.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    climate_calls.clear()
+
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await hass.async_block_till_done()
+    # Room-temp changes are debounced 2 s before a refresh is requested.
+    freezer.tick(timedelta(seconds=5))
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    assert any(
+        c["hvac_mode"] == HVAC_MODE_HEAT for c in _calls_for(climate_calls, "set_hvac_mode")
+    ), climate_calls
+    # The refresh really ran off the event, not off stale state.
+    assert coordinator.data.room == 16.0
+    assert coordinator.data.decision.action == ACTION_HEAT
+
+
+async def test_a_climate_change_alone_reaches_the_manual_edit_detector(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Somebody using the wall remote must reach the detector by itself.
+
+    The detector's own logic is covered by tests that call
+    `_on_climate_state_change` with a hand-built event, which proves the logic
+    but not that anything is subscribed to deliver one. This closes that gap
+    from the other side: the only input is the climate entity changing.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._samples_cache, "expected a sample to have been recorded"
+
+    # Someone picks up the remote, well outside the echo window.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 30))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_COOL, {"temperature": 17.0})
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache == [], "a manual edit should flush the buffer"
+
+
+async def test_setup_hydrates_the_buffer_before_the_first_refresh(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Restoring the learned samples must happen before anything appends one.
+
+    `_append_sample` persists the whole list, and on a fresh coordinator
+    `_last_sample_persist_at is None`, so the first append writes immediately
+    with no throttle. Refresh before hydrating and the store is truncated to
+    that one sample -- the thermal model wiped on every restart and
+    `mpc.is_ready` permanently False. The ordering used to be self-evident
+    inside a single method; it is a contract between two now, so it needs a test.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    await store.async_update_zone("office", enabled=True)
+
+    seeded = [
+        {
+            "t": (dt_util.utcnow() - timedelta(minutes=n)).isoformat(),
+            "temp": 20.0 + n * 0.1,
+            "action": ACTION_IDLE,
+            "fan_mode": None,
+        }
+        for n in range(8, 0, -1)
+    ]
+    await store.async_update_zone("office", samples=seeded)
+
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    _HELPER_COORDINATORS.append(coordinator)
+    coordinator.subscribe_and_hydrate()
+    assert len(coordinator._samples_cache) == len(seeded)
+
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert len(coordinator._samples_cache) >= len(seeded)
+    assert len(store.get_zone("office")["samples"]) >= len(seeded)
+
+
+async def test_a_profile_change_alone_re_evaluates_the_zone(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Switching profile must reach every zone on its own.
+
+    `subscribe_and_hydrate` wires three things, and the profile signal was the
+    one with no coverage at all -- deleting the subscription passed the whole
+    suite. Without it a home/away switch wouldn't re-evaluate a zone until its
+    sensor happened to move, which on a settled room can be a long time.
+
+    Note the drain step below: a room-temp change arms a 2 s debounce that an
+    explicit `async_refresh()` does not cancel, so advancing the clock later
+    would fire *that* and refresh the zone for the wrong reason. A first draft
+    of this test passed with the signal subscription deleted for exactly that
+    reason.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    store = coordinator._store
+    await store.async_set_zone_schedule(
+        "office", "home", [{"at": "00:00", "low": 18.0, "high": 24.0}]
+    )
+    await store.async_set_zone_schedule(
+        "office", "away", [{"at": "00:00", "low": 21.5, "high": 24.0}]
+    )
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Drain the pending sensor debounce so it can't supply the refresh below.
+    freezer.tick(timedelta(seconds=5))
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    climate_calls.clear()
+
+    # The signal is now the only thing that can trigger a re-evaluation --
+    # sent exactly as `profiles.py` sends it.
+    await store.async_set_active_profile("away")
+    async_dispatcher_send(hass, SIGNAL_ACTIVE_PROFILE_CHANGED, "away")
+    await hass.async_block_till_done()
+    # Its handler requests a refresh through the coordinator's own debouncer.
+    freezer.tick(timedelta(seconds=15))
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    assert coordinator.data.decision.action == ACTION_HEAT
+    assert any(
+        c["hvac_mode"] == HVAC_MODE_HEAT for c in _calls_for(climate_calls, "set_hvac_mode")
+    ), climate_calls
+
+
+async def test_subscribing_twice_does_not_leak_a_listener(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A second subscribe must not orphan the first set of listeners.
+
+    Each unsub handle is stored in a single attribute, so re-wiring without
+    guarding would overwrite it and leave the original registration alive with
+    nothing holding its handle -- and `async_unload`, documented as cancelling
+    every active subscription, could then never cancel it. HA's own
+    lingering-check does not catch a stray `state_changed` listener, so it would
+    fail silently, leaving a torn-down coordinator able to command a live
+    climate entity.
+
+    Unreachable today (production subscribes once), but the wiring is a public
+    entry point now, so the guard is worth pinning.
+    """
+    freezer.move_to("2026-07-30 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    first_unsub = coordinator._unsub_state
+
+    coordinator.subscribe_and_hydrate()
+    assert coordinator._unsub_state is first_unsub, "re-wired over the live listener"
+
+    refreshes = 0
+    real_update = coordinator._async_update_data
+
+    async def _count() -> Any:
+        nonlocal refreshes
+        refreshes += 1
+        return await real_update()
+
+    coordinator._async_update_data = _count  # type: ignore[method-assign]
+    await coordinator.async_unload()
+
+    # After unload nothing may still be listening.
+    hass.states.async_set(TEMP_ENTITY, "17.0", {})
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(seconds=10))
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+    assert refreshes == 0, f"a listener survived unload and drove {refreshes} refreshes"

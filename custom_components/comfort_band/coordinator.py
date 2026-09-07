@@ -193,6 +193,38 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
     async def async_setup(self) -> None:
         """Wire event-driven triggers and run the first refresh."""
+        self.subscribe_and_hydrate()
+        await self.async_config_entry_first_refresh()
+
+    @callback
+    def subscribe_and_hydrate(self) -> None:
+        """Wire the event-driven triggers and restore cached state from the store.
+
+        Named for both jobs because the order matters and is no longer obvious
+        once this is a method rather than an inlined block: the first refresh
+        must see a hydrated `_samples_cache`. `_append_sample` persists the whole
+        list, and on a fresh coordinator `_last_sample_persist_at is None` so the
+        first append writes immediately with no throttle -- run the refresh
+        before hydration and the store is truncated to a single sample, wiping
+        the learned thermal model on every restart and leaving `mpc.is_ready`
+        permanently False.
+
+        Split out of `async_setup` so tests can exercise the same wiring. This
+        coordinator has `update_interval=None` -- every decision is triggered by
+        a state change -- so a harness that skips this is not testing the
+        production path at all: a sensor recovery reaches such a coordinator only
+        through an explicit refresh, and `_on_climate_state_change` never fires,
+        which silently makes every "no manual edit was detected" assertion
+        vacuous. `async_setup` can't be reused directly because
+        `async_config_entry_first_refresh` requires a real config entry in
+        SETUP_IN_PROGRESS.
+
+        Idempotent: a second call would otherwise orphan the first set of
+        listeners, which `async_unload` could then never cancel -- leaving a
+        torn-down coordinator able to command a live climate entity.
+        """
+        if self._unsub_state is not None:
+            return
         # Subscribe to temp + (optionally) humidity changes via the same
         # debounced path — a humidity-only change should re-evaluate when
         # `use_apparent_temperature` is on.
@@ -210,7 +242,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_climate = async_track_state_change_event(
             self.hass, [self.climate_entity_id], self._on_climate_state_change
         )
-        await self.async_config_entry_first_refresh()
 
     async def async_unload(self) -> None:
         """Cancel every active subscription. Safe to call repeatedly."""
