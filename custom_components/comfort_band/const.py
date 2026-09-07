@@ -67,6 +67,15 @@ CLIMATE_ECHO_WINDOW_S: Final = 30
 # interval: five minutes makes a flapping sensor cheap while still reporting a
 # real dropout promptly.
 SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
+# Same budget, separate name: the command-path warnings (an undeliverable
+# command, a setpoint the unit won't take, a fan mode it won't take) repeat for
+# as long as the fault lasts, and two of them can be permanent -- an entity that
+# advertises only a temperature *range* raises for a plain setpoint forever, and
+# a stored fan mode a unit advertises but refuses is retried on every apply.
+# The budget is per fault episode, not per hour: each key is cleared when a call
+# of its own kind next succeeds, so a unit that fails intermittently still gets
+# a line per episode. That is the trade for announcing a return promptly.
+COMMAND_WARN_INTERVAL_S: Final = 300
 
 # Slope estimator: minimum samples per segment before WLS produces a slope;
 # exponential recency weight time constant; epsilon below which a slope is
