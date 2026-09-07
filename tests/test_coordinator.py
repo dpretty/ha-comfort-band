@@ -3556,11 +3556,26 @@ async def test_subscribing_twice_does_not_leak_a_listener(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [
+        HomeAssistantError(
+            "Set temperature action was used with the target temperature "
+            "parameter but the entity does not support it"
+        ),
+        # Not a `HomeAssistantError`: the guard is deliberately broad because a
+        # cloud unit's timeout would otherwise escape into the fire-and-forget
+        # apply task, where nothing is waiting to catch it.
+        TimeoutError("the cloud never answered"),
+    ],
+    ids=["rejected", "timed-out"],
+)
 async def test_a_failed_setpoint_still_records_the_started_cycle(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
+    raised: Exception,
 ) -> None:
     """`set_hvac_mode` landing is what commits the zone, not the setpoint.
 
@@ -3580,10 +3595,7 @@ async def test_a_failed_setpoint_still_records_the_started_cycle(
     coordinator = await _setup_enabled_zone(hass, climate_calls)
 
     async def _reject_setpoint(call: Any) -> None:
-        raise HomeAssistantError(
-            "Set temperature action was used with the target temperature "
-            "parameter but the entity does not support it"
-        )
+        raise raised
 
     hass.services.async_register("climate", "set_temperature", _reject_setpoint)
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
@@ -3597,6 +3609,9 @@ async def test_a_failed_setpoint_still_records_the_started_cycle(
     assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
     # And the sample is still recorded, so the run isn't invisible to the model.
     assert coordinator._samples_cache
+    # A setpoint that never reached the unit is not something the unit may
+    # report, so it must not join what the manual-edit detector accepts.
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT}
 
 
 async def test_a_dropped_command_is_not_recorded(
@@ -3663,8 +3678,10 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
 
     commanded = _calls_for(climate_calls, "set_hvac_mode")[-1]["hvac_mode"]
     setpoint = _calls_for(climate_calls, "set_temperature")[-1]["temperature"]
-    # The baseline records what we asked for, not what the lagging unit reports.
-    assert coordinator._last_command_state == {
+    # What we asked for is recorded, so the unit is allowed to report it later
+    # however long it takes -- the lagging value it shows now is not the only
+    # thing the listener will accept.
+    assert coordinator._commanded_state == {
         "hvac_mode": commanded,
         "target_temp": setpoint,
     }
@@ -3675,6 +3692,90 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
     await hass.async_block_till_done()
 
     assert coordinator._samples_cache, "the unit's own echo flushed the buffer"
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+    # And the mode the unit was lagging on is not thereby made acceptable
+    # forever: somebody putting it back is still a real edit, because the room
+    # stops being heated. Recording the live (stale) mode as the baseline would
+    # swallow exactly this. Fed as a synthetic event, like the other
+    # manual-edit tests, so no refresh can interleave with it.
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    await hass.async_block_till_done()
+    reverted: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, commanded, {"temperature": setpoint}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": setpoint}),
+        },
+    )
+    coordinator._on_climate_state_change(reverted)
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+
+async def test_a_unit_that_snaps_the_setpoint_is_not_a_manual_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A unit that reports a coerced setpoint must not look hand-edited.
+
+    `ClimateEntity.state_attributes` puts `temperature` through `display_temp`,
+    which rounds to the entity's own `precision` -- independent of the
+    `target_temp_step` this integration rounds to, and absent entirely from
+    `capability_attributes` when the platform publishes no step. So a
+    whole-degree thermostat commanded 19.5 reports 20, forever.
+
+    Pinning the baseline to our commanded value alone therefore mismatches on
+    every later attribute update, and a same-mode re-commit is exactly the case
+    the echo path cannot rescue: nothing the unit reports changes, so no state
+    event fires for the echo branch to correct the baseline with.
+
+    That the detector still fires on a real edit is pinned by
+    `test_manual_climate_edit_flushes_buffer`, whose edit matches neither the
+    baseline nor what was commanded.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+
+    # A whole-degree unit: it snaps whatever we send to the nearest integer.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    setpoint = _calls_for(climate_calls, "set_temperature")[-1]["temperature"]
+    assert setpoint == 19.5, "the test needs a setpoint the unit has to snap"
+
+    # Its echo, inside the window, reports the snapped value.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 20.0})
+    await hass.async_block_till_done()
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    assert coordinator._samples_cache
+
+    # Past the min-cycle the same decision is re-committed. The unit is already
+    # in heat at its snapped setpoint, so it reports nothing new and no echo
+    # arrives.
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "18.1", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert len(_calls_for(climate_calls, "set_temperature")) >= 2, "no re-commit"
+
+    # An ordinary attribute update, well outside the echo window.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(
+        CLIMATE_ENTITY,
+        HVAC_MODE_HEAT,
+        {"temperature": 20.0, "current_temperature": 18.4},
+    )
+    await hass.async_block_till_done()
+
+    assert coordinator._samples_cache, "the unit's snapped setpoint read as a manual edit"
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
@@ -3720,6 +3821,43 @@ async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(
     # never again, which would silence a later outage entirely.
     warnings = sum("was dropped" in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
+
+
+async def test_a_backwards_clock_step_does_not_silence_the_dropped_command_log(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A clock correction must not starve this throttle either.
+
+    Same fault as `test_a_backwards_clock_step_does_not_silence_the_log`, and
+    the same correlated cause: the power cut that rebooted an RTC-less Pi is
+    also what took the HVAC's bridge down. A negative elapsed time satisfies a
+    bare `< interval`, so nothing would be said about a unit that is dropping
+    every command until the clock caught up.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    # One dropped command, logged, which stamps the budget.
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # The clock jumps backwards past the stamp.
+    freezer.move_to("2026-09-07 10:00:00+00:00")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        hass.states.async_set(TEMP_ENTITY, "15.9", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("was dropped" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
 
 
 async def test_a_new_outage_is_announced_after_the_unit_recovers(
@@ -3878,9 +4016,9 @@ async def test_the_commit_lands_before_the_setpoint_call(
     """Ordering, not just the guard, is what makes the commit safe.
 
     `except Exception` doesn't catch `BaseException`, and the apply task is
-    cancelled on shutdown and on a config-entry reload -- so if the commit sat
-    after the setpoint call, a cancellation there would still leave the unit
-    conditioning with nothing recorded. Pinning the order rather than the
+    cancelled on shutdown (it is created on `hass`, so `async_stop` cancels it)
+    -- so if the commit sat after the setpoint call, a cancellation there would
+    still leave the unit conditioning with nothing recorded. Pinning the order rather than the
     guard: with the commit moved back below the setpoint, this fails.
     """
     freezer.move_to("2026-09-07 12:00:00+00:00")

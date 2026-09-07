@@ -181,6 +181,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
         self._dropped_command_logged_at: datetime | None = None
         self._last_command_state: dict[str, Any] | None = None
+        # What we last actually asked the climate for, kept apart from the
+        # baseline above because the listener overwrites that with whatever the
+        # entity reports. A unit is allowed to report either (see
+        # `_observation_is_expected`).
+        self._commanded_state: dict[str, Any] | None = None
         self._last_command_at: datetime | None = None
         self._unsub_climate: CALLBACK_TYPE | None = None
         self._last_sample_persist_at: datetime | None = None
@@ -270,6 +275,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._sensor_edge_logged_at = {True: None, False: None}
         self._dropped_command_logged_at = None
         self._last_command_state = None
+        self._commanded_state = None
         self._last_command_at = None
         self._last_sample_persist_at = None
         self._last_idle_slope_persist_at = None
@@ -1345,17 +1351,28 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # so its real echo, arriving outside CLIMATE_ECHO_WINDOW_S, was read
             # as somebody editing the thermostat by hand. That flushes the
             # sample buffer and clears the persisted idle slope, taking MPC
-            # readiness with it, on every single command to such a unit.
+            # readiness with it, on every single command to such a unit. A mode
+            # is safe to pin because it is echoed back verbatim.
             "hvac_mode": decision.target_mode,
-            # The setpoint, though, does come from the entity when we didn't set
-            # one: an idle release leaves `target_temp` None while the unit keeps
-            # its stale `temperature`, and the echo carries that stale value.
-            # When our own setpoint landed it is the better answer, since that is
-            # what the unit will report once it catches up.
-            "target_temp": setpoint_applied
-            if setpoint_applied is not None
-            else (fresh.attributes.get("temperature") if fresh is not None else None),
+            # A setpoint is not. `ClimateEntity.state_attributes` puts
+            # `temperature` through `display_temp`, which rounds to the entity's
+            # own `precision` -- unrelated to the `target_temp_step` we rounded
+            # to, and absent from `capability_attributes` when the platform
+            # publishes no step -- so a whole-degree unit commanded 19.5 reports
+            # 20 forever. Pinning our value here would mismatch on every later
+            # attribute update, and a same-mode re-commit changes nothing the
+            # unit reports, so no echo ever arrives to correct it. The entity's
+            # own report is the honest baseline; what we asked for is recorded
+            # separately below and accepted alongside it.
+            "target_temp": fresh.attributes.get("temperature") if fresh is not None else None,
         }
+        # Only what actually landed: a raised `set_temperature` never reached the
+        # unit, so its value must not be treated as something the unit may
+        # report. Absent key rather than None -- None is a setpoint a climate can
+        # genuinely report.
+        self._commanded_state = {"hvac_mode": decision.target_mode}
+        if setpoint_applied is not None:
+            self._commanded_state["target_temp"] = setpoint_applied
         # `_last_command_at` is already `now_utc` from before the calls, so the
         # echo window measures from when we started commanding rather than from
         # whenever a slow unit finished -- one timestamp per refresh, as
@@ -1426,6 +1443,32 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         )
         self._last_sample_persist_at = now_utc
 
+    def _observation_is_expected(self, observed: dict[str, Any]) -> bool:
+        """True when nothing in `observed` looks like somebody else's edit.
+
+        A field is expected if it matches the baseline (what the entity was last
+        seen reporting) *or* what we last commanded for it. Both are needed, and
+        neither alone will do: a slow unit reports its old value long after our
+        call and only catches up outside the echo window, while a unit that
+        coerces the setpoint -- rounding it to its own display precision, or
+        snapping it server-side -- never reports our value at all. Picking one at
+        write time therefore breaks the other, and both failures are the same
+        one: a spurious "manual edit" that flushes the sample buffer and drops
+        the persisted idle slope, so `mpc.is_ready` never turns true.
+
+        Accepting our own commanded value indefinitely does soften detection by
+        exactly one value: a human setting the thermostat to precisely what we
+        last asked for goes unnoticed. That is a change we would have made
+        anyway, so there is no stale dynamic to flush.
+        """
+        baseline = self._last_command_state or {}
+        commanded = self._commanded_state or {}
+        return all(
+            (key in baseline and value == baseline[key])
+            or (key in commanded and value == commanded[key])
+            for key, value in observed.items()
+        )
+
     @callback
     def _on_climate_state_change(self, event: Event[EventStateChangedData]) -> None:
         """Flush the sample buffer when the climate entity changes outside our path.
@@ -1486,7 +1529,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # without triggering a flush.
             self._last_command_state = observed
             return
-        if observed == self._last_command_state:
+        if self._observation_is_expected(observed):
             return
         LOGGER.info(
             "%s: manual climate edit detected (observed=%s, last_command=%s); "
