@@ -3623,9 +3623,12 @@ async def test_a_dropped_command_is_not_recorded(
     """A clean return from the service call is not proof of delivery.
 
     Home Assistant answers a call it cannot deliver by skipping the entity and
-    returning normally -- verified against its real entity-service dispatch: an
-    available entity receives `set_hvac_mode`, an unavailable one receives
-    nothing and no exception is raised. Recording the action anyway leaves the
+    returning normally. That premise was established out of band, on a throwaway
+    probe with a real climate platform, since the service stub these tests use
+    does no availability filtering of its own: an available entity received
+    `set_hvac_mode`, an unavailable one received nothing and nothing was raised.
+    What this test covers is what the coordinator does about it. Recording the
+    action anyway leaves the
     store describing something the unit never did, which the dwell gates and
     every later decision then trust.
     """
@@ -3694,11 +3697,12 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
     assert coordinator._samples_cache, "the unit's own echo flushed the buffer"
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
-    # And the mode the unit was lagging on is not thereby made acceptable
-    # forever: somebody putting it back is still a real edit, because the room
-    # stops being heated. Recording the live (stale) mode as the baseline would
-    # swallow exactly this. Fed as a synthetic event, like the other
-    # manual-edit tests, so no refresh can interleave with it.
+    # What the unit was showing beforehand does not thereby become acceptable
+    # forever. The baseline is read while the unit is still lagging, so it holds
+    # the *old* setpoint -- and an occupant putting the thermostat back to
+    # exactly that is the likeliest hand edit there is. Once the unit has agreed
+    # with us the old value has to stop being accepted. Fed as a synthetic
+    # event, like the other manual-edit tests, so no refresh can interleave.
     from homeassistant.core import Event, EventStateChangedData, State
 
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
@@ -3708,7 +3712,7 @@ async def test_a_slow_units_late_echo_is_not_a_manual_edit(
         {
             "entity_id": CLIMATE_ENTITY,
             "old_state": State(CLIMATE_ENTITY, commanded, {"temperature": setpoint}),
-            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": setpoint}),
+            "new_state": State(CLIMATE_ENTITY, commanded, {"temperature": 17.0}),
         },
     )
     coordinator._on_climate_state_change(reverted)
@@ -3777,6 +3781,66 @@ async def test_a_unit_that_snaps_the_setpoint_is_not_a_manual_edit(
 
     assert coordinator._samples_cache, "the unit's snapped setpoint read as a manual edit"
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_an_idle_release_stops_offering_the_old_setpoint(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An idle release sends no setpoint, so it must leave none behind.
+
+    What we commanded is rebuilt on every apply rather than updated, because a
+    release carries no `target_temp` at all -- the unit keeps whatever it had.
+    Carrying the previous cycle's setpoint over would leave the manual-edit
+    detector accepting a value nobody has asked for since.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}
+
+    # Back inside the band -> release to idle, which sends no setpoint.
+    freezer.tick(timedelta(minutes=10))
+    hass.states.async_set(TEMP_ENTITY, "20.5", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_FAN_ONLY}
+
+
+async def test_shadow_mode_stops_vouching_for_the_last_command(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A zone switched to shadow mode commands nothing, so it expects nothing.
+
+    Left standing, the command from before the switch would go on being accepted
+    by the manual-edit detector for as long as the zone stayed in shadow -- and
+    in shadow mode every climate change is somebody else's by definition.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._commanded_state is not None
+
+    await coordinator._store.async_update_zone("office", enabled=False)
+    freezer.tick(timedelta(minutes=10))
+    hass.states.async_set(TEMP_ENTITY, "17.9", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert not _calls_for(climate_calls, "set_hvac_mode")[1:], "shadow mode commanded"
+    assert coordinator._commanded_state is None
 
 
 async def test_an_undeliverable_command_records_nothing_and_warns_sparingly(

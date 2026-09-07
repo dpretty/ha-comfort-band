@@ -1078,6 +1078,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """
         now_utc = dt_util.utcnow()
         if not enabled:
+            # Nothing is commanded here, so nothing of ours is expected either.
+            # Left standing, the last command from before the zone was switched
+            # to shadow would go on being accepted by the manual-edit detector
+            # forever, and in shadow mode every change is somebody else's.
+            self._commanded_state = None
             LOGGER.debug(
                 "%s: shadow mode -- would %s (target_mode=%s, target_temp=%s)",
                 self.zone_name,
@@ -1456,10 +1461,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         one: a spurious "manual edit" that flushes the sample buffer and drops
         the persisted idle slope, so `mpc.is_ready` never turns true.
 
-        Accepting our own commanded value indefinitely does soften detection by
-        exactly one value: a human setting the thermostat to precisely what we
-        last asked for goes unnoticed. That is a change we would have made
-        anyway, so there is no stale dynamic to flush.
+        This does soften detection, per field, by whichever of the two values
+        the unit is not currently reporting -- but only until it agrees with us,
+        because the caller moves the baseline on for every observation this
+        accepts. Once a unit has caught up, both values are the same one again.
+        What remains softened is a human setting the thermostat to precisely
+        what we last asked for, which is a change we would have made anyway.
         """
         baseline = self._last_command_state or {}
         commanded = self._commanded_state or {}
@@ -1530,13 +1537,23 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._last_command_state = observed
             return
         if self._observation_is_expected(observed):
+            # Move the baseline on, even though this matched. Without it the
+            # pre-command values stay acceptable for as long as the command
+            # stands: the baseline is read *before* a lagging unit catches up
+            # (see `_maybe_apply_action`), so an occupant putting the thermostat
+            # back to exactly what it showed beforehand -- the likeliest edit
+            # there is -- would be silently swallowed. Refreshing also collapses
+            # the two accepted values back to one as soon as the unit agrees,
+            # confining "either answer" to the lag window it exists for.
+            self._last_command_state = observed
             return
         LOGGER.info(
-            "%s: manual climate edit detected (observed=%s, last_command=%s); "
-            "flushing sample buffer",
+            "%s: manual climate edit detected (observed=%s, last_seen=%s, "
+            "commanded=%s); flushing sample buffer",
             self.zone_name,
             observed,
             self._last_command_state,
+            self._commanded_state,
         )
         self._samples_cache = []
         self._last_command_state = observed
