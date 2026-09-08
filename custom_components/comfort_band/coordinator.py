@@ -180,7 +180,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # throttled edge is re-offered on the next refresh instead of dropped.
         self._sensor_logged_available = True
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
-        # Per-fault stamps for the command-path warnings: "dropped",
+        # Per-fault stamps for the command-path warnings: "mode", "dropped",
         # "setpoint", "fan".
         self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
@@ -783,11 +783,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _may_log_command_warning(self, key: str) -> bool:
         """Throttle a command-path warning to one line per interval, per fault.
 
-        All three faults repeat. The dropped command repeats hardest -- nothing
-        is committed on that path, so the same-mode gate never arms and a
-        room-temp-driven zone re-enters on every refresh for the length of the
-        outage. The setpoint and fan faults repeat once per applied action, but
-        can be permanent: a unit that will not take a plain setpoint, or a
+        All four faults repeat. A dropped command and a raising `set_hvac_mode`
+        repeat hardest -- neither commits, so the same-mode gate never arms and
+        a room-temp-driven zone re-enters on every refresh for the length of the
+        fault. The setpoint and fan faults repeat once per applied action, but
+        all three of those can be permanent: a unit that will not take a plain setpoint, or a
         stored fan mode it advertises and refuses, is a property of the hardware
         rather than a passing fault.
 
@@ -1271,43 +1271,64 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # sampled -- see the delivery check below.
         before = self.hass.states.get(self.climate_entity_id)
         was_unavailable = before is not None and before.state == STATE_UNAVAILABLE
-        # Deliberately unguarded, unlike the fan and setpoint calls below. A
-        # raise here escapes into the fire-and-forget apply task, which is the
-        # pre-existing behaviour and not good -- there is no log of our own, and
-        # because nothing is committed the same-mode gate never arms, so the
-        # zone re-enters on every refresh for the length of the fault. Worse,
-        # the echo-window stamp written just above is not rolled back on that
-        # path -- and since it re-enters every refresh, the window never closes
-        # for the length of the fault, so a wall edit made during it is absorbed
-        # as an echo rather than compared. (The dropped-command path below rolls
-        # back for exactly this reason; the asymmetry is the missing guard, not
-        # a judgement.) It is left that way on purpose. Guarding it was attempted here and taken
-        # out again, because "the call raised" and "the unit never got it" are
-        # not the same statement and the difference is not answerable from
-        # inside the `except`. Both readings were tried and each was measured
-        # flushing the learned model on ordinary hardware: assuming delivery
-        # holds the echo window open and swallows wall edits, assuming
-        # non-delivery makes the unit's own late echo look like one. It wants
-        # its own change, and these are the two findings to start from:
+        # Guarded, like the two calls below it, but the bookkeeping differs
+        # because this is the call the commitment rests on. A raise used to
+        # escape into the fire-and-forget apply task: no log naming the zone,
+        # nothing committed, and -- because the echo-window stamp written just
+        # above was not rolled back while the fault re-entered on every refresh
+        # -- a window that never closed, so a wall edit made during the fault
+        # was absorbed as an echo instead of compared.
         #
-        #   * whatever is recorded on the raise must *narrow* the commanded
-        #     state rather than replace it, or a previous successful
-        #     `set_temperature` loses a vouch its echo is still relying on;
-        #   * and vouching for the mode alone leaves the setpoint half of the
-        #     same echo uncovered, which bites every unit that drops its
-        #     `temperature` attribute on reaching `fan_only` -- commanded on
-        #     every idle release -- or that restores a per-mode setpoint.
+        # What a raise actually tells us is narrow: the call did not complete.
+        # It does not say the unit never got it. A cloud round-trip that times
+        # out on its confirming poll may well have applied the mode and will
+        # publish it seconds later. Four earlier attempts tried to settle that
+        # question here -- assume delivered, assume not, or infer it from the
+        # state machine -- and each was measured flushing the learned model on
+        # ordinary hardware, because the question is not answerable from inside
+        # this `except`.
         #
-        # It also matters beyond a cloud timeout: from Home Assistant 2025.4
+        # So it is not asked. The mode joins what the manual-edit detector will
+        # accept, which is the honest reading of "we asked, and we do not know
+        # whether it arrived": a late echo is then recognised whenever it lands
+        # rather than depending on a window still being open, and the window
+        # itself goes back to whatever it was, because nothing completed here
+        # and there is no burst of intermediate values to absorb.
+        #
+        # Merged, not replaced. A `set_temperature` from an earlier apply may
+        # still have an echo in flight, and its vouch has to survive: replacing
+        # the dict discards it, and the unit's own late setpoint ack then reads
+        # as a hand edit. Nothing is added for the setpoint on this path --
+        # `set_temperature` never ran.
+        #
+        # It matters beyond a cloud timeout: from Home Assistant 2025.4
         # `climate.set_hvac_mode` raises for a mode the entity does not
         # advertise, where 2024.12 only warns, and `fan_only` is exactly such a
         # mode on many units.
-        await self.hass.services.async_call(
-            "climate",
-            "set_hvac_mode",
-            {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
-            blocking=True,
-        )
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_hvac_mode",
+                {"entity_id": self.climate_entity_id, "hvac_mode": decision.target_mode},
+                blocking=True,
+            )
+        except Exception as err:
+            if self._may_log_command_warning("mode"):
+                LOGGER.warning(
+                    "%s: could not command %s to %s (%s: %s) -- not recording it; will retry",
+                    self.zone_name,
+                    self.climate_entity_id,
+                    decision.target_mode,
+                    type(err).__name__,
+                    err,
+                )
+            self._commanded_state = {
+                **(self._commanded_state or {}),
+                "hvac_mode": decision.target_mode,
+            }
+            self._last_command_at = previous_command_at
+            return
+        self._command_warn_logged_at.pop("mode", None)
 
         # A clean return is not proof of delivery. Home Assistant answers a call
         # it cannot deliver by skipping the entity and returning normally
@@ -1366,7 +1387,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # closed for the length of the outage, so the reconnect carrying
             # somebody's wall edit was absorbed as an echo instead of compared.
             # At a 30-second sensor that missed the edit every time, where
-            # `main` caught it every time.
+            # v0.16.0 caught it every time.
+            #
+            # Restored rather than cleared, here and on the mode-raise path
+            # above. The window belongs to whichever command last actually
+            # issued, and an apply that delivered nothing does not invalidate
+            # one still open from a command that did -- clearing it would make
+            # *that* command's echo read as a hand edit. It expires on its own
+            # schedule either way; all this stops is the ratcheting.
             self._last_command_at = previous_command_at
             return
 
@@ -1668,6 +1696,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
+        carried = self._last_command_state
         if new_state.state == STATE_UNKNOWN:
             # `unknown` is not the same thing as `unavailable`, though it is
             # easy to treat it as one. Home Assistant writes it whenever
@@ -1679,13 +1708,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # forward, which makes that field say nothing, and let the setpoint
             # be judged. Skipping the whole observation instead was measured
             # swallowing three consecutive dial turns.
-            #
-            # A setpoint it isn't reporting either -- a climate coming up cold
-            # has neither -- is carried forward on the same reasoning, so an
-            # entity mid-initialisation says nothing rather than reading as
-            # somebody having cleared the dial. Once the mode arrives, the full
-            # comparison resumes.
-            carried = self._last_command_state
             if carried is None:
                 # Nothing to carry forward and nothing to compare against.
                 # Adopting `unknown` as the baseline instead would leave it
@@ -1695,8 +1717,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 # disk.
                 return
             observed["hvac_mode"] = carried["hvac_mode"]
-            if observed["target_temp"] is None:
-                observed["target_temp"] = carried["target_temp"]
+        # A setpoint the entity is not reporting is an absence of information,
+        # not a value, so it says nothing rather than reading as somebody having
+        # cleared the dial -- which is not a thing anybody can do. A physical
+        # remote always sets a number, and `climate.set_temperature` requires
+        # one; there is no service or dial position that unsets a target. What
+        # `None` does mean is that the platform has no target *right now*:
+        # `state_attributes` publishes `temperature` only while
+        # `TARGET_TEMPERATURE` is in `supported_features`, and several
+        # integrations vary that by mode, so a unit reaching `fan_only` -- which
+        # this integration commands on every idle release -- simply stops
+        # carrying one. Judging that as an edit flushed the learned model on
+        # exactly the release we asked for. The mode is still compared, and a
+        # regime change always shows there.
+        if observed["target_temp"] is None and carried is not None:
+            observed["target_temp"] = carried["target_temp"]
         now = dt_util.utcnow()
         # `0 <= elapsed < window` so a backwards NTP step (now < last_command_at)
         # doesn't trip the negative `< window` branch and suppress legitimate
