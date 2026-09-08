@@ -3983,6 +3983,9 @@ async def test_a_setpoint_a_unit_will_never_take_is_not_shouted_about(
     # never again, which would hide the fault returning on a different unit.
     warnings = sum("own setpoint" in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
+    # With frames, like its two siblings: the catch is broad enough to take a
+    # platform's own bug, and a message alone names neither module nor line.
+    assert all(r.exc_info is not None for r in caplog.records if "own setpoint" in r.getMessage())
 
     # A setpoint lands, so the fault is over...
     hass.services.async_register("climate", "set_temperature", _accept)
@@ -4144,6 +4147,7 @@ async def test_a_fan_mode_a_unit_will_never_take_is_not_shouted_about(
     # never again, which would hide the fault returning.
     warnings = sum(needle in r.getMessage() for r in caplog.records)
     assert 2 <= warnings <= 3, warnings
+    assert all(r.exc_info is not None for r in caplog.records if needle in r.getMessage())
 
     # A fan command lands, so the fault is over...
     hass.services.async_register("climate", "set_fan_mode", _accept)
@@ -4838,6 +4842,11 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     assert all(f" to {HVAC_MODE_HEAT} (" in r.getMessage() for r in named), [
         r.getMessage() for r in named
     ]
+    # And the zone, which is the whole point of having our own line rather than
+    # Home Assistant's anonymous one.
+    assert all(r.getMessage().startswith("office: ") for r in named), [
+        r.getMessage() for r in named
+    ]
     # With frames: the catch is broad enough to take a platform's own bug, and
     # a class name names neither the integration nor the line.
     assert all(r.exc_info is not None for r in named)
@@ -5007,7 +5016,7 @@ async def test_a_dropped_command_does_not_end_a_mode_fault(
     delivery check -- not on the clean return from `set_hvac_mode`, which Home
     Assistant also gives for a call it dropped at dispatch. Clearing it there
     let a bridge alternating between raising and unreachable warn on every
-    apply instead of once per interval: five times the intended volume, and
+    apply instead of once per interval: several times the intended volume, and
     scaling with the room sensor's rate.
 
     The ordering matters and is why the sibling test does not catch this: the
@@ -5063,7 +5072,7 @@ async def test_a_mode_raise_writes_nothing_at_all(
 ) -> None:
     """The guard catches and reports. It does not revise anything.
 
-    Seven attempts have tried to say something useful here about whether the
+    Six ways of saying something useful here have been tried about whether the
     command arrived -- vouch for the mode, hand the echo window back, hand it
     back only on retries -- and every one was measured either flushing the
     learned model on a unit that had taken the mode, or swallowing a wall edit.
