@@ -1335,7 +1335,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     err,
                 )
             return
-        self._command_warn_logged_at.pop("mode", None)
 
         # A clean return is not proof of delivery. Home Assistant answers a call
         # it cannot deliver by skipping the entity and returning normally
@@ -1396,12 +1395,17 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # At a 30-second sensor that missed the edit every time, where
             # v0.16.0 caught it every time.
             #
-            # Restored rather than cleared, here and on the mode-raise path
-            # above. The window belongs to whichever command last actually
-            # issued, and an apply that delivered nothing does not invalidate
-            # one still open from a command that did -- clearing it would make
-            # *that* command's echo read as a hand edit. It expires on its own
-            # schedule either way; all this stops is the ratcheting.
+            # Restored rather than cleared. The window belongs to whichever
+            # command last actually issued, and an apply that delivered nothing
+            # does not invalidate one still open from a command that did --
+            # clearing it would make *that* command's echo read as a hand edit.
+            # It expires on its own schedule either way; all this stops is the
+            # ratcheting.
+            #
+            # The mode-raise path above does neither, deliberately: see there.
+            # This one can restore because a dropped command is known not to
+            # have reached the unit, which is exactly what a raise does not
+            # tell us.
             if self._still_the_current_apply(now_utc):
                 self._last_command_at = previous_command_at
             return
@@ -1430,6 +1434,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             previous_action=new_previous_action,
         )
 
+        # Both budgets, and only here: a clean return is not proof of delivery,
+        # so clearing the mode budget on it let a command dropped at dispatch
+        # end a fault the unit never heard about -- and a bridge alternating
+        # between raising and unreachable then warned on every apply rather than
+        # once per interval.
+        self._command_warn_logged_at.pop("mode", None)
         self._command_warn_logged_at.pop("dropped", None)
 
         # v0.13.0 deterministic fan-boost. Placed right after set_hvac_mode so
@@ -1762,10 +1772,20 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             observed["hvac_mode"] = carried["hvac_mode"]
         # A setpoint the entity is not reporting is an absence of information,
         # not a value, so it says nothing rather than reading as somebody having
-        # cleared the dial -- which is not a thing anybody can do. A physical
-        # remote always sets a number, and `climate.set_temperature` requires
-        # one; there is no service or dial position that unsets a target. What
-        # `None` does mean is that the platform has no target *right now*:
+        # cleared the dial. A physical remote always sets a number, and no dial
+        # position unsets a target.
+        #
+        # One service call does, and it is worth naming because the rule cannot
+        # see it: `SET_TEMPERATURE_SCHEMA` is `has_at_least_one_key`, so
+        # `climate.set_temperature` with only `target_temp_low`/`_high` is legal
+        # on an entity advertising both features, and nulls `target_temperature`
+        # while leaving the mode alone. Somebody moving such a unit from a
+        # single target to a 24-28 band is accepted here. Every core integration
+        # I could check gates that on `heat_cool`, so the mode moves too and the
+        # edit is still caught; on one that does not, this is a miss.
+        #
+        # What `None` usually means is that the platform has no target *right
+        # now*:
         # `state_attributes` publishes `temperature` only while
         # `TARGET_TEMPERATURE` is in `supported_features`, and several
         # integrations vary that by mode, so a unit reaching `fan_only` -- which
