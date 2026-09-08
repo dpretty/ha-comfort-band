@@ -786,8 +786,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         All four faults repeat. A dropped command and a raising `set_hvac_mode`
         repeat hardest -- neither commits, so the same-mode gate never arms and
         a room-temp-driven zone re-enters on every refresh for the length of the
-        fault. The setpoint and fan faults repeat once per applied action, but
-        all three of those can be permanent: a unit that will not take a plain setpoint, or a
+        fault. The setpoint and fan faults repeat once per applied action. Three
+        of the four can be permanent: a unit that will not take a plain setpoint, or a
         stored fan mode it advertises and refuses, is a property of the hardware
         rather than a passing fault.
 
@@ -1280,26 +1280,28 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # was absorbed as an echo instead of compared.
         #
         # What a raise actually tells us is narrow: the call did not complete.
-        # It does not say the unit never got it. A cloud round-trip that times
-        # out on its confirming poll may well have applied the mode and will
-        # publish it seconds later. Four earlier attempts tried to settle that
-        # question here -- assume delivered, assume not, or infer it from the
-        # state machine -- and each was measured flushing the learned model on
-        # ordinary hardware, because the question is not answerable from inside
-        # this `except`.
+        # It does not say the unit never got it. Five attempts have now tried to
+        # settle that question here -- assume delivered, assume not, infer it
+        # from the state machine, or vouch for the attempted mode -- and each
+        # was measured flushing the learned model on ordinary hardware, because
+        # the question is not answerable from inside this `except`.
         #
-        # So it is not asked. The mode joins what the manual-edit detector will
-        # accept, which is the honest reading of "we asked, and we do not know
-        # whether it arrived": a late echo is then recognised whenever it lands
-        # rather than depending on a window still being open, and the window
-        # itself goes back to whatever it was, because nothing completed here
-        # and there is no burst of intermediate values to absorb.
+        # So nothing is recorded about it. In particular `_commanded_state` is
+        # left exactly as it is: it holds what the last command that *landed*
+        # asked for, and that command's own echo may still be in flight. The
+        # vouching attempt wrote the attempted mode into it, which reads as
+        # additive but is not -- one scalar per field means writing the mode
+        # discards the delivered one, so a lagging unit acknowledging the heat
+        # it was really told read as a hand edit and flushed the model. And with
+        # nothing to expire it, a wall edit landing on the mode we were failing
+        # to send was swallowed for as long as the fault lasted.
         #
-        # Merged, not replaced. A `set_temperature` from an earlier apply may
-        # still have an echo in flight, and its vouch has to survive: replacing
-        # the dict discards it, and the unit's own late setpoint ack then reads
-        # as a hand edit. Nothing is added for the setpoint on this path --
-        # `set_temperature` never ran.
+        # The declared cost of recording nothing: a unit that applied the mode
+        # anyway and publishes it after the window closes has that echo compared
+        # and flushes once per fault episode. That is what v0.17.0 did too, so
+        # it is a residual rather than a regression -- and bounding a vouch well
+        # enough to fix it, without reopening either failure above, is a change
+        # of its own.
         #
         # It matters beyond a cloud timeout: from Home Assistant 2025.4
         # `climate.set_hvac_mode` raises for a mode the entity does not
@@ -1322,11 +1324,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     type(err).__name__,
                     err,
                 )
-            self._commanded_state = {
-                **(self._commanded_state or {}),
-                "hvac_mode": decision.target_mode,
-            }
-            self._last_command_at = previous_command_at
+            self._release_echo_window(previous_command_at, now_utc)
             return
         self._command_warn_logged_at.pop("mode", None)
 
@@ -1395,7 +1393,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # one still open from a command that did -- clearing it would make
             # *that* command's echo read as a hand edit. It expires on its own
             # schedule either way; all this stops is the ratcheting.
-            self._last_command_at = previous_command_at
+            self._release_echo_window(previous_command_at, now_utc)
             return
 
         # Record the commitment on the strength of `set_hvac_mode` alone: that
@@ -1528,8 +1526,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             }
         # Only what actually landed: a raised `set_temperature` never reached the
         # unit, so its value must not be treated as something the unit may
-        # report. Absent key rather than None -- None is a setpoint a climate can
-        # genuinely report.
+        # report. The key is left absent rather than set to None for the same
+        # reason -- we have no opinion to offer, not an opinion that the unit
+        # reports nothing. The listener never sees a None here either way, since
+        # it carries an unreported setpoint forward before comparing, so the two
+        # forms are indistinguishable in behaviour; absent is the honest one.
         self._commanded_state = {"hvac_mode": decision.target_mode}
         if setpoint_applied is not None:
             self._commanded_state["target_temp"] = setpoint_applied
@@ -1602,6 +1603,23 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             samples=[predictor.sample_to_dict(s) for s in new_samples],
         )
         self._last_sample_persist_at = now_utc
+
+    def _release_echo_window(self, previous: datetime | None, mine: datetime) -> None:
+        """Hand the echo window back after an apply that delivered nothing.
+
+        Applies are dispatched with `hass.async_create_task`, so two of them
+        overlap whenever a climate call outlives the next refresh -- which is
+        exactly the cloud timeout the guard above exists for, and nothing spaces
+        the retries because nothing commits. `previous` was captured before this
+        apply's own await, so writing it back unconditionally would discard a
+        stamp a *later* apply set after landing a real command, and that
+        command's echo would then read as a hand edit.
+
+        So only an apply that still owns the stamp gives it back. Anything else
+        has already been superseded and has nothing to hand over.
+        """
+        if self._last_command_at == mine:
+            self._last_command_at = previous
 
     def _observation_is_expected(self, observed: dict[str, Any]) -> bool:
         """True when nothing in `observed` looks like somebody else's edit.

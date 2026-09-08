@@ -69,10 +69,11 @@ CLIMATE_ECHO_WINDOW_S: Final = 30
 SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
 # Same budget, separate name: the command-path warnings (a mode call that
 # raises, an undeliverable command, a setpoint the unit won't take, a fan mode
-# it won't take) repeat for as long as the fault lasts, and three can be
-# permanent -- an entity that
-# advertises only a temperature *range* raises for a plain setpoint forever, and
-# a stored fan mode a unit advertises but refuses is retried on every apply.
+# it won't take) repeat for as long as the fault lasts, and three of the four
+# can be permanent: an entity advertising only a temperature *range* raises for
+# a plain setpoint forever, a stored fan mode a unit advertises but refuses is
+# retried on every apply, and from Home Assistant 2025.4 a mode the entity does
+# not advertise raises rather than warning.
 # The budget is per fault episode, not per hour: each key is cleared when a call
 # of its own kind next succeeds, so a unit that fails intermittently still gets
 # a line per episode. That is the trade for announcing a return promptly.

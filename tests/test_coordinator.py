@@ -7,6 +7,7 @@ pytest-freezer `freezer` fixture for time travel.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -4826,103 +4827,193 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     ]
 
 
-async def _heat_then_raise_on_the_release(
+async def test_a_mode_raise_leaves_an_earlier_commands_vouch_alone(
     hass: HomeAssistant,
-    coordinator: ZoneCoordinator,
+    hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
-    *,
-    echoed_setpoint: float,
 ) -> None:
-    """Land a heat command, then have the idle release's mode call raise.
+    """A raise must not disturb what the last landed command asked for.
 
-    Leaves the baseline on what the unit reported for the heat command
-    (`echoed_setpoint`, which a coercing unit snaps away from what we asked),
-    the commanded setpoint on our own 19.5, and a `fan_only` mode attempt whose
-    call raised.
+    Recording the attempted mode reads as additive and is not: the commanded
+    state holds one value per field, so writing the mode discards the one a
+    command that actually landed put there -- and a lagging unit's own
+    acknowledgement of that command then matches neither side and flushes the
+    learned model. Idle releases bypass both dwell gates by design, so the
+    raising apply can follow the delivered one within seconds.
     """
-    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    # The unit lags: still reporting fan_only/21.0 when the heat command lands,
+    # so the baseline holds neither the mode nor the setpoint we asked for and
+    # only the commanded side can cover its echo.
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
     hass.states.async_set(TEMP_ENTITY, "16.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert _calls_for(climate_calls, "set_temperature")[-1]["temperature"] == 19.5
-    # Its echo, inside the window: a real baseline to be judged against later.
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": echoed_setpoint})
-    await hass.async_block_till_done()
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
 
+    # Seconds later the room is back in band, and the release's mode call fails.
     async def _refuse(call: Any) -> None:
-        climate_calls.append((call.service, dict(call.data)))
         raise HomeAssistantError("the confirming poll timed out")
 
     hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    freezer.tick(timedelta(minutes=2))
+    freezer.tick(timedelta(seconds=5))
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert coordinator.data.decision.action == ACTION_IDLE
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}
 
-
-async def test_a_mode_call_that_raises_still_vouches_for_the_mode(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """A raise says the call did not complete, not that the unit never got it.
-
-    A cloud round-trip that times out on its confirming poll may well have
-    applied the mode and will publish it seconds later. Recognising that echo
-    cannot depend on the echo window still being open -- the window is un-armed
-    precisely because nothing completed -- so the mode is vouched for instead,
-    and the late echo is accepted whenever it lands.
-    """
-    freezer.move_to("2026-09-07 12:00:00+00:00")
-    coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await _heat_then_raise_on_the_release(
-        hass, coordinator, climate_calls, freezer, echoed_setpoint=19.5
-    )
-
-    # It applied the release after all, and says so well outside the window.
-    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    # The unit finally acknowledges the heat command it was really given.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 15))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
     await hass.async_block_till_done()
 
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
-async def test_a_mode_raise_keeps_an_outstanding_setpoint_vouch(
+async def test_a_superseded_apply_does_not_take_back_the_echo_window(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """What the raise records has to narrow the commanded state, not replace it.
+    """Only an apply that still owns the stamp may hand it back.
 
-    An earlier `set_temperature` that succeeded may still have an echo in
-    flight -- a coercing unit reports its own value first and ours later, or
-    not at all. Replacing the dict on the raise discards that vouch, and the
-    unit's own late setpoint ack then reads as a hand edit.
+    Applies are dispatched with `hass.async_create_task`, so two overlap
+    whenever a climate call outlives the next refresh -- which is exactly the
+    cloud timeout this guard is for, and nothing spaces the retries because
+    nothing commits. The stamp each apply saved was read before its own await,
+    so writing it back unconditionally discards one a later apply set after
+    landing a real command, and that command's echo then reads as a hand edit.
     """
     freezer.move_to("2026-09-07 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
-    # A whole-degree unit: it reported 20.0 for the 19.5 we asked for, so the
-    # baseline and the commanded setpoint disagree and only the vouch covers ours.
-    await _heat_then_raise_on_the_release(
-        hass, coordinator, climate_calls, freezer, echoed_setpoint=20.0
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=0)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+
+    gate = asyncio.Event()
+    seen: list[dict[str, Any]] = []
+
+    async def _first_call_hangs_then_raises(call: Any) -> None:
+        seen.append(dict(call.data))
+        if len(seen) == 1:
+            await gate.wait()
+            raise HomeAssistantError("the confirming poll timed out")
+        climate_calls.append((call.service, dict(call.data)))
+
+    hass.services.async_register("climate", "set_hvac_mode", _first_call_hangs_then_raises)
+
+    async def _pump() -> None:
+        # `async_block_till_done` would wait on the apply parked below, so the
+        # loop is pumped by hand until it is released.
+        for _ in range(200):
+            await asyncio.sleep(0)
+
+    # Apply A starts and blocks inside the service call.
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await _pump()
+    assert len(seen) == 1, seen
+
+    # A minute later apply B runs to completion and arms the window.
+    freezer.tick(timedelta(minutes=1))
+    hass.states.async_set(TEMP_ENTITY, "15.9", {})
+    await coordinator.async_refresh()
+    await _pump()
+    assert len(seen) == 2, seen
+    armed_by_b = coordinator._last_command_at
+    assert armed_by_b == dt_util.utcnow()
+
+    # Only now does A's call give up.
+    gate.set()
+    await _pump()
+
+    assert coordinator._last_command_at == armed_by_b, "a superseded apply took the window back"
+
+
+async def test_a_climate_with_no_setpoint_before_any_command_is_safe(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Carrying a setpoint forward needs something to carry it from.
+
+    A zone that has not commanded yet -- freshly set up, or in shadow mode --
+    has no baseline, and the entity it is watching may well report no target:
+    `fan_only` on a platform that varies `supported_features` by mode is
+    exactly that. The carry-forward runs on every observation, so without its
+    guard that is a `TypeError` inside a state-change callback, where nothing
+    is waiting to catch it.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    assert coordinator._last_command_state is None
+
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"current_temperature": 20.0}),
+        },
     )
-    assert coordinator._commanded_state == {
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    assert coordinator._last_command_state == {
         "hvac_mode": HVAC_MODE_FAN_ONLY,
-        "target_temp": 19.5,
+        "target_temp": None,
     }
 
-    # It catches up on the setpoint we asked for two commands ago.
-    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
-    await hass.async_block_till_done()
 
-    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+async def test_a_mode_fault_and_an_outage_do_not_share_a_warning_budget(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two faults, two budgets -- or the second one goes unreported.
+
+    They cannot occur in the same apply (a raising call never reaches the
+    delivery check), but they occur minutes apart on a flaky bridge, well
+    inside one throttle interval.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # The unit is unreachable, so the command is dropped at dispatch.
+        hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+        hass.states.async_set(TEMP_ENTITY, "16.0", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # It comes back, and now the call itself raises.
+        async def _refuse(call: Any) -> None:
+            raise HomeAssistantError("that mode is not supported by this entity")
+
+        hass.services.async_register("climate", "set_hvac_mode", _refuse)
+        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+        freezer.tick(timedelta(minutes=2))
+        hass.states.async_set(TEMP_ENTITY, "15.9", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("was dropped" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
+    assert sum("could not command" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
 
 
 async def test_a_wall_edit_during_a_mode_fault_is_caught(
