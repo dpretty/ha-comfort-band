@@ -4219,6 +4219,109 @@ async def test_a_flushed_edit_is_only_reported_once(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
+async def test_a_lagging_unit_that_drops_its_target_is_not_an_edit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The absent-target rule must not depend on the mode already matching.
+
+    A unit that reports the release late is the case the whole rule is for: the
+    baseline still says `heat` when `{fan_only, no target}` arrives, so both
+    fields differ from it at once and only the commanded side covers the mode.
+    Requiring the mode to match the baseline as well would leave exactly the
+    lagging, cloud-backed units the fix was written for still flushing.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator._last_command_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}
+
+    # Released, but the unit says nothing yet, so the baseline still reads heat.
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+    assert coordinator._last_command_state["hvac_mode"] == HVAC_MODE_HEAT
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+
+    # It catches up well outside the window, fanning and reporting no target.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {}),
+        },
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+    # And the baseline it leaves behind keeps the target, so the unit going on
+    # to report one again is not an edit either.
+    assert coordinator._last_command_state == {
+        "hvac_mode": HVAC_MODE_FAN_ONLY,
+        "target_temp": 19.5,
+    }
+
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
+
+
+async def test_a_flush_leaves_a_baseline_that_keeps_the_target(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """What the *next* comparison is made against has to keep the rule too.
+
+    A detected edit sets the baseline from the observation, and an observation
+    carrying no target would otherwise put the absence into the baseline --
+    where the rule can no longer rescue it, because everything afterwards is
+    judged against it. So the flush path stores the carried value, exactly as
+    the accepted path does.
+    """
+    from homeassistant.core import Event, EventStateChangedData, State
+
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    # Somebody switches it to cool at the wall, and the unit reports no target
+    # in that mode.
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    event: Event[EventStateChangedData] = Event(
+        "state_changed",
+        {
+            "entity_id": CLIMATE_ENTITY,
+            "old_state": State(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5}),
+            "new_state": State(CLIMATE_ENTITY, HVAC_MODE_COOL, {}),
+        },
+    )
+    coordinator._on_climate_state_change(event)
+    await hass.async_block_till_done()
+    assert coordinator._last_command_state == {
+        "hvac_mode": HVAC_MODE_COOL,
+        "target_temp": 19.5,
+    }
+
+
 async def test_a_setpoint_the_unit_stops_reporting_is_not_an_edit(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -4628,6 +4731,10 @@ async def test_a_blink_while_commanding_does_not_become_the_baseline(
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    # The blink is not the baseline -- neither field of it. The setpoint half
+    # alone would now survive the guard's removal, because the carry-forward
+    # rescues it independently, so the mode is what pins the guard itself.
+    assert coordinator._last_command_state["hvac_mode"] == HVAC_MODE_HEAT
 
     # It comes back doing exactly what it was doing.
     await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)

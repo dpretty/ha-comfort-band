@@ -987,11 +987,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # append still needs to run.
             #
             # Throttled for the same reason as the other command-path warnings,
-            # and carrying its traceback for the same reason they all do: the
-            # catch is broad enough to take a climate platform's own
-            # programming error, and a class name alone names neither the
-            # integration nor the line. The throttle is what makes the frames
-            # affordable.
+            # and carrying its traceback for the same reason they all do: a
+            # class name alone names neither the integration nor the line, and
+            # the throttle is what makes the frames affordable. This catch is
+            # the narrow one -- anything that is not a `HomeAssistantError`
+            # goes to the wrapper in `_maybe_apply_action`, which shares this
+            # budget.
             # This one can be permanent: the guard above only skips the call
             # when the unit already reports the mode we want, so a stored fan
             # mode it advertises and refuses is retried on every apply, forever.
@@ -1303,8 +1304,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # window that has not been handed back yet.)
         #
         # What a raise actually tells us is narrow: the call did not complete.
-        # It does not say the unit never got it, and on the Home Assistant
-        # pinned here it usually did: `_valid_mode_or_raise` still only warns
+        # It does not say the unit never got it, and on Home Assistant 2024.12
+        # -- the floor this integration declares -- it usually did.
+        # `_valid_mode_or_raise` still only warns
         # for an unadvertised hvac mode until 2025.4, so what reaches this
         # `except` today is mostly a platform or cloud error -- the class where
         # the command lands and only the confirmation is lost. Not always: a
@@ -1769,7 +1771,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
-        reported = dict(observed)
         carried = self._last_command_state
         if new_state.state == STATE_UNKNOWN:
             # `unknown` is not the same thing as `unavailable`, though it is
@@ -1791,6 +1792,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 # disk.
                 return
             observed["hvac_mode"] = carried["hvac_mode"]
+        # Snapshotted here, between the two carries, for the flush diagnostic
+        # below. After the mode carry, because a mode the entity could not
+        # report is not what caused a flush and should not be printed as if it
+        # were; before the setpoint one, because that substitutes a value
+        # nothing published.
+        reported = dict(observed)
         # A setpoint the entity is not reporting is an absence of information,
         # not a value, so it says nothing rather than reading as somebody having
         # cleared the dial. A physical remote always sets a number, and no dial
