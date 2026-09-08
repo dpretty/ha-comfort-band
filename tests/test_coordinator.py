@@ -4828,6 +4828,56 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     ]
 
 
+async def test_a_mode_raise_writes_nothing_at_all(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The guard catches and reports. It does not revise anything.
+
+    Seven attempts have tried to say something useful here about whether the
+    command arrived -- vouch for the mode, hand the echo window back, hand it
+    back only on retries -- and every one was measured either flushing the
+    learned model on a unit that had taken the mode, or swallowing a wall edit.
+    The window is the wrong instrument for the question and `_commanded_state`
+    cannot hold two values per field, so until one of those changes the honest
+    thing is to touch none of it. This pins that, because the next attempt will
+    look like an improvement.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "16.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    before = (
+        coordinator._last_command_at,
+        dict(coordinator._last_command_state or {}),
+        dict(coordinator._commanded_state or {}),
+        dict(coordinator._store.get_zone("office")),
+    )
+
+    async def _refuse(call: Any) -> None:
+        raise HomeAssistantError("the confirming poll timed out")
+
+    hass.services.async_register("climate", "set_hvac_mode", _refuse)
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.decision.action == ACTION_IDLE
+
+    # The stamp is written before the call and left where the raise found it;
+    # everything the detector reads, and the store, is untouched.
+    assert coordinator._last_command_at == dt_util.utcnow()
+    assert dict(coordinator._last_command_state or {}) == before[1]
+    assert dict(coordinator._commanded_state or {}) == before[2]
+    assert dict(coordinator._store.get_zone("office")) == before[3]
+
+
 async def test_a_mode_raise_leaves_an_earlier_commands_vouch_alone(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -4870,84 +4920,6 @@ async def test_a_mode_raise_leaves_an_earlier_commands_vouch_alone(
     # The unit finally acknowledges the heat command it was really given.
     freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 15))
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
-    await hass.async_block_till_done()
-
-    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
-
-
-async def test_a_superseded_apply_revises_nothing(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """A hung apply that loses the race must not write anything on its way out.
-
-    Applies are dispatched with `hass.async_create_task`, so two overlap
-    whenever a climate call outlives the next refresh -- exactly the cloud
-    timeout this guard is for. Everything the loser writes afterwards comes
-    from values it read before its own await: it would hand back a stamp the
-    winner set after landing a real command, or re-open a run of failures the
-    winner had just ended. The second is the subtler one, and it is what this
-    covers: with a stale run left open, the *next* genuine failure takes itself
-    for a retry and hands its window straight back, so the unit that did take
-    the mode has its echo compared instead of absorbed.
-
-    Ownership is identity, not equality -- the two applies here enter in the
-    same frozen tick, so their stamps are equal and belong to different applies.
-    """
-    freezer.move_to("2026-09-07 12:00:00+00:00")
-    coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone("office", min_cycle_minutes=0)
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
-
-    gate = asyncio.Event()
-    seen: list[dict[str, Any]] = []
-
-    async def _first_call_hangs_then_raises(call: Any) -> None:
-        seen.append(dict(call.data))
-        if len(seen) == 1:
-            await gate.wait()
-            raise HomeAssistantError("the confirming poll timed out")
-        climate_calls.append((call.service, dict(call.data)))
-
-    hass.services.async_register("climate", "set_hvac_mode", _first_call_hangs_then_raises)
-
-    async def _pump() -> None:
-        # `async_block_till_done` would wait on the apply parked below, so the
-        # loop is pumped by hand until it is released.
-        for _ in range(200):
-            await asyncio.sleep(0)
-
-    # The loser parks inside its call; the winner lands one in the same tick.
-    hass.states.async_set(TEMP_ENTITY, "16.0", {})
-    await coordinator.async_refresh()
-    await _pump()
-    assert len(seen) == 1, seen
-    hass.states.async_set(TEMP_ENTITY, "15.9", {})
-    await coordinator.async_refresh()
-    await _pump()
-    assert len(seen) == 2, seen
-    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
-
-    gate.set()
-    await _pump()
-    assert coordinator._mode_fault_at is None, "a superseded apply opened a run of failures"
-
-    # So the next real failure is a first failure, and arms its own window.
-    async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("the confirming poll timed out")
-
-    hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
-    freezer.tick(timedelta(minutes=10))
-    hass.states.async_set(TEMP_ENTITY, "21.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator.data.decision.action == ACTION_IDLE
-
-    freezer.tick(timedelta(seconds=5))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
     await hass.async_block_till_done()
 
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
@@ -5020,114 +4992,6 @@ async def test_a_superseded_dropped_apply_revises_nothing_either(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
-async def test_switching_to_shadow_ends_a_run_of_mode_failures(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """A zone that is not commanding cannot be in a run of failed commands.
-
-    Left open, the run would outlive the switch, and the first failure after
-    the zone was turned back on would take itself for a retry -- handing its
-    window straight back, so a unit that took the mode anyway is flushed for
-    saying so.
-    """
-    freezer.move_to("2026-09-07 12:00:00+00:00")
-    coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
-
-    async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("the confirming poll timed out")
-
-    hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    hass.states.async_set(TEMP_ENTITY, "16.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator._mode_fault_at is not None
-
-    # Turned off, then on again.
-    await coordinator._store.async_update_zone("office", enabled=False)
-    freezer.tick(timedelta(minutes=2))
-    hass.states.async_set(TEMP_ENTITY, "15.9", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator._mode_fault_at is None, "the run outlived the switch"
-    await coordinator._store.async_update_zone("office", enabled=True)
-
-    # The next failure is a first failure, so it arms its own window and the
-    # unit that took the release anyway is not read as somebody at the wall.
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
-    freezer.tick(timedelta(minutes=2))
-    hass.states.async_set(TEMP_ENTITY, "21.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator.data.decision.action == ACTION_IDLE
-
-    freezer.tick(timedelta(seconds=5))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
-    await hass.async_block_till_done()
-
-    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
-
-
-async def test_a_second_run_of_mode_failures_arms_its_own_window(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """Each run of failures gets one armed window, so the run has to end.
-
-    Only the first failing apply of a run leaves its window standing; the rest
-    hand theirs back so retries cannot hold it open. A command that lands ends
-    the run -- without that, every later fault would be treated as a retry of
-    the first, and the unit that took the mode anyway would be flushed for
-    saying so.
-    """
-    freezer.move_to("2026-09-07 12:00:00+00:00")
-    coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
-
-    async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("the confirming poll timed out")
-
-    async def _accept(call: Any) -> None:
-        climate_calls.append((call.service, dict(call.data)))
-
-    # A first run of failures, which ends when a command lands.
-    hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    hass.states.async_set(TEMP_ENTITY, "16.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator._mode_fault_at is not None
-
-    hass.services.async_register("climate", "set_hvac_mode", _accept)
-    freezer.tick(timedelta(minutes=2))
-    hass.states.async_set(TEMP_ENTITY, "15.9", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator._mode_fault_at is None, "a landed command did not end the run"
-
-    # A second run, hours later. Its first failure arms its own window, so the
-    # unit that took the release anyway is not read as somebody at the wall.
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
-    hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    freezer.tick(timedelta(hours=2))
-    hass.states.async_set(TEMP_ENTITY, "21.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    assert coordinator.data.decision.action == ACTION_IDLE
-
-    freezer.tick(timedelta(seconds=5))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
-    await hass.async_block_till_done()
-
-    assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
-
-
 async def test_a_unit_that_took_the_mode_anyway_is_not_a_manual_edit(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -5140,10 +5004,10 @@ async def test_a_unit_that_took_the_mode_anyway_is_not_a_manual_edit(
     platform or cloud error -- an unadvertised mode still only warns until
     2025.4 -- and that is precisely the class where the command usually did
     land: the confirming poll timed out, the unit applied the mode, and it
-    publishes a second later. Handing the echo window back on every failing
-    apply closed it at the moment of the raise, so that publish was compared
-    and flushed the learned model. The first failing apply of a run leaves the
-    window it armed standing instead.
+    published a second later. Every attempt at closing the window on the way out
+    of the raise -- on every failing apply, or on every one after the first of a
+    run -- flushed the learned model when that publish arrived, at up to 57 an
+    hour. So the window is left exactly as an unguarded raise left it.
     """
     freezer.move_to("2026-09-07 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
@@ -5346,48 +5210,6 @@ async def test_a_mode_fault_and_an_outage_do_not_share_a_warning_budget(
     assert sum("could not command" in r.getMessage() for r in caplog.records) == 1, [
         r.getMessage() for r in caplog.records
     ]
-
-
-async def test_a_wall_edit_during_a_mode_fault_is_caught(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """A repeating fault must not hold the echo window open.
-
-    Nothing is committed when the mode call raises, so the same-mode gate never
-    arms and the zone re-enters on every refresh. Re-stamping the window each
-    time meant that for any room sensor reporting faster than
-    `CLIMATE_ECHO_WINDOW_S` it never closed for the length of the fault, so
-    somebody at the wall was absorbed as an echo of ours instead of compared.
-    """
-    freezer.move_to("2026-09-07 12:00:00+00:00")
-    coordinator = await _setup_enabled_zone(hass, climate_calls)
-    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
-    hass.states.async_set(TEMP_ENTITY, "16.0", {})
-    await coordinator.async_refresh()
-    await hass.async_block_till_done()
-    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
-
-    async def _refuse(call: Any) -> None:
-        raise HomeAssistantError("the cloud never answered")
-
-    hass.services.async_register("climate", "set_hvac_mode", _refuse)
-    for n in range(5):
-        freezer.tick(timedelta(minutes=1))
-        hass.states.async_set(TEMP_ENTITY, f"{15.9 - n * 0.1:.1f}", {})
-        await coordinator.async_refresh()
-        await hass.async_block_till_done()
-
-    # Seconds after the last attempt -- well inside the window a retry would
-    # have re-armed -- somebody turns it to cool at the wall.
-    freezer.tick(timedelta(seconds=5))
-    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_COOL, {"temperature": 24.0})
-    await hass.async_block_till_done()
-
-    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
 
 
 async def test_an_undelivered_apply_leaves_a_live_echo_window_alone(

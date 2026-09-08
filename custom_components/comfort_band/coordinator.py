@@ -182,9 +182,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._sensor_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
         # Per-fault stamps for the command-path warnings: "mode", "dropped",
         # "setpoint", "fan".
-        # When the current run of failing `set_hvac_mode` calls began, or None
-        # outside one. Only its first apply arms the echo window (see there).
-        self._mode_fault_at: datetime | None = None
         self._command_warn_logged_at: dict[str, datetime] = {}
         self._last_command_state: dict[str, Any] | None = None
         # What we last actually asked the climate for, kept apart from the
@@ -280,7 +277,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._sensor_logged_available = True
         self._sensor_edge_logged_at = {True: None, False: None}
         self._command_warn_logged_at = {}
-        self._mode_fault_at = None
         self._last_command_state = None
         self._commanded_state = None
         self._last_command_at = None
@@ -1129,8 +1125,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """
         now_utc = dt_util.utcnow()
         if not enabled:
-            # Not commanding means any run of failed commands is over too.
-            self._mode_fault_at = None
             # Nothing is commanded here, so nothing of ours is expected either.
             # Left standing, the last command from before the zone was switched
             # to shadow would go on being accepted by the manual-edit detector
@@ -1295,48 +1289,34 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # window that has not been handed back yet.)
         #
         # What a raise actually tells us is narrow: the call did not complete.
-        # It does not say the unit never got it. Five attempts have now tried to
-        # settle that question here -- assume delivered, assume not, infer it
-        # from the state machine, or vouch for the attempted mode -- and each
-        # was measured flushing the learned model on ordinary hardware, because
-        # the question is not answerable from inside this `except`.
+        # It does not say the unit never got it, and on the Home Assistant
+        # pinned here it usually did -- `_valid_mode_or_raise` still only warns
+        # for an unadvertised hvac mode until 2025.4, so the sole way this call
+        # raises today is a platform or cloud error, which is exactly the class
+        # where the command lands and only the confirmation is lost.
         #
-        # So nothing is recorded about it. In particular `_commanded_state` is
-        # left exactly as it is: it holds what the last command that *landed*
-        # asked for, and that command's own echo may still be in flight. The
-        # vouching attempt wrote the attempted mode into it, which reads as
-        # additive but is not -- one scalar per field means writing the mode
-        # discards the delivered one, so a lagging unit acknowledging the heat
-        # it was really told read as a hand edit and flushed the model. And with
-        # nothing to expire it, a wall edit landing on the mode we were failing
-        # to send was swallowed for as long as the fault lasted.
+        # So this catches, says so, and records nothing. In particular it leaves
+        # the echo-window stamp written above exactly as an un-guarded raise
+        # left it. That is not because it is right -- it means the window is
+        # re-armed by every retry and so never closes for the length of a fault,
+        # and a wall edit made during one is absorbed as an echo instead of
+        # compared. It is because every alternative was measured worse. Seven
+        # attempts now: assume delivered, assume not, infer delivery from
+        # `State` identity across the call, vouch for the attempted mode, hand
+        # the stamp back on every failing apply, hand it back on every apply
+        # after the first of a run. The last two closed the window while a unit
+        # that had taken the mode was still publishing it, and flushed the
+        # learned model at up to 57 an hour against none before the guard
+        # existed; the first two swallowed wall edits or discarded the vouch of
+        # a command that had actually landed.
         #
-        # What the window does is the whole answer here. Handing it back on
-        # every failing apply closed it at the moment of the raise, so a unit
-        # that applied the mode anyway and published it a second later was
-        # compared and flushed -- measured at 15 to 39 flushes an hour on a
-        # cycling room, against none before this guard existed. Keeping it armed
-        # on every failing apply is the opposite failure: the fault re-enters on
-        # every refresh, so the window never closes and a wall edit made during
-        # it is absorbed instead of compared.
-        #
-        # Neither, then, once per apply. The window is armed by the *first*
-        # failing apply of a fault and left alone after that: a unit that did
-        # get the mode has its echo absorbed, and thirty seconds later the
-        # window closes on its own and stays closed however long the fault runs,
-        # so anything the occupant does is compared. Retries hand the stamp back
-        # rather than renewing it, which is what stops the ratcheting.
-        #
-        # This matters most on the Home Assistant actually pinned here.
-        # `_valid_mode_or_raise` still only *warns* for an unadvertised hvac
-        # mode in 2024.12, so the sole way this call raises today is a platform
-        # or cloud error -- precisely the class where the command most often did
-        # land, and the reading a rollback-always design gets backwards.
-        #
-        # It matters beyond a cloud timeout: from Home Assistant 2025.4
-        # `climate.set_hvac_mode` raises for a mode the entity does not
-        # advertise, where 2024.12 only warns, and `fan_only` is exactly such a
-        # mode on many units.
+        # The reason none of them works is that the window is the wrong
+        # instrument: it answers "was anything commanded recently", and what is
+        # needed here is "is this observation the unit acknowledging something
+        # we asked for". `_commanded_state` is that instrument, and making it
+        # hold more than one value per field -- with an expiry, and without
+        # displacing what a landed command put there -- is a change to the
+        # detector rather than to this `except`. It is left for one.
         try:
             await self.hass.services.async_call(
                 "climate",
@@ -1354,17 +1334,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     type(err).__name__,
                     err,
                 )
-            if not self._still_the_current_apply(now_utc):
-                # Superseded while this call hung: a later apply has stamped
-                # the window since, and if it landed it also ended this run.
-                # None of that is ours to revise.
-                return
-            if self._mode_fault_at is None:
-                self._mode_fault_at = now_utc
-            else:
-                self._last_command_at = previous_command_at
             return
-        self._mode_fault_at = None
         self._command_warn_logged_at.pop("mode", None)
 
         # A clean return is not proof of delivery. Home Assistant answers a call
@@ -1658,13 +1628,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """True while `mine`'s apply is the last one to have stamped the window.
 
         Applies are dispatched with `hass.async_create_task`, so two of them
-        overlap whenever a climate call outlives the next refresh -- which is
-        exactly the cloud timeout the mode guard exists for, and nothing spaces
-        the retries because nothing commits. Everything an undelivered apply
-        does afterwards is written from values it read *before* its own await,
-        so a superseded one would hand back a stamp a later apply set after
-        landing a real command -- making that command's echo read as a hand edit
-        -- or re-open a run of failures the later apply had just ended.
+        overlap whenever a climate call outlives the next refresh -- ordinary
+        for a cloud unit, and nothing spaces the retries because nothing
+        commits. `previous` was read before this apply's own await, so a
+        superseded apply writing it back would hand away a stamp a later apply
+        set after landing a real command, and that command's echo would then
+        read as a hand edit.
+
+        Only the dropped-command path needs this today; the mode-raise path
+        above deliberately touches nothing.
 
         Identity rather than equality, because ownership is the question:
         `self._last_command_at = now_utc` stores this very object. Two applies
