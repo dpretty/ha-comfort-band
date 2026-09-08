@@ -4220,6 +4220,7 @@ async def test_a_setpoint_the_unit_stops_reporting_is_not_an_edit(
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A setpoint that vanishes is an absence of information, not a value.
 
@@ -4280,6 +4281,27 @@ async def test_a_setpoint_the_unit_stops_reporting_is_not_an_edit(
     _observe({"temperature": 24.0})
     await hass.async_block_till_done()
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+    # And when a flush does happen on an observation carrying no target, the
+    # line an operator reads says so rather than naming the value substituted
+    # for the comparison -- which nothing published.
+    await coordinator._store.async_update_zone("office", persisted_idle_slope=-0.02)
+    freezer.tick(timedelta(seconds=CLIMATE_ECHO_WINDOW_S + 60))
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        event: Event[EventStateChangedData] = Event(
+            "state_changed",
+            {
+                "entity_id": CLIMATE_ENTITY,
+                "old_state": State(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 24.0}),
+                "new_state": State(CLIMATE_ENTITY, HVAC_MODE_COOL, {}),
+            },
+        )
+        coordinator._on_climate_state_change(event)
+        await hass.async_block_till_done()
+    assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+    flushes = [r.getMessage() for r in caplog.records if "manual climate edit" in r.getMessage()]
+    assert flushes and "'target_temp': None" in flushes[0], flushes
 
 
 async def test_a_climate_entity_that_does_not_exist_yet_is_not_an_outage(
@@ -4962,6 +4984,67 @@ async def test_the_baseline_prefers_what_the_unit_reports_to_what_it_reported(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
+async def test_a_dropped_command_does_not_end_a_mode_fault(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A clean return is not proof of delivery, so it cannot end a fault.
+
+    The mode warning's budget is cleared where its sibling is, after the
+    delivery check -- not on the clean return from `set_hvac_mode`, which Home
+    Assistant also gives for a call it dropped at dispatch. Clearing it there
+    let a bridge alternating between raising and unreachable warn on every
+    apply instead of once per interval: five times the intended volume, and
+    scaling with the room sensor's rate.
+
+    The ordering matters and is why the sibling test does not catch this: the
+    dropped apply has to fall *between* two raises, so that its clean return is
+    what spends a live mode budget.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
+
+    async def _refuse(call: Any) -> None:
+        raise HomeAssistantError("the confirming poll timed out")
+
+    async def _accept(call: Any) -> None:
+        climate_calls.append((call.service, dict(call.data)))
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # A raise, which stamps the mode budget.
+        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+        hass.services.async_register("climate", "set_hvac_mode", _refuse)
+        hass.states.async_set(TEMP_ENTITY, "16.0", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # Then the unit drops off: the call returns cleanly and delivers
+        # nothing, which is not the fault ending.
+        hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+        hass.services.async_register("climate", "set_hvac_mode", _accept)
+        freezer.tick(timedelta(minutes=1))
+        hass.states.async_set(TEMP_ENTITY, "15.9", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # Then it raises again, well inside the same interval.
+        hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 21.0})
+        hass.services.async_register("climate", "set_hvac_mode", _refuse)
+        freezer.tick(timedelta(minutes=1))
+        hass.states.async_set(TEMP_ENTITY, "15.8", {})
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    assert sum("could not command" in r.getMessage() for r in caplog.records) == 1, [
+        r.getMessage() for r in caplog.records
+    ]
+
+
 async def test_a_mode_raise_writes_nothing_at_all(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -4982,16 +5065,31 @@ async def test_a_mode_raise_writes_nothing_at_all(
     freezer.move_to("2026-09-07 12:00:00+00:00")
     coordinator = await _setup_enabled_zone(hass, climate_calls)
     await coordinator._store.async_update_zone("office", min_cycle_minutes=1)
-    # An outage first, so there is a live budget belonging to another fault for
-    # the raise below to leave alone.
-    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+
+    # A landed command first, so the learned model and its persist throttles
+    # hold something the raise below could damage. Its setpoint call fails, so
+    # a second fault's budget is live too.
+    async def _refuse_setpoint(call: Any) -> None:
+        raise HomeAssistantError("the entity does not support it")
+
+    hass.services.async_register("climate", "set_temperature", _refuse_setpoint)
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
     hass.states.async_set(TEMP_ENTITY, "16.0", {})
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert set(coordinator._command_warn_logged_at) == {"dropped"}
+    assert set(coordinator._command_warn_logged_at) == {"setpoint"}
+    assert coordinator._samples_cache
+    assert coordinator._last_sample_persist_at is not None
 
-    # The unit is back, but nothing has landed yet, so that outage's budget is
-    # still live when the mode call starts raising.
+    # Then an outage, so a budget belonging to another fault is live when the
+    # mode call starts raising. It commits nothing and appends no sample, so
+    # everything above survives it.
+    hass.states.async_set(CLIMATE_ENTITY, STATE_UNAVAILABLE, {})
+    freezer.tick(timedelta(minutes=2))
+    hass.states.async_set(TEMP_ENTITY, "16.1", {})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert set(coordinator._command_warn_logged_at) == {"setpoint", "dropped"}
     hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
     await hass.async_block_till_done()
 
@@ -5000,6 +5098,10 @@ async def test_a_mode_raise_writes_nothing_at_all(
         dict(coordinator._last_command_state or {}),
         dict(coordinator._commanded_state or {}),
         dict(coordinator._store.get_zone("office")),
+        list(coordinator._samples_cache),
+        coordinator._last_sample_persist_at,
+        coordinator._last_idle_slope_persist_at,
+        coordinator._sensor_logged_available,
     )
 
     async def _refuse(call: Any) -> None:
@@ -5018,9 +5120,14 @@ async def test_a_mode_raise_writes_nothing_at_all(
     assert dict(coordinator._last_command_state or {}) == before[1]
     assert dict(coordinator._commanded_state or {}) == before[2]
     assert dict(coordinator._store.get_zone("office")) == before[3]
-    # Its own budget is spent; the one belonging to the earlier outage is
-    # neither cleared nor spent by it.
-    assert set(coordinator._command_warn_logged_at) == {"dropped", "mode"}
+    # The learned model and everything that governs writing it, untouched.
+    assert list(coordinator._samples_cache) == before[4]
+    assert coordinator._last_sample_persist_at == before[5]
+    assert coordinator._last_idle_slope_persist_at == before[6]
+    assert coordinator._sensor_logged_available == before[7]
+    # Its own budget is spent; the two belonging to other faults are neither
+    # cleared nor spent by it.
+    assert set(coordinator._command_warn_logged_at) == {"setpoint", "dropped", "mode"}
 
 
 async def test_a_mode_raise_leaves_an_earlier_commands_vouch_alone(

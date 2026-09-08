@@ -1112,10 +1112,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         stop.
 
         The commitment rests on `set_hvac_mode` alone -- that is the call that
-        makes the unit start conditioning. The fan and setpoint calls that
-        follow are best-effort: they refine a cycle that is already running, and
-        a raise from either is warned about but changes nothing that was
-        recorded.
+        makes the unit start conditioning. All three calls are guarded, but not
+        alike: a raise from the fan or setpoint call is warned about and changes
+        nothing that was recorded, because they only refine a cycle that is
+        already running, while a raise from the mode call means no cycle
+        started, so it records nothing and returns (see there for why it records
+        nothing at all, including no sample).
 
         Appends a sample reflecting the action the HVAC is actually in for the
         next interval -- the newly-committed `decision.action` once
@@ -1290,10 +1292,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         #
         # What a raise actually tells us is narrow: the call did not complete.
         # It does not say the unit never got it, and on the Home Assistant
-        # pinned here it usually did -- `_valid_mode_or_raise` still only warns
-        # for an unadvertised hvac mode until 2025.4, so the sole way this call
-        # raises today is a platform or cloud error, which is exactly the class
-        # where the command lands and only the confirmation is lost.
+        # pinned here it usually did: `_valid_mode_or_raise` still only warns
+        # for an unadvertised hvac mode until 2025.4, so what reaches this
+        # `except` today is mostly a platform or cloud error -- the class where
+        # the command lands and only the confirmation is lost. Not always: a
+        # `ServiceNotFound` from a climate integration that failed to load
+        # definitely did not land. There is no way to tell them apart here,
+        # which is the whole difficulty.
         #
         # So this catches, says so, and records nothing. In particular it leaves
         # the echo-window stamp written above exactly as an un-guarded raise
@@ -1749,6 +1754,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
+        reported = dict(observed)
         carried = self._last_command_state
         if new_state.state == STATE_UNKNOWN:
             # `unknown` is not the same thing as `unavailable`, though it is
@@ -1780,9 +1786,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # `climate.set_temperature` with only `target_temp_low`/`_high` is legal
         # on an entity advertising both features, and nulls `target_temperature`
         # while leaving the mode alone. Somebody moving such a unit from a
-        # single target to a 24-28 band is accepted here. Every core integration
-        # I could check gates that on `heat_cool`, so the mode moves too and the
-        # edit is still caught; on one that does not, this is a miss.
+        # single target to a 24-28 band is accepted here, and a preset that
+        # switches the entity to a range target reaches the same state from a
+        # wall button rather than a service call. Every core integration I could
+        # check gates that on `heat_cool`, so the mode moves too and the edit is
+        # still caught; on one that does not, this is a miss. The rule accepts
+        # any absent target under an expected mode -- that is the mechanism, and
+        # the routes to it are only examples.
         #
         # What `None` usually means is that the platform has no target *right
         # now*:
@@ -1831,7 +1841,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "%s: manual climate edit detected (observed=%s, last_seen=%s, "
             "commanded=%s); flushing sample buffer",
             self.zone_name,
-            observed,
+            # What the entity actually reported. `observed` may carry a setpoint
+            # substituted for one it did not send (see above), and naming a
+            # value nothing published is no help to whoever is reading this.
+            reported,
             self._last_command_state,
             self._commanded_state,
         )
