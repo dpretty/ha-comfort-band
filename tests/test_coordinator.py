@@ -4831,6 +4831,16 @@ async def test_a_mode_command_that_raises_records_nothing_and_warns_sparingly(
     assert any(type(raised).__name__ in r.getMessage() for r in caplog.records), [
         r.getMessage() for r in caplog.records
     ]
+    # And the *mode* it was trying to set, which is what an operator matches
+    # against the unit's own `hvac_modes`. The action name would pass a bare
+    # substring check (`heat` is in `heating`), so match the rendered form.
+    named = [r for r in caplog.records if "could not command" in r.getMessage()]
+    assert all(f" to {HVAC_MODE_HEAT} (" in r.getMessage() for r in named), [
+        r.getMessage() for r in named
+    ]
+    # With frames: the catch is broad enough to take a platform's own bug, and
+    # a class name names neither the integration nor the line.
+    assert all(r.exc_info is not None for r in named)
 
     # A mode command lands, so the fault is over -- and its return is announced
     # rather than sitting inside the stale budget.

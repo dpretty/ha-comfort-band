@@ -797,6 +797,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         Each key is cleared when a call of its own kind next succeeds, so a
         fault's return is announced rather than sitting inside a stale budget.
+        `"mode"` is the exception, and deliberately: a clean return from
+        `set_hvac_mode` is not proof of delivery, so it is cleared past the
+        delivery check rather than on the return (see there).
         Note the "next succeeds": an episode that ends without one -- a fan the
         unit adopts by itself, so the call is skipped -- keeps its stamp until
         the budget expires, delaying the next announcement by up to an interval.
@@ -983,7 +986,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # must not abort the rest of _maybe_apply_action -- the sample
             # append still needs to run.
             #
-            # Throttled for the same reason as the other command-path warnings.
+            # Throttled for the same reason as the other command-path warnings,
+            # and carrying its traceback for the same reason they all do: the
+            # catch is broad enough to take a climate platform's own
+            # programming error, and a class name alone names neither the
+            # integration nor the line. The throttle is what makes the frames
+            # affordable.
             # This one can be permanent: the guard above only skips the call
             # when the unit already reports the mode we want, so a stored fan
             # mode it advertises and refuses is retried on every apply, forever.
@@ -991,7 +999,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # one budget, whichever of the two sites catches it.
             if self._may_log_command_warning("fan"):
                 LOGGER.warning(
-                    "%s: climate.set_fan_mode(%s) failed: %s", self.zone_name, desired, err
+                    "%s: climate.set_fan_mode(%s) failed: %s",
+                    self.zone_name,
+                    desired,
+                    err,
+                    exc_info=True,
                 )
         else:
             self._command_warn_logged_at.pop("fan", None)
@@ -1305,15 +1317,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # left it. That is not because it is right -- it means the window is
         # re-armed by every retry and so never closes for the length of a fault,
         # and a wall edit made during one is absorbed as an echo instead of
-        # compared. It is because every alternative was measured worse. Seven
-        # attempts now: assume delivered, assume not, infer delivery from
-        # `State` identity across the call, vouch for the attempted mode, hand
-        # the stamp back on every failing apply, hand it back on every apply
-        # after the first of a run. The last two closed the window while a unit
-        # that had taken the mode was still publishing it, and flushed the
-        # learned model at up to 57 an hour against none before the guard
-        # existed; the first two swallowed wall edits or discarded the vouch of
-        # a command that had actually landed.
+        # compared. It is because every alternative was measured worse. Six
+        # ways of acting on the guess have been tried: assume delivered; assume
+        # not; infer delivery from `State` identity across the call; vouch for
+        # the attempted mode; hand the stamp back on every failing apply; hand
+        # it back on every apply after the first of a run. The last two closed
+        # the window while a unit that had taken the mode was still publishing
+        # it, and flushed the learned model at up to 57 an hour against none
+        # before the guard existed; the first two swallowed wall edits or
+        # discarded the vouch of a command that had actually landed.
         #
         # The reason none of them works is that the window is the wrong
         # instrument: it answers "was anything commanded recently", and what is
@@ -1338,6 +1350,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     decision.target_mode,
                     type(err).__name__,
                     err,
+                    exc_info=True,
                 )
             return
 
@@ -1466,6 +1479,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     self.zone_name,
                     self.climate_entity_id,
                     err,
+                    exc_info=True,
                 )
         setpoint_applied: float | None = None
         if rounded_target_temp is not None:
@@ -1492,6 +1506,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                         decision.target_mode,
                         rounded_target_temp,
                         err,
+                        exc_info=True,
                     )
         # Snapshot the climate's actual state after our commands settle. The
         # service calls leave `decision.target_temp=None` for idle releases,
