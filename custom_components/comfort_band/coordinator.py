@@ -1128,9 +1128,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         makes the unit start conditioning. All three calls are guarded, but not
         alike: a raise from the fan or setpoint call is warned about and changes
         nothing that was recorded, because they only refine a cycle that is
-        already running, while a raise from the mode call means no cycle
-        started, so it records nothing and returns (see there for why it records
-        nothing at all, including no sample).
+        already running, while a raise from the mode call leaves no cycle we
+        can say started, so it records nothing and returns. Note the shape of
+        that claim: a raise does *not* establish that the unit missed the
+        command -- on the Home Assistant this integration declares a floor for,
+        it usually took it -- only that we cannot claim it did. See there; that
+        distinction is the whole difficulty, and it is also why nothing is
+        recorded at all, including no sample.
 
         Appends a sample reflecting the action the HVAC is actually in for the
         next interval -- the newly-committed `decision.action` once
@@ -1671,8 +1675,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         set after landing a real command, and that command's echo would then
         read as a hand edit.
 
-        Only the dropped-command path needs this today; the mode-raise path
-        above deliberately touches nothing.
+        Only the dropped-command path calls this today, because the mode-raise
+        path above deliberately touches nothing and so has nothing to own. That
+        is not a claim the rest of the apply is covered: the success tail writes
+        the store, `_commanded_state` and a sample with no ownership check at
+        all, so a superseded apply still clobbers those three. It does that on
+        `main` too, which is why it is filed as its own work rather than widened
+        here on the way past.
 
         Identity rather than equality, because ownership is the question:
         `self._last_command_at = now_utc` stores this very object. Two applies
@@ -1872,6 +1881,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # (see above), and naming a value nothing published is no help to
             # whoever is reading this.
             reported,
+            # The baseline -- what the comparison was actually made against, so
+            # it is the right thing to print even though its `target_temp` may
+            # itself be a value carried from an earlier mode rather than one the
+            # entity published alongside this one. Read it as "what we compared
+            # to", not as a second observation.
             self._last_command_state,
             self._commanded_state,
         )
