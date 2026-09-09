@@ -4750,6 +4750,7 @@ async def test_a_dial_turned_while_the_mode_is_unknown_is_still_an_edit(
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """`unknown` costs us the mode, and only the mode.
 
@@ -4778,10 +4779,21 @@ async def test_a_dial_turned_while_the_mode_is_unknown_is_still_an_edit(
             "new_state": State(CLIMATE_ENTITY, STATE_UNKNOWN, {"temperature": 26.0}),
         },
     )
-    coordinator._on_climate_state_change(turned)
-    await hass.async_block_till_done()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        coordinator._on_climate_state_change(turned)
+        await hass.async_block_till_done()
 
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] is None
+
+    # And the line an operator reads names the mode the entity actually
+    # published. `unknown` is the symptom they are chasing -- printing the
+    # carried mode instead would tell them the entity reported a mode it never
+    # sent, and hide the missing topic behind a plausible-looking one.
+    flushes = [r.getMessage() for r in caplog.records if "manual climate edit" in r.getMessage()]
+    assert flushes, "the dial turn should have flushed"
+    assert f"'hvac_mode': '{STATE_UNKNOWN}'" in flushes[0], flushes[0]
+    assert f"'hvac_mode': '{HVAC_MODE_HEAT}'" not in flushes[0].split("last_seen=")[0], flushes[0]
 
 
 async def test_a_setpoint_that_never_left_is_not_offered_as_a_baseline(

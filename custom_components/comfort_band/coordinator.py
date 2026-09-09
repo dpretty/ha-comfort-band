@@ -1314,7 +1314,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # definitely did not land. There is no way to tell them apart here,
         # which is the whole difficulty.
         #
-        # So this catches, says so, and records nothing. In particular it leaves
+        # So this catches, says so, and records nothing: no commitment, no store
+        # write, and -- the half the docstring above points here for -- no
+        # sample, because one appended here would label the interval with an
+        # action the unit was never put into, and the slope estimator would
+        # learn the wrong room from it. In particular it leaves
         # the echo-window stamp written above exactly as an un-guarded raise
         # left it. That is not because it is right -- it means the window is
         # re-armed by every retry and so never closes for the length of a fault,
@@ -1771,6 +1775,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "hvac_mode": new_state.state,
             "target_temp": new_state.attributes.get("temperature"),
         }
+        # Snapshotted before either carry below, for the flush diagnostic. Both
+        # of them substitute a value the entity did not send, and naming one as
+        # if it had is no help to whoever is reading the line -- an entity
+        # publishing no mode is worth seeing as `unknown` there, because that is
+        # the symptom to chase.
+        reported = dict(observed)
         carried = self._last_command_state
         if new_state.state == STATE_UNKNOWN:
             # `unknown` is not the same thing as `unavailable`, though it is
@@ -1792,12 +1802,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 # disk.
                 return
             observed["hvac_mode"] = carried["hvac_mode"]
-        # Snapshotted here, between the two carries, for the flush diagnostic
-        # below. After the mode carry, because a mode the entity could not
-        # report is not what caused a flush and should not be printed as if it
-        # were; before the setpoint one, because that substitutes a value
-        # nothing published.
-        reported = dict(observed)
         # A setpoint the entity is not reporting is an absence of information,
         # not a value, so it says nothing rather than reading as somebody having
         # cleared the dial. A physical remote always sets a number, and no dial
@@ -1863,9 +1867,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             "%s: manual climate edit detected (observed=%s, last_seen=%s, "
             "commanded=%s); flushing sample buffer",
             self.zone_name,
-            # What the entity actually reported. `observed` may carry a setpoint
-            # substituted for one it did not send (see above), and naming a
-            # value nothing published is no help to whoever is reading this.
+            # What the entity actually reported, both fields raw. `observed`
+            # may carry a mode or a setpoint substituted for one it did not send
+            # (see above), and naming a value nothing published is no help to
+            # whoever is reading this.
             reported,
             self._last_command_state,
             self._commanded_state,
