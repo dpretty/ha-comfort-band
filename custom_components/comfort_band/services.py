@@ -406,6 +406,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
             "low": state.effective_low,
             "high": state.effective_high,
             "action": state.decision.action,
+            "room_source": state.room_source,
         }
         await _data(hass).feedback_store.async_append(entry)
 

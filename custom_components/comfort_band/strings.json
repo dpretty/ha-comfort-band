@@ -36,12 +36,17 @@
     "step": {
       "init": {
         "title": "Configure zone sensors",
-        "description": "Change the room-temperature sensor or attach / clear the humidity sensor. Swapping the temperature sensor clears this zone's sample buffer and triggers an MPC warm-up period.",
+        "description": "Change the room-temperature sensor or attach / clear the humidity sensor. Swapping the temperature sensor clears this zone's sample buffer and triggers an MPC warm-up period. The fallback fields say what may stand in when the room sensor stops reporting for more than five minutes: an optional second sensor, then the climate entity's own temperature reading unless you switch that off.",
         "data": {
           "temp_sensor": "Room-temperature sensor",
-          "humidity_sensor": "Humidity sensor (optional, enables apparent temperature)"
+          "humidity_sensor": "Humidity sensor (optional, enables apparent temperature)",
+          "fallback_temp_sensor": "Fallback temperature sensor (optional, used while the room sensor is unavailable)",
+          "fallback_to_climate": "Fall back to the climate entity's own temperature reading as a last resort"
         }
       }
+    },
+    "error": {
+      "fallback_same_as_temp_sensor": "Choose a different sensor — the fallback cannot be the room sensor itself."
     }
   },
   "entity": {
