@@ -62,15 +62,20 @@ class MpcReadyBinarySensor(ComfortBandZoneEntity, BinarySensorEntity):
 class RoomSensorUnavailableBinarySensor(ComfortBandZoneEntity, BinarySensorEntity):
     """True while the zone's configured temperature sensor isn't reporting.
 
-    A zone with no room reading cannot control: the decider returns `unknown`
-    and the room is left to drift. On its own that is silent -- the failure that
-    prompted this entity went unnoticed for hours while a bedroom sat several
-    degrees below its band, because nothing surfaced "this zone has stopped
-    controlling."
+    Before v0.18.0 a zone with no room reading could not control: the decider
+    returned `unknown` and the room was left to drift. On its own that was
+    silent -- the failure that prompted this entity went unnoticed for hours
+    while a bedroom sat several degrees below its band, because nothing
+    surfaced "this zone has stopped controlling."
 
     Deliberately a first-class (non-diagnostic) `problem` sensor rather than an
-    attribute: `on` means "this room has no reading to control from", which is
-    exactly the condition worth a notification. (A zone still in shadow mode
+    attribute: `on` means "the configured sensor is not reporting", which is
+    exactly the condition worth a notification. Since v0.18.0 a stand-in
+    reading -- a fallback sensor, or the climate entity's own
+    `current_temperature` -- may be driving control meanwhile, and the `source`
+    attribute of `sensor.{zone}_room_temperature` says which; this entity
+    deliberately stays `on` regardless, because the device still needs
+    attention. (A zone still in shadow mode
     wasn't controlling either way -- the entity is just as true there, it simply
     matters less, which is why only the log distinguishes them.) Pair it with a `for:` of a few
     minutes to ride out routine sensor blips:

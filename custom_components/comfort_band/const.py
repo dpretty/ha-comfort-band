@@ -21,6 +21,12 @@ CONF_ZONE_NAME: Final = "zone_name"
 CONF_CLIMATE_ENTITY: Final = "climate_entity"
 CONF_TEMP_SENSOR: Final = "temp_sensor"
 CONF_HUMIDITY_SENSOR: Final = "humidity_sensor"
+# v0.18.0 room-sensor fallback. Both are OptionsFlow-only (never in `data`):
+# the optional stand-in sensor, and whether the climate entity's own
+# `current_temperature` may serve as the last resort.
+CONF_FALLBACK_TEMP_SENSOR: Final = "fallback_temp_sensor"
+CONF_FALLBACK_TO_CLIMATE: Final = "fallback_to_climate"
+DEFAULT_FALLBACK_TO_CLIMATE: Final = True
 CONF_DEADBAND_BELOW: Final = "deadband_below"
 CONF_DEADBAND_ABOVE: Final = "deadband_above"
 CONF_MIN_CYCLE_MINUTES: Final = "min_cycle_minutes"
@@ -81,6 +87,28 @@ SENSOR_EDGE_LOG_INTERVAL_S: Final = 300
 # a clean return is not proof of delivery -- for reasons the coordinator gives
 # at the point it clears it.
 COMMAND_WARN_INTERVAL_S: Final = 300
+
+# v0.18.0 room-sensor fallback. How long the configured room sensor must be
+# continuously unavailable before the zone starts controlling from a stand-in
+# reading. Five minutes rides out the mesh blips the edge-log throttle above
+# exists for: switching sources on every blip would feed hysteresis a step
+# between two readings with different offsets, and the sampler must never see
+# that step at all. During the grace window the zone behaves exactly as it did
+# before v0.18.0 -- no reading, no command.
+FALLBACK_GRACE_S: Final = 300
+# Added to both deadbands while a stand-in reading drives control. A climate
+# entity's own sensor sits at the indoor unit and typically reports whole
+# degrees, so the same deadbands that suit a room sensor short-cycle on it.
+FALLBACK_DEADBAND_EXTRA: Final = 0.5
+
+# Where the room reading driving control came from. Surfaced as the `source`
+# attribute of `sensor.{zone}_room_temperature`.
+ROOM_SOURCE_PRIMARY: Final = "primary"
+ROOM_SOURCE_FALLBACK_SENSOR: Final = "fallback_sensor"
+ROOM_SOURCE_CLIMATE: Final = "climate"
+ROOM_SOURCE_NONE: Final = "none"
+# The sources that mean a stand-in is driving control.
+ROOM_SOURCES_STAND_IN: Final = frozenset({ROOM_SOURCE_FALLBACK_SENSOR, ROOM_SOURCE_CLIMATE})
 
 # Slope estimator: minimum samples per segment before WLS produces a slope;
 # exponential recency weight time constant; epsilon below which a slope is

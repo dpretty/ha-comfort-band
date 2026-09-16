@@ -20,10 +20,13 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_FALLBACK_TEMP_SENSOR,
+    CONF_FALLBACK_TO_CLIMATE,
     CONF_HUMIDITY_SENSOR,
     CONF_KIND,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
+    DEFAULT_FALLBACK_TO_CLIMATE,
     DOMAIN,
     ENTRY_KIND_PROFILE_MANAGER,
     ENTRY_KIND_ZONE,
@@ -119,8 +122,13 @@ class ComfortBandConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class ZoneOptionsFlow(OptionsFlow):
     """Edit a zone's sensor wiring after creation: room temperature
-    (required, swapping flushes the sample buffer) and humidity (optional,
-    clearable).
+    (required, swapping flushes the sample buffer), humidity (optional,
+    clearable), and -- v0.18.0 -- what stands in when the room sensor is
+    dark: an optional fallback sensor, and whether the climate entity's own
+    reading may be used as the last resort (on by default).
+
+    Changing either fallback field does not flush the sample buffer: nothing
+    is ever sampled from a stand-in reading, so there is no mixing to avoid.
 
     Resolution order at read time is `entry.options[KEY]` falling back to
     `entry.data[KEY]` — so existing zones that set sensors at first-setup
@@ -148,14 +156,27 @@ class ZoneOptionsFlow(OptionsFlow):
         current_humidity = entry.options.get(
             CONF_HUMIDITY_SENSOR, entry.data.get(CONF_HUMIDITY_SENSOR)
         )
+        # Options-only keys: never present in `data`, so a missing key is
+        # simply the default.
+        current_fallback = entry.options.get(CONF_FALLBACK_TEMP_SENSOR)
+        current_fallback_to_climate = entry.options.get(
+            CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
+        )
+        errors: dict[str, str] = {}
         if user_input is not None:
             new_temp = user_input[CONF_TEMP_SENSOR]
+            # Both fields share a selector, so nothing stops the user picking
+            # the room sensor as its own fallback. The coordinator ignores such
+            # a fallback (with a warning); refusing it here puts the mistake in
+            # front of the user rather than in the log.
+            if user_input.get(CONF_FALLBACK_TEMP_SENSOR) == new_temp:
+                errors[CONF_FALLBACK_TEMP_SENSOR] = "fallback_same_as_temp_sensor"
             # String equality on the EntitySelector's output is sufficient
             # — the widget returns the entity_id verbatim from the entity
             # registry (always lowercase, no whitespace), so there's no
             # casing / formatting ambiguity for "did the user change the
             # sensor?".
-            if new_temp != current_temp:
+            elif new_temp != current_temp:
                 # Sensor swap: clear samples so the new sensor's data
                 # isn't mixed with old-sensor samples at a different
                 # resolution / offset. Correctness depends on the
@@ -187,18 +208,25 @@ class ZoneOptionsFlow(OptionsFlow):
                     persisted_idle_slope=None,
                     persisted_idle_slope_at=None,
                 )
-            return self.async_create_entry(
-                title="",
-                # Voluptuous omits the humidity key when its EntitySelector
-                # is left empty. Normalise to None so the resolution above
-                # sees a value (not a missing key that falls through to
-                # entry.data — which would silently re-apply the
-                # previously-saved sensor).
-                data={
-                    CONF_TEMP_SENSOR: new_temp,
-                    CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR),
-                },
-            )
+            if not errors:
+                return self.async_create_entry(
+                    title="",
+                    # Voluptuous omits the humidity key when its EntitySelector
+                    # is left empty. Normalise to None so the resolution above
+                    # sees a value (not a missing key that falls through to
+                    # entry.data — which would silently re-apply the
+                    # previously-saved sensor).
+                    data={
+                        CONF_TEMP_SENSOR: new_temp,
+                        CONF_HUMIDITY_SENSOR: user_input.get(CONF_HUMIDITY_SENSOR),
+                        # Same normalisation as humidity: an emptied selector
+                        # persists as None rather than a missing key.
+                        CONF_FALLBACK_TEMP_SENSOR: user_input.get(CONF_FALLBACK_TEMP_SENSOR),
+                        CONF_FALLBACK_TO_CLIMATE: user_input.get(
+                            CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
+                        ),
+                    },
+                )
         schema = vol.Schema(
             {
                 vol.Required(CONF_TEMP_SENSOR, default=current_temp): _TEMP_SELECTOR,
@@ -206,6 +234,13 @@ class ZoneOptionsFlow(OptionsFlow):
                     CONF_HUMIDITY_SENSOR,
                     description={"suggested_value": current_humidity},
                 ): _HUMIDITY_SELECTOR,
+                vol.Optional(
+                    CONF_FALLBACK_TEMP_SENSOR,
+                    description={"suggested_value": current_fallback},
+                ): _TEMP_SELECTOR,
+                vol.Optional(
+                    CONF_FALLBACK_TO_CLIMATE, default=current_fallback_to_climate
+                ): selector.BooleanSelector(),
             }
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

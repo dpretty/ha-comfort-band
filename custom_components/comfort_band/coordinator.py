@@ -5,6 +5,10 @@ Event-driven (`update_interval=None`); refreshes fire from:
   - active-profile dispatcher signal
   - one-shot timers for override-expiry + next-transition
   - explicit `async_request_refresh()` from numbers/switches/services
+  - v0.18.0, only once the room sensor has been unavailable for the grace
+    period: the fallback-grace timer, and changes to the stand-in reading
+    (the fallback sensor's state, or the climate entity's
+    `current_temperature`)
 
 Each refresh re-reads the store + sensor, runs the hysteresis decider against
 the resolved effective band, and (in a follow-up task) applies the decision
@@ -42,9 +46,17 @@ from .const import (
     ACTION_UNKNOWN,
     CLIMATE_ECHO_WINDOW_S,
     COMMAND_WARN_INTERVAL_S,
+    DEFAULT_FALLBACK_TO_CLIMATE,
+    FALLBACK_DEADBAND_EXTRA,
+    FALLBACK_GRACE_S,
     LOGGER,
     MPC_SIMULATION_STEP_MINUTES,
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
+    ROOM_SOURCE_CLIMATE,
+    ROOM_SOURCE_FALLBACK_SENSOR,
+    ROOM_SOURCE_NONE,
+    ROOM_SOURCE_PRIMARY,
+    ROOM_SOURCES_STAND_IN,
     SAMPLE_PERSIST_INTERVAL_S,
     SENSOR_EDGE_LOG_INTERVAL_S,
     SIGNAL_ACTIVE_PROFILE_CHANGED,
@@ -88,15 +100,27 @@ class ZoneState:
     (manual_low/high, deadband_*, override_hours, enabled, ...) without
     poking the store directly.
 
-    `room` is always the *raw* room reading. `apparent_temperature` is
-    always the Steadman value (which equals `room` when humidity is None).
-    `decision_room` is whichever of those was actually fed into hysteresis —
-    surfaced for the card so users can see the value driving control.
+    `room` is the *raw* reading in use: the configured room sensor while it
+    reports, otherwise (v0.18.0) the stand-in named by `room_source`, or None.
+    `apparent_temperature` is always the Steadman value (which equals `room`
+    when humidity is None). `decision_room` is whichever of those was
+    actually fed into hysteresis — surfaced for the card so users can see the
+    value driving control.
+
+    `sensor_available` is about the *configured* sensor only. It stays False
+    for as long as that sensor is dark, whether or not a stand-in is driving
+    control, so `binary_sensor.{zone}_room_sensor_unavailable` keeps meaning
+    "the device that needs attention is not reporting".
     """
 
     zone: StoredZone
     room: float | None
     sensor_available: bool
+    # v0.18.0: one of the ROOM_SOURCE_* constants. `fallback_active` is the
+    # derived "a stand-in is driving control" flag for consumers of ZoneState
+    # (only the tests today; nothing in the integration reads it); the
+    # coordinator computes the same predicate locally before the state exists.
+    room_source: str
     humidity: float | None
     apparent_temperature: float | None
     decision_room: float | None
@@ -142,6 +166,10 @@ class ZoneState:
     def last_action(self) -> str | None:
         return self.zone["last_action"]
 
+    @property
+    def fallback_active(self) -> bool:
+        return self.room_source in ROOM_SOURCES_STAND_IN
+
 
 class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     """One per zone. Owns no state of its own beyond timer subscriptions."""
@@ -154,6 +182,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         climate_entity_id: str,
         temp_entity_id: str,
         humidity_entity_id: str | None = None,
+        *,
+        fallback_temp_entity_id: str | None = None,
+        fallback_to_climate: bool = DEFAULT_FALLBACK_TO_CLIMATE,
     ) -> None:
         super().__init__(
             hass,
@@ -166,6 +197,57 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self.climate_entity_id = climate_entity_id
         self.temp_entity_id = temp_entity_id
         self.humidity_entity_id = humidity_entity_id
+        # v0.18.0 room-sensor fallback. Resolution while the configured sensor
+        # is dark: the fallback sensor if one is configured and reporting, else
+        # the climate entity's `current_temperature` if allowed, else nothing.
+        if fallback_temp_entity_id == temp_entity_id:
+            # A sensor cannot stand in for itself -- and left in place it would
+            # be worse than useless: `_on_temp_change` tells the two apart by
+            # entity_id, so the room sensor's own changes would be filtered as
+            # fallback-sensor changes and the zone would never refresh from it.
+            # The OptionsFlow refuses this; guarded here as well so that no
+            # construction path can reach it.
+            LOGGER.warning(
+                "%s: fallback sensor %s is the room sensor itself -- a sensor cannot "
+                "stand in for itself; ignoring the fallback",
+                zone_name,
+                fallback_temp_entity_id,
+            )
+            fallback_temp_entity_id = None
+        self.fallback_temp_entity_id = fallback_temp_entity_id
+        self.fallback_to_climate = fallback_to_climate
+        # When the configured sensor was first seen dark by a refresh; None
+        # while it reports. The grace period is measured from here.
+        self._primary_unavailable_since: datetime | None = None
+        # One-shot timer that wakes the zone when the grace period ends. A
+        # dead sensor emits nothing, so without it a zone with no schedule
+        # would learn that its stand-in is now allowed only on the next
+        # unrelated refresh -- which may never come.
+        self._unsub_fallback_timer: CALLBACK_TYPE | None = None
+        # Stand-in edge log, the same shape as the availability edge below:
+        # what the log last said (a stand-in in use, and which one), tracked
+        # apart from reality so a throttled edge is re-offered on the next
+        # refresh, plus per-direction stamps for the throttle.
+        self._standin_logged_engaged: bool = False
+        self._standin_logged_source: str = ROOM_SOURCE_NONE
+        self._standin_edge_logged_at: dict[bool, datetime | None] = {True: None, False: None}
+        # The last stand-in that engaged in the current outage, None until one
+        # does. The hand-back line keys on this rather than on what was last
+        # logged, because a stand-in that went dark before the room sensor
+        # returned has already been logged as lost -- and the record still
+        # owes the reader the end of that stand-in's story. The sample flush
+        # (`_flush_samples_for_stand_in`) keys on it too, so one outage is
+        # one episode: the action in force when the first stand-in engaged
+        # is remembered for the whole outage, not again after a stand-in
+        # goes dark and comes back, nor when the fallback sensor hands over
+        # to the climate reading; and the flush lands at most once.
+        self._standin_last_engaged: str | None = None
+        self._standin_action_at_engage: str | None = None
+        self._standin_flushed: bool = False
+        # Whether this outage has been told that the grace period ended with
+        # no stand-in reading at all -- the retraction of the "takes over in"
+        # promise, once per outage.
+        self._standin_missing_logged: bool = False
         self._unsub_state: CALLBACK_TYPE | None = None
         self._unsub_signal: CALLBACK_TYPE | None = None
         self._unsub_debounce: CALLBACK_TYPE | None = None
@@ -240,6 +322,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         watch = [self.temp_entity_id]
         if self.humidity_entity_id is not None:
             watch.append(self.humidity_entity_id)
+        # The fallback sensor is watched through the same debounced path but
+        # filtered in `_on_temp_change`: its changes only matter while the
+        # configured sensor is dark, and a healthy zone must not gain refreshes
+        # (and samples) from a sensor that is not driving it.
+        if self.fallback_temp_entity_id is not None:
+            watch.append(self.fallback_temp_entity_id)
         self._unsub_state = async_track_state_change_event(self.hass, watch, self._on_temp_change)
         self._unsub_signal = async_dispatcher_connect(
             self.hass, SIGNAL_ACTIVE_PROFILE_CHANGED, self._on_profile_change
@@ -261,9 +349,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._unsub_override_timer,
             self._unsub_transition_timer,
             self._unsub_climate,
+            self._unsub_fallback_timer,
         ):
             if unsub is not None:
                 unsub()
+        self._unsub_fallback_timer = None
+        self._primary_unavailable_since = None
+        self._standin_logged_engaged = False
+        self._standin_logged_source = ROOM_SOURCE_NONE
+        self._standin_edge_logged_at = {True: None, False: None}
+        self._standin_last_engaged = None
+        self._standin_action_at_engage = None
+        self._standin_flushed = False
+        self._standin_missing_logged = False
         self._unsub_state = None
         self._unsub_signal = None
         self._unsub_debounce = None
@@ -394,7 +492,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     # ----- triggers -----
 
     @callback
-    def _on_temp_change(self, _event: Event[EventStateChangedData]) -> None:
+    def _on_temp_change(self, event: Event[EventStateChangedData]) -> None:
+        # A change on the fallback sensor is only a reason to refresh while it
+        # might be the reading in use -- i.e. once the configured sensor has
+        # been dark for the grace period. Before that it would add refreshes
+        # (and, while the configured sensor reports, samples) to a zone it is
+        # not driving; inside the grace window the timer's own refresh is what
+        # engages the stand-in, and reads whatever it says then.
+        if event.data["entity_id"] == self.fallback_temp_entity_id and not self._grace_elapsed(
+            dt_util.utcnow()
+        ):
+            return
+        self._schedule_debounced_refresh()
+
+    @callback
+    def _schedule_debounced_refresh(self) -> None:
         # Many sensors emit several updates per second; debounce so we only
         # refresh once per quiet 2 s window.
         if self._unsub_debounce is not None:
@@ -419,8 +531,26 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     async def _async_update_data(self) -> ZoneState:
         zone = self._store.get_zone(self.zone_name)
         active_profile = self._store.active_profile
+        now_utc = dt_util.utcnow()
 
-        room, sensor_available = self._read_room_temp()
+        primary_room, sensor_available = self._read_room_temp()
+        # v0.18.0: while the configured sensor is dark, and once it has been
+        # dark for the grace period, a stand-in reading may drive control.
+        room, room_source = self._resolve_room_reading(primary_room, sensor_available, now_utc)
+        fallback_active = room_source in ROOM_SOURCES_STAND_IN
+        # The first refresh of this outage on which a stand-in drives control.
+        # Read before the edge log below, which records the stand-in. The
+        # action in force at that moment is what the stand-in's cycle is
+        # measured against (see `_flush_samples_for_stand_in`).
+        engaging = fallback_active and self._standin_last_engaged is None
+        if engaging:
+            self._standin_action_at_engage = zone["last_action"]
+            self._standin_flushed = False
+        # Whether this refresh's availability line already said that no
+        # stand-in has a reading -- the withheld edge re-offered past the
+        # boundary -- so the grace-period line below is not put directly
+        # underneath it saying the same thing.
+        boundary_retracted = False
         # Log the edge, not the state. The incident that prompted this had the
         # zone sitting *idle* when its sensor died, so nothing was commanded and
         # nothing was logged -- the room simply drifted for hours. This is the
@@ -440,10 +570,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # Warning then would be a guaranteed false positive on every
             # restart. The edge is left un-recorded rather than swallowed, so a
             # sensor that is genuinely dead is announced by the first refresh
-            # after startup -- which for a zone with no schedule may not come,
-            # since nothing else wakes this coordinator and a dead sensor emits
-            # nothing. The binary sensor is `on` from the first refresh either
-            # way.
+            # after startup. Before v0.18.0 that refresh might never have come
+            # for a zone with no schedule, since nothing else wakes this
+            # coordinator and a dead sensor emits nothing; the fallback grace
+            # timer now wakes every zone once at the grace boundary, so a
+            # withheld edge is re-offered there at the latest. The binary
+            # sensor is `on` from the first refresh either way.
             and self.hass.state is CoreState.running
             and self._may_log_sensor_edge(sensor_available)
         ):
@@ -451,6 +583,42 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 LOGGER.info(
                     "%s: room sensor %s is reporting again", self.zone_name, self.temp_entity_id
                 )
+            elif zone["enabled"] and fallback_active:
+                # A withheld edge -- throttled after a blip-then-die, or
+                # suppressed at startup -- re-offered by the refresh that
+                # engages the stand-in: for a zone with no schedule, the grace
+                # timer's. The engage line that follows names the stand-in.
+                LOGGER.warning(
+                    "%s: room sensor %s is unavailable -- a stand-in reading is taking over",
+                    self.zone_name,
+                    self.temp_entity_id,
+                )
+            elif zone["enabled"] and self._has_fallback_source():
+                # A stand-in is configured or allowed, so the outage is a
+                # gap rather than a stop: say how long the gap will be.
+                # Measured from the first dark refresh rather than assumed to
+                # be the whole grace period, because a withheld edge can be
+                # re-offered part-way through the window -- or past its end,
+                # when the stand-in turned out to have no reading either.
+                since = self._primary_unavailable_since
+                elapsed_s = (now_utc - since).total_seconds() if since is not None else 0.0
+                remaining_s = max(0.0, FALLBACK_GRACE_S - elapsed_s)
+                if remaining_s > 0:
+                    LOGGER.warning(
+                        "%s: room sensor %s is unavailable -- no control until it reports "
+                        "again or a stand-in reading takes over in %d s",
+                        self.zone_name,
+                        self.temp_entity_id,
+                        remaining_s,
+                    )
+                else:
+                    boundary_retracted = True
+                    LOGGER.warning(
+                        "%s: room sensor %s is unavailable -- no control until it reports "
+                        "again or a stand-in reading becomes available",
+                        self.zone_name,
+                        self.temp_entity_id,
+                    )
             elif zone["enabled"]:
                 LOGGER.warning(
                     "%s: room sensor %s is unavailable -- this zone cannot control "
@@ -467,6 +635,54 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     self.temp_entity_id,
                 )
             self._sensor_logged_available = sensor_available
+        # The outage line promised that a stand-in "takes over in N s". When
+        # the grace period ends and none has a reading -- a unit that publishes
+        # no `current_temperature`, or the fallback sensor dark too with the
+        # climate reading switched off -- nothing else says so: no stand-in
+        # engages, so there is no hand-over line, and the record's last word
+        # would be a hand-over that never happened, followed by hours of no
+        # control. Once per outage, and only for an outage in which no stand-in
+        # engaged: one that engaged and then went dark is closed by the edge
+        # log's "unavailable too" line instead. Withheld while Home Assistant
+        # is starting for the availability edge's reason -- the climate
+        # entity's own integration may simply not have published yet.
+        if (
+            room_source == ROOM_SOURCE_NONE
+            and self._standin_last_engaged is None
+            and not self._standin_missing_logged
+            and not boundary_retracted
+            and self._grace_elapsed(now_utc)
+            and self._has_fallback_source()
+            and self.hass.state is CoreState.running
+        ):
+            self._standin_missing_logged = True
+            tried: list[str] = []
+            if self.fallback_temp_entity_id is not None:
+                tried.append(self.fallback_temp_entity_id)
+            if self.fallback_to_climate:
+                tried.append(f"{self.climate_entity_id} current_temperature")
+            log = LOGGER.warning if zone["enabled"] else LOGGER.info
+            log(
+                "%s: grace period over -- no stand-in has a reading (%s); no control until "
+                "it or room sensor %s reports%s",
+                self.zone_name,
+                ", ".join(tried),
+                self.temp_entity_id,
+                "" if zone["enabled"] else " (zone is in shadow mode)",
+            )
+        # Flush once the stand-in has changed the action, on the first refresh
+        # that sees the change committed -- a stand-in refresh, or the hand-back
+        # refresh itself, which is the last chance: the apply task this refresh
+        # spawns appends the first post-hand-back sample. Evaluated ahead of the
+        # edge log, which forgets the stand-in on the hand-back edge.
+        if (
+            (engaging or self._standin_last_engaged is not None)
+            and not self._standin_flushed
+            and zone["last_action"] != self._standin_action_at_engage
+        ):
+            await self._flush_samples_for_stand_in()
+            self._standin_flushed = True
+        self._log_room_source_edge(room_source, zone["enabled"], now_utc)
         humidity = self._read_humidity()
         # `apparent_temp.compute(T, None) → T`, so when humidity is
         # unavailable the apparent value silently equals the room reading.
@@ -475,7 +691,6 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         apparent_temperature = apparent_temp.compute(room, humidity) if room is not None else None
 
         # Re-validate override.
-        now_utc = dt_util.utcnow()
         override_until = _parse_iso(zone["override_until"])
         override_active = override_until is not None and now_utc < override_until
         if override_until is not None and not override_active:
@@ -542,12 +757,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             apparent_temperature,
         )
 
+        # A stand-in reading gets wider deadbands: the climate entity's own
+        # sensor sits at the indoor unit and usually reports whole degrees, so
+        # deadbands tuned for a room sensor would short-cycle on it.
+        deadband_extra = FALLBACK_DEADBAND_EXTRA if fallback_active else 0.0
         hyst_inputs = HysteresisInputs(
             room=decision_room,
             low=eff_low,
             high=eff_high,
-            deadband_below=zone["deadband_below"],
-            deadband_above=zone["deadband_above"],
+            deadband_below=zone["deadband_below"] + deadband_extra,
+            deadband_above=zone["deadband_above"] + deadband_extra,
             current_action=zone["last_action"] or ACTION_UNKNOWN,
         )
         hyst_decision = hysteresis.decide(hyst_inputs)
@@ -576,7 +795,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             effective_slopes,
             idle_slope_source,
             idle_slope_cached_age_min,
-        ) = await self._resolve_idle_slope(thermal_slopes, zone, now_utc)
+        ) = await self._resolve_idle_slope(
+            thermal_slopes, zone, now_utc, persist_ok=not fallback_active
+        )
         predicted_decision = predictor.decide(
             thermal_slopes,
             hyst_inputs,
@@ -628,7 +849,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # is the v0.6 predictor gate (preserves v0.7 behaviour). mpc_enabled is
         # the v0.8 MPC gate, layered on top — both must be ON, and MPC must
         # have its required slopes, for MPC's decision to be the active one.
-        if zone["learning_enabled"] and zone["mpc_enabled"] and mpc_ready:
+        #
+        # v0.18.0: on a stand-in reading the zone runs plain hysteresis. The
+        # learned slopes describe the configured sensor's placement and
+        # resolution, and the predictor's anticipation and MPC's plan both
+        # extrapolate from the current reading -- a reading from a sensor with
+        # a different offset. The shadow sensors still show what they would do.
+        if fallback_active:
+            final_decision = hyst_decision
+        elif zone["learning_enabled"] and zone["mpc_enabled"] and mpc_ready:
             final_decision = mpc_decision
         elif zone["learning_enabled"]:
             final_decision = predicted_decision
@@ -648,6 +877,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             zone=zone,
             room=room,
             sensor_available=sensor_available,
+            room_source=room_source,
             humidity=humidity,
             apparent_temperature=apparent_temperature,
             decision_room=decision_room,
@@ -669,18 +899,268 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # Apply in a follow-up task so this refresh returns immediately --
         # entities can render the new state without waiting on climate calls.
         self.hass.async_create_task(
-            self._maybe_apply_action(final_decision, zone["enabled"], decision_room=decision_room)
+            self._maybe_apply_action(
+                final_decision,
+                zone["enabled"],
+                decision_room=decision_room,
+                record_samples=not fallback_active,
+            )
         )
 
         return state
 
     # ----- helpers -----
 
+    def _has_fallback_source(self) -> bool:
+        """Whether any stand-in could take over: a fallback sensor is
+        configured, or the climate entity's own reading is allowed."""
+        return self.fallback_temp_entity_id is not None or self.fallback_to_climate
+
+    def _grace_elapsed(self, now_utc: datetime) -> bool:
+        """Whether the configured sensor has been dark for the whole grace
+        period -- the point from which a stand-in reading may be in use, and
+        so the point from which changes in one are worth a refresh."""
+        since = self._primary_unavailable_since
+        return since is not None and (now_utc - since).total_seconds() >= FALLBACK_GRACE_S
+
+    def _resolve_room_reading(
+        self, primary: float | None, sensor_available: bool, now_utc: datetime
+    ) -> tuple[float | None, str]:
+        """Pick the reading that drives this refresh, and name where it came from.
+
+        The configured sensor always wins while it reports. Once it has been
+        dark for `FALLBACK_GRACE_S` -- continuously, measured from the first
+        refresh that saw it dark -- the stand-ins are tried in order: the
+        configured fallback sensor, then the climate entity's own
+        `current_temperature` if `fallback_to_climate` allows it. Inside the
+        grace window, and when no stand-in has a reading either, the answer is
+        `(None, ROOM_SOURCE_NONE)`: exactly what every release before v0.18.0
+        did for the whole outage.
+
+        Also owns the grace timer. A dead sensor emits nothing, so nothing else
+        is guaranteed to wake this zone at the end of the window; the timer is
+        armed on the first dark refresh and cancelled the moment the sensor
+        reports, or once it has fired and the window is over.
+        """
+        if sensor_available:
+            self._primary_unavailable_since = None
+            self._cancel_fallback_timer()
+            return primary, ROOM_SOURCE_PRIMARY
+        if self._primary_unavailable_since is None:
+            self._primary_unavailable_since = now_utc
+        elapsed_s = (now_utc - self._primary_unavailable_since).total_seconds()
+        if elapsed_s < FALLBACK_GRACE_S:
+            self._schedule_fallback_timer(FALLBACK_GRACE_S - elapsed_s)
+            return None, ROOM_SOURCE_NONE
+        self._cancel_fallback_timer()
+        value = self._read_numeric_sensor(self.fallback_temp_entity_id)
+        if value is not None:
+            return value, ROOM_SOURCE_FALLBACK_SENSOR
+        if self.fallback_to_climate:
+            value = self._read_climate_current_temperature()
+            if value is not None:
+                return value, ROOM_SOURCE_CLIMATE
+        return None, ROOM_SOURCE_NONE
+
+    def _read_climate_current_temperature(self) -> float | None:
+        """The climate entity's own `current_temperature`, or None when the
+        entity is missing, unavailable, or the attribute is absent,
+        non-numeric or non-finite -- the same acceptance rule as
+        `_read_numeric_sensor`, applied to an attribute rather than a state.
+        An unavailable entity publishes no state attributes at all, so the
+        attribute read covers that case without a separate check.
+        """
+        state = self.hass.states.get(self.climate_entity_id)
+        if state is None:
+            return None
+        raw = state.attributes.get("current_temperature")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @callback
+    def _schedule_fallback_timer(self, delay_s: float) -> None:
+        if self._unsub_fallback_timer is not None:
+            return
+        # A second past the boundary, so the refresh it triggers measures the
+        # elapsed time as at least the grace period rather than a hair under.
+        self._unsub_fallback_timer = async_call_later(
+            self.hass, max(delay_s, 0.0) + 1.0, self._on_fallback_timer_fire
+        )
+
+    @callback
+    def _cancel_fallback_timer(self) -> None:
+        if self._unsub_fallback_timer is not None:
+            self._unsub_fallback_timer()
+            self._unsub_fallback_timer = None
+
+    @callback
+    def _on_fallback_timer_fire(self, _now: datetime) -> None:
+        self._unsub_fallback_timer = None
+        self.hass.async_create_task(self.async_request_refresh())
+
+    def _log_room_source_edge(self, room_source: str, enabled: bool, now_utc: datetime) -> None:
+        """Announce a stand-in taking over, a stand-in going dark, and the
+        configured sensor taking back over.
+
+        The same shape as the availability edge (`_may_log_sensor_edge`): the
+        comparison is against what the log last *said* rather than against
+        reality, so a throttled edge is re-offered on the next refresh -- and
+        unlike a dead room sensor, a change in a stand-in does trigger one.
+        The bound is one line per direction per `SENSOR_EDGE_LOG_INTERVAL_S`
+        within an outage. Without it a climate entity that blinks unavailable
+        while the room sensor is dark would re-announce the hand-over on every
+        blink, unbounded. A switch between `fallback_sensor` and `climate`
+        while engaged is a hand-over too and spends that direction's budget.
+        The stamps reset when the configured sensor returns, so the first
+        hand-over of every outage is never throttled.
+        """
+        if room_source == ROOM_SOURCE_PRIMARY:
+            # The one thing said about an outage in which no stand-in engaged
+            # is that none had a reading; a fresh outage gets to say it again.
+            self._standin_missing_logged = False
+            # Nothing to close and nothing else to reset unless a stand-in
+            # engaged: the stamps and the latch are only ever set past that
+            # point.
+            if self._standin_last_engaged is None:
+                return
+            LOGGER.info(
+                "%s: room sensor %s is back -- stand-in %s released",
+                self.zone_name,
+                self.temp_entity_id,
+                self._standin_last_engaged,
+            )
+            self._standin_last_engaged = None
+            self._standin_action_at_engage = None
+            self._standin_flushed = False
+            self._standin_logged_engaged = False
+            self._standin_edge_logged_at = {True: None, False: None}
+            return
+        if room_source in ROOM_SOURCES_STAND_IN:
+            self._standin_last_engaged = room_source
+            if self._standin_logged_engaged and self._standin_logged_source == room_source:
+                return
+            if not self._may_log_standin_edge(True, now_utc):
+                return
+            self._standin_logged_engaged = True
+            self._standin_logged_source = room_source
+            since = self._primary_unavailable_since
+            dark_min = (now_utc - since).total_seconds() / 60 if since is not None else 0.0
+            standin = (
+                self.fallback_temp_entity_id
+                if room_source == ROOM_SOURCE_FALLBACK_SENSOR
+                else f"{self.climate_entity_id} current_temperature"
+            )
+            log = LOGGER.warning if enabled else LOGGER.info
+            log(
+                "%s: room sensor %s has been unavailable for %.0f min -- controlling from "
+                "%s (%s) until it reports again%s",
+                self.zone_name,
+                self.temp_entity_id,
+                dark_min,
+                standin,
+                room_source,
+                "" if enabled else " (zone is in shadow mode)",
+            )
+            return
+        # ROOM_SOURCE_NONE: inside the grace window nothing was announced, so
+        # there is nothing to retract. Otherwise the stand-in itself has gone
+        # dark. Without this line the record's last word about control is
+        # "controlling from ... until it reports again" while nothing is
+        # controlling -- the silent night this release exists to prevent, one
+        # layer down.
+        if not self._standin_logged_engaged or not self._may_log_standin_edge(False, now_utc):
+            return
+        self._standin_logged_engaged = False
+        previous = self._standin_logged_source
+        standin = (
+            self.fallback_temp_entity_id
+            if previous == ROOM_SOURCE_FALLBACK_SENSOR
+            else f"{self.climate_entity_id} current_temperature"
+        )
+        log = LOGGER.warning if enabled else LOGGER.info
+        log(
+            "%s: stand-in %s (%s) is unavailable too -- no control until it or "
+            "room sensor %s reports%s",
+            self.zone_name,
+            standin,
+            previous,
+            self.temp_entity_id,
+            "" if enabled else " (zone is in shadow mode)",
+        )
+
+    def _may_log_standin_edge(self, engaged: bool, now_utc: datetime) -> bool:
+        """Throttle the stand-in edge lines to one per direction per interval:
+        `_may_log_sensor_edge`'s shape, applied to the hand-over. The stamps
+        are reset by `_log_room_source_edge` when the configured sensor
+        returns, so this bounds flapping *within* an outage only."""
+        last = self._standin_edge_logged_at[engaged]
+        # `0 <=` because a backwards clock step -- an RTC-less Pi correcting
+        # against NTP after boot -- makes the elapsed time negative, which would
+        # otherwise satisfy the throttle and silence the log until the clock
+        # caught up.
+        if last is not None and 0 <= (now_utc - last).total_seconds() < SENSOR_EDGE_LOG_INTERVAL_S:
+            return False
+        self._standin_edge_logged_at[engaged] = now_utc
+        return True
+
+    async def _flush_samples_for_stand_in(self) -> None:
+        """Empty the sample buffer once a stand-in has changed the action.
+
+        Nothing is sampled from a stand-in, but the cycle it commands is real:
+        the buffer simply has a gap where the heat or cool run was.
+        `predictor._latest_run_of` joins runs by action label alone, so on
+        hand-back the idle samples from before the outage and those after it
+        would form one idle run spanning that cycle, and the idle slope would
+        read as strong passive warming (or cooling) -- which a learning zone
+        then acts on: an anticipatory cool inside the deadband, or passive
+        drift accepted in place of a heat call. Flushing makes the hand-back
+        a clean segment boundary, as a sensor swap is.
+
+        Only when the stand-in commands an action other than the one in force
+        when it engaged, though. A gap in which the action never changed is
+        what every outage produced before v0.18.0 and joins nothing that was
+        not already one run; and on a restart where the room sensor's own
+        integration takes longer than the grace period to publish (Thread or
+        Matter after a power cut, a deep-sleep ESPHome node) the stand-in
+        usually idles for a minute or two and hands back. Flushing there would
+        discard the buffer just restored from disk -- the bug class the
+        manual-edit detector's startup guards exist to prevent. The caller
+        keys on the committed `last_action`, so the flush lands on the first
+        refresh after the change rather than on the engage refresh, and at
+        the latest on the hand-back refresh.
+
+        Unlike the manual-edit flush this keeps the persisted idle slope and
+        its stamp: the passive rate was learned from the configured sensor
+        and is still valid, and nothing refreshes it while a stand-in drives
+        (`_resolve_idle_slope` is told not to persist). The command-state
+        bookkeeping is untouched too -- what was commanded is not in question
+        here.
+        """
+        LOGGER.info(
+            "%s: sample buffer flushed -- what a stand-in commands is not sampled, so the "
+            "runs on either side of the outage must not be joined",
+            self.zone_name,
+        )
+        self._samples_cache = []
+        # The first sample after hand-back writes immediately, as after every
+        # flush (a flush is a forced segment boundary).
+        self._last_sample_persist_at = None
+        await self._store.async_update_zone(self.zone_name, samples=[])
+
     async def _resolve_idle_slope(
         self,
         slopes: ThermalSlopes,
         zone: StoredZone,
         now_utc: datetime,
+        *,
+        persist_ok: bool = True,
     ) -> tuple[ThermalSlopes, str, float | None]:
         """Apply the persisted-idle-slope policy (v0.12.0).
 
@@ -689,7 +1169,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         ``(effective_slopes, source, cached_age_min)``:
 
         - **Live idle slope present** -> remember it (throttled write) and
-          return the slopes unchanged. ``source="live"``.
+          return the slopes unchanged. ``source="live"``. Not remembered
+          when ``persist_ok`` is False: the stamp has to say when the value
+          was measured, and while a stand-in drives control (v0.18.0)
+          nothing is -- the buffer is frozen, so a live slope is the
+          pre-outage one, and re-stamping it on every stand-in refresh
+          would carry it past its 24 h expiry on the strength of nothing.
         - **Live idle slope absent** but a persisted one exists within
           ``PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`` -> substitute it via
           ``dataclasses.replace`` (tagging ``method_idle="cached"``) so MPC
@@ -710,7 +1195,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # learning_enabled (not mpc_enabled) keeps the cache — and thus the
             # shadow `mpc_ready` signal — warm for zones being evaluated for MPC
             # before the user flips mpc_enabled on.
-            if zone["learning_enabled"]:
+            if zone["learning_enabled"] and persist_ok:
                 await self._maybe_persist_idle_slope(slopes.idle, now_utc)
             return slopes, "live", None
 
@@ -746,9 +1231,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         That keeps ``persisted_idle_slope_at`` tracking "this slope is current"
         to within ~5 min, so the cached value's age at the start of a heating
         chase reflects time-since-idle (when the chase began), not
-        time-since-first-observed. The first call after setup / a buffer flush
-        (``_last_idle_slope_persist_at is None``) writes immediately. The idle
-        rate is slow-changing, so a value up to 5 min stale is fine.
+        time-since-first-observed. The first call after setup / a manual-edit
+        flush (``_last_idle_slope_persist_at is None``) writes immediately. The
+        idle rate is slow-changing, so a value up to 5 min stale is fine.
         """
         due = (
             self._last_idle_slope_persist_at is None
@@ -770,8 +1255,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     async def _clear_persisted_idle_slope(self) -> None:
         """Null the persisted idle slope (stale-expiry path).
 
-        Buffer-flush sites clear it inline in their own store write to keep
-        the flush atomic; this is the standalone expiry path.
+        The manual-edit and sensor-swap flushes clear it inline in their own
+        store write to keep the flush atomic (the stand-in flush deliberately
+        keeps it -- see `_flush_samples_for_stand_in`); this is the standalone
+        expiry path.
         """
         self._last_idle_slope_persist_at = None
         await self._store.async_update_zone(
@@ -829,12 +1316,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         This narrows the problem rather than eliminating it: two *drops* still
         share a budget, so a link that blips and then dies inside one window
-        leaves the record's last word as "reporting again". A throttled edge is
-        re-offered on the next refresh, but a dead sensor emits no state changes
-        and a zone with no schedule has no timer, so for that zone there may be
-        no next refresh. The binary sensor is `on` throughout regardless, which
-        is the surface this release is actually about; closing the log gap needs
-        a wake-up of its own and is not worth the machinery here.
+        leaves the record's last word as "reporting again" for a while. A
+        throttled edge is re-offered on the next refresh; a dead sensor emits
+        no state changes and a zone with no schedule has no timer of its own,
+        but from v0.18.0 the fallback grace timer wakes every zone once at the
+        grace boundary -- `FALLBACK_GRACE_S` plus a second after the drop, and
+        the two intervals are equal, so the budget is back by then -- and the
+        withheld edge is logged there at the latest. The binary sensor is `on`
+        throughout regardless.
         """
         now = dt_util.utcnow()
         last = self._sensor_edge_logged_at[available]
@@ -1113,6 +1602,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         enabled: bool,
         *,
         decision_room: float | None,
+        record_samples: bool = True,
     ) -> None:
         """Translate the decision into climate.set_hvac_mode + set_temperature.
 
@@ -1141,8 +1631,17 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         `set_hvac_mode` has landed, or the prior `last_action` when a gate
         suppressed the re-issue. Nothing at all when the command did not reach
         the unit: an unreachable climate is not doing anything we can label.
+
+        v0.18.0: `record_samples=False` while a stand-in reading is driving
+        control. The commands still go out, but nothing is appended -- a
+        sample from a sensor with a different offset and resolution would
+        bias the slope estimator, which is exactly why the OptionsFlow flushes
+        the buffer on a sensor swap. Implemented by blanking the room value
+        the sampler sees, so every append site below skips as it does for an
+        unavailable sensor.
         """
         now_utc = dt_util.utcnow()
+        sample_room = decision_room if record_samples else None
         if not enabled:
             # Nothing is commanded here, so nothing of ours is expected either.
             # Left standing, the last command from before the zone was switched
@@ -1168,9 +1667,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # Skip the append when there's no usable room reading: predictor
             # decisions with target_mode=None pair with decision_room=None,
             # and a sample with no temperature isn't a useful data point.
-            if decision_room is None or decision.target_mode is None:
+            if sample_room is None or decision.target_mode is None:
                 return
-            await self._append_sample(decision_room, decision.action, now_utc)
+            await self._append_sample(sample_room, decision.action, now_utc)
             return
         if decision.target_mode is None:
             # UNKNOWN_DECISION (room unavailable -- both hysteresis.decide and
@@ -1199,7 +1698,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # Gate suppresses re-issue but the HVAC keeps doing `last_action`,
             # which equals `decision.action` here -- record the sample so the
             # predictor still learns the in-progress recovery slope.
-            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
+            await self._append_sample(sample_room, last_action or ACTION_UNKNOWN, now_utc)
             return
 
         # Cross-mode min-cycle: don't flip between heat and cool too quickly.
@@ -1244,7 +1743,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # decider releases through idle before the flip). Record under
             # that action so the predictor's idle_slope reflects what's
             # actually happening during the dwell.
-            await self._append_sample(decision_room, last_action or ACTION_UNKNOWN, now_utc)
+            await self._append_sample(sample_room, last_action or ACTION_UNKNOWN, now_utc)
             return
 
         # Round the decision's target_temp to the climate's step before
@@ -1601,7 +2100,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # Record a sample under the newly-committed action — the predictor's
         # next refresh will see this sample in the trailing run for
         # decision.action and compute the slope from it.
-        await self._append_sample(decision_room, decision.action, now_utc)
+        await self._append_sample(sample_room, decision.action, now_utc)
 
     async def _append_sample(
         self, decision_room: float | None, action: str, now_utc: datetime
@@ -1765,6 +2264,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # mask a future schema rename.
         old_state = event.data["old_state"]
         new_state = event.data["new_state"]
+        # v0.18.0: once the configured room sensor has been dark for the grace
+        # period, the climate entity's own `current_temperature` may be the
+        # reading in use -- and a dark sensor emits nothing, so this is the
+        # only event that tracks the room. Not before: inside the grace window
+        # the zone must behave exactly as it did without a stand-in, and the
+        # grace timer's refresh engages one. Ahead of the manual-edit logic,
+        # which is about the setpoint and mode and does not care about this
+        # attribute. Filtered to changes of that attribute only: the unit's
+        # echo of our own command changes mode and setpoint, not the reading,
+        # so this does not refresh on every command.
+        if self.fallback_to_climate and self._grace_elapsed(dt_util.utcnow()):
+            old_temp = old_state.attributes.get("current_temperature") if old_state else None
+            new_temp = new_state.attributes.get("current_temperature") if new_state else None
+            if old_temp != new_temp:
+                self._schedule_debounced_refresh()
         if old_state is None or new_state is None:
             # Initial state-added or entity-removed -- not a manual edit.
             return

@@ -50,12 +50,19 @@ class EffectiveHighSensor(_TemperatureSensor):
 
 
 class RoomTemperatureSensor(_TemperatureSensor):
-    """Diagnostic mirror of the source sensor; lets the card read everything
-    from the comfort_band namespace.
+    """Diagnostic mirror of the reading driving control; lets the card read
+    everything from the comfort_band namespace.
 
     Also exposes the configured `humidity_sensor` entity_id as an attribute
     so the card's Settings tab can show the current value without a
     separate WS round-trip. None when not configured.
+
+    v0.18.0: mirrors whichever reading is in use, and says which in
+    `source` -- `primary` for the configured sensor, `fallback_sensor` or
+    `climate` while a stand-in has taken over, `none` when there is no
+    reading at all (the state is then unknown). `fallback_temp_sensor` and
+    `fallback_to_climate` echo the zone's configuration for the same reason
+    as `humidity_sensor`.
     """
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -68,8 +75,13 @@ class RoomTemperatureSensor(_TemperatureSensor):
         return self.coordinator.data.room
 
     @property
-    def extra_state_attributes(self) -> dict[str, str | None]:
-        return {"humidity_sensor": self.coordinator.humidity_entity_id}
+    def extra_state_attributes(self) -> dict[str, str | bool | None]:
+        return {
+            "humidity_sensor": self.coordinator.humidity_entity_id,
+            "source": self.coordinator.data.room_source,
+            "fallback_temp_sensor": self.coordinator.fallback_temp_entity_id,
+            "fallback_to_climate": self.coordinator.fallback_to_climate,
+        }
 
 
 class ApparentTemperatureSensor(_TemperatureSensor):

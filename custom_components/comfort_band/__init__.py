@@ -21,10 +21,13 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_FALLBACK_TEMP_SENSOR,
+    CONF_FALLBACK_TO_CLIMATE,
     CONF_HUMIDITY_SENSOR,
     CONF_KIND,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
+    DEFAULT_FALLBACK_TO_CLIMATE,
     DOMAIN,
     ENTRY_KIND_PROFILE_MANAGER,
     ENTRY_KIND_ZONE,
@@ -103,6 +106,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             humidity_entity_id = entry.options[CONF_HUMIDITY_SENSOR]
         else:
             humidity_entity_id = entry.data.get(CONF_HUMIDITY_SENSOR)
+        # v0.18.0 stand-ins for a dark room sensor. Both keys are written by
+        # the OptionsFlow only, so `data` is never consulted: a fallback
+        # sensor is optional (None = none configured), and the climate
+        # entity's own reading is allowed unless the user switched it off.
+        fallback_temp_entity_id = entry.options.get(CONF_FALLBACK_TEMP_SENSOR)
+        fallback_to_climate = entry.options.get(
+            CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
+        )
         coordinator = ZoneCoordinator(
             hass,
             data.store,
@@ -110,6 +121,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data[CONF_CLIMATE_ENTITY],
             temp_entity_id,
             humidity_entity_id=humidity_entity_id,
+            fallback_temp_entity_id=fallback_temp_entity_id,
+            fallback_to_climate=fallback_to_climate,
         )
         await coordinator.async_setup()
         data.zone_coordinators[entry.entry_id] = coordinator

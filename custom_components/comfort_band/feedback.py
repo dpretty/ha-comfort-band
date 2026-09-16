@@ -15,7 +15,7 @@ return deep copies for copy-on-read isolation, matching `ComfortBandStore`.
 from __future__ import annotations
 
 import copy
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -34,10 +34,15 @@ class FeedbackEntry(TypedDict):
     zone: str
     timestamp: str  # ISO-8601, UTC (dt_util.utcnow().isoformat())
     label: str  # one of FEEDBACK_LABELS
-    room_temp: float | None  # raw room reading at record time (None if sensor unavailable)
+    # The reading driving control at record time (None when there was none);
+    # since v0.18.0 this may be a stand-in -- see room_source.
+    room_temp: float | None
     low: float  # effective band low at record time
     high: float  # effective band high at record time
     action: str  # ACTION_* in effect at record time
+    # v0.18.0: ROOM_SOURCE_* the room_temp came from; absent on entries
+    # written before v0.18.0, so readers must .get() it.
+    room_source: NotRequired[str]
 
 
 class FeedbackData(TypedDict):

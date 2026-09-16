@@ -44,6 +44,20 @@ async def test_append_then_get_returns_entry(
     assert entries[0]["room_temp"] == 21.0
 
 
+async def test_an_entry_without_room_source_round_trips(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """`room_source` arrived in v0.18.0; entries written before it have no
+    such key, and the store must neither reject nor invent one."""
+    store = FeedbackStore(hass)
+    await store.async_load()
+    await store.async_append(_entry("office", "2026-05-01T10:00:00+00:00"))
+
+    entry = store.get_entries("office")[0]
+    assert "room_source" not in entry
+    assert entry.get("room_source") is None
+
+
 async def test_get_entries_is_copy_on_read(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
