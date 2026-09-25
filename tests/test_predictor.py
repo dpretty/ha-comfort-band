@@ -1218,6 +1218,9 @@ def test_a_heat_cycles_aftermath_is_left_out_too() -> None:
     slopes = estimate_slopes(heat + idle, now=idle[-1].t)
     assert slopes.idle is not None
     assert abs(slopes.idle * 60.0) < 0.01
+    # The diagnostics describe the same settled samples: flat, so no spread.
+    assert slopes.sample_count_idle == len(flat)
+    assert slopes.std_dev_idle == 0.0
 
 
 def test_a_run_whose_release_has_aged_out_is_still_left_out() -> None:

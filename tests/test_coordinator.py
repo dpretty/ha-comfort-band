@@ -2343,6 +2343,8 @@ async def test_cached_idle_slope_keeps_mpc_ready_during_heating_chase(
     # alongside the live recovery slope -> is_ready is satisfied.
     assert state.thermal_slopes.idle == -0.004
     assert state.thermal_slopes.method_idle == "cached"
+    # v0.19.0: and it says when that value was measured, as a live one does.
+    assert state.thermal_slopes.idle_measured_at == now - timedelta(minutes=5)
     assert state.thermal_slopes.recovery_heat is not None
     assert state.mpc_ready is True
 

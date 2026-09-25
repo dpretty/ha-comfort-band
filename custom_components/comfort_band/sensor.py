@@ -144,10 +144,13 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
 
     Returns None (HA "unknown") when the relevant segment has fewer than
     SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
-    first few samples of a heat or cool run are expected to be unknown, and
-    (v0.19.0) the idle slope the first IDLE_SETTLE_MINUTES of an idle run
-    plus four samples more, about 35 minutes with a sensor reporting every
-    minute and 50 with one reporting every five.
+    first few samples of a heat or cool run are expected to be unknown. The
+    live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
+    idle run plus four samples more (v0.19.0): about 35 minutes with a
+    sensor reporting every minute, 50 with one reporting every five, and
+    never with one reporting less often than about every 20 minutes, which
+    leaves too few samples in the hour of window that remains. Meanwhile
+    the cached idle slope is shown, if the zone has one.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);

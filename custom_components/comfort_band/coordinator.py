@@ -1257,7 +1257,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         ``SAMPLE_PERSIST_INTERVAL_S`` (mirroring the sample-buffer cadence); the
         stamp can lag the newest sample by that much, which errs towards
         expiring early. The first write after setup / a manual-edit flush
-        (``_last_idle_slope_persist_at is None``) is immediate.
+        (``_last_idle_slope_persist_at is None``) is immediate. The sample
+        buffer's own writes are throttled separately, so after a restart the
+        stored stamp can be up to one interval newer than the newest sample
+        restored with the buffer, and the first write can move it back by that
+        much -- early expiry again.
         """
         slope = slopes.idle
         measured_at = slopes.idle_measured_at
