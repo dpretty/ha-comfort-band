@@ -2275,7 +2275,10 @@ async def test_live_idle_slope_is_persisted(
     freezer.move_to("2026-05-19 12:00:00+00:00")
     # Persist is gated on learning_enabled (the cache only feeds MPC).
     await coordinator._store.async_update_zone("office", learning_enabled=True)
-    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
+    # The seed's newest sample is 90 s old, so the stamp can be told apart
+    # from the time of the refresh.
+    seed_end = dt_util.utcnow() - timedelta(seconds=90)
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=seed_end)
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
 
     state = await coordinator._async_update_data()
@@ -2285,10 +2288,10 @@ async def test_live_idle_slope_is_persisted(
     assert state.thermal_slopes.idle is not None
     zone = coordinator._store.get_zone("office")
     # The persisted value equals the live estimate, stamped with the newest
-    # sample behind it (the seed's last, taken at "now" here).
+    # sample behind it rather than with the refresh.
     assert zone["persisted_idle_slope"] == state.thermal_slopes.idle
-    assert state.thermal_slopes.idle_measured_at == coordinator._samples_cache[-1].t
-    assert zone["persisted_idle_slope_at"] == coordinator._samples_cache[-1].t.isoformat()
+    assert state.thermal_slopes.idle_measured_at == seed_end
+    assert zone["persisted_idle_slope_at"] == seed_end.isoformat()
 
 
 async def test_persist_skipped_for_non_learning_zone(
@@ -2488,30 +2491,35 @@ async def test_persisted_idle_slope_write_is_throttled(
     _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
 
-    def _measure() -> None:
+    def _measure() -> datetime:
+        """A new idle sample, taken 30 s before the refresh that will see it."""
+        taken = dt_util.utcnow()
         last = coordinator._samples_cache[-1]
         coordinator._samples_cache.append(
-            Sample(t=dt_util.utcnow(), temp=last.temp - 0.005, action=ACTION_IDLE)
+            Sample(t=taken, temp=last.temp - 0.005, action=ACTION_IDLE)
         )
+        freezer.tick(timedelta(seconds=30))
+        return taken
 
     # The samples are this test's to add, so the apply task must not add its own.
     with patch.object(coordinator, "_maybe_apply_action", AsyncMock()):
         await coordinator._async_update_data()
         first_at = coordinator._store.get_zone("office")["persisted_idle_slope_at"]
-        assert first_at == dt_util.utcnow().isoformat()
+        assert first_at == coordinator._samples_cache[-1].t.isoformat()
 
-        # A new sample 60 s on (< 300 s): measured, but not written yet.
-        freezer.tick(timedelta(seconds=60))
+        # A new sample 60 s on (< 300 s since the write): measured, not written yet.
+        freezer.tick(timedelta(seconds=30))
         _measure()
         await coordinator._async_update_data()
         assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] == first_at
 
         # Past the interval the newest measurement is written, with its own stamp.
-        freezer.tick(timedelta(seconds=300))
-        _measure()
+        freezer.tick(timedelta(seconds=270))
+        taken = _measure()
         await coordinator._async_update_data()
         zone = coordinator._store.get_zone("office")
-        assert zone["persisted_idle_slope_at"] == dt_util.utcnow().isoformat()
+        assert zone["persisted_idle_slope_at"] == taken.isoformat()
+        assert taken < dt_util.utcnow()
 
 
 async def test_an_idle_slope_with_nothing_new_behind_it_is_not_rewritten(
@@ -2541,12 +2549,16 @@ async def test_an_idle_slope_with_nothing_new_behind_it_is_not_rewritten(
         assert stored[1] == measured_at.isoformat()
         # An hour of refreshes, each past the throttle, on a buffer that
         # gains nothing.
-        for _ in range(12):
-            freezer.tick(timedelta(minutes=5))
-            state = await coordinator._async_update_data()
-            assert state.idle_slope_source == "live"
-            zone = coordinator._store.get_zone("office")
-            assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == stored
+        with patch.object(
+            coordinator._store, "async_update_zone", wraps=coordinator._store.async_update_zone
+        ) as writes:
+            for _ in range(12):
+                freezer.tick(timedelta(minutes=5))
+                state = await coordinator._async_update_data()
+                assert state.idle_slope_source == "live"
+        assert not [c for c in writes.call_args_list if "persisted_idle_slope_at" in c.kwargs]
+        zone = coordinator._store.get_zone("office")
+        assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == stored
 
         # The unit is back and the first new sample prunes the old run.
         coordinator._samples_cache = []

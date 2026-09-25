@@ -330,9 +330,11 @@ def _settled(run: list[Sample]) -> list[Sample]:
     buffer cannot say what came before a run at its start: the release may
     just have aged out -- and trimming only visible releases was measured
     letting exactly those runs back in, the transient intact, once the cycle
-    in front of them was pruned -- or a flush may have emptied it. A run that
-    has idled for longer than the window only loses its oldest half hour,
-    which its recency weights had already all but discounted.
+    in front of them was pruned -- or a flush may have emptied it. The price
+    is paid by a run that has idled for longer than the window: it loses its
+    oldest half hour, under 4 % of the fit's weight but about a third of its
+    leverage, so its slope is somewhat noisier (replayed over ten days of two
+    zones, such slopes moved by a median 0.03 °C/h).
     """
     if not run:
         return run

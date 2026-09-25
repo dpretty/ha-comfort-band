@@ -1174,8 +1174,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
           when ``persist_ok`` is False: while a stand-in drives control
           (v0.18.0) nothing is measured -- the buffer is frozen, so a live
           slope is the pre-outage one. Since v0.19.0 the stamp is the
-          measurement time, which a frozen buffer cannot advance anyway (see
-          `_maybe_persist_idle_slope`); a stand-in simply writes nothing.
+          measurement time, so a frozen buffer can move it at most once, to
+          the newest sample it already holds when a write the throttle held
+          back catches up (see `_maybe_persist_idle_slope`). A stand-in writes
+          nothing at all, so the value it hands back is exactly the one it
+          was handed.
         - **Live idle slope absent** but a persisted one exists within
           ``PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`` -> substitute it via
           ``dataclasses.replace`` (tagging ``method_idle="cached"``) so MPC
@@ -1220,7 +1223,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             await self._clear_persisted_idle_slope()
             return slopes, "none", None
 
-        effective = replace(slopes, idle=persisted, method_idle="cached")
+        effective = replace(
+            slopes, idle=persisted, method_idle="cached", idle_measured_at=persisted_at
+        )
         # Clamp the reported age at 0 to absorb minor clock skew (a timestamp
         # written by a slightly-ahead clock would otherwise read negative).
         return effective, "cached", round(max(0.0, age_min), 1)

@@ -1068,9 +1068,9 @@ def test_per_segment_sample_counts_populated() -> None:
     all_samples = idle_run + heat_run + cool_run
 
     slopes = estimate_slopes(all_samples, now=all_samples[-1].t)
-    # The aggregate counts the idle run's settling lead-in too; the idle
-    # count is only the part behind the estimate.
-    assert slopes.sample_count == len(all_samples)
+    # The aggregate counts the idle run's settling lead-in too (15 samples at
+    # 120 s); the idle count is only the part behind the estimate.
+    assert slopes.sample_count == 15 + 6 + 5 + 4
     assert slopes.sample_count_idle == 6
     assert slopes.sample_count_recovery_heat == 5
     assert slopes.sample_count_recovery_cool == 4

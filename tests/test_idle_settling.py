@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
@@ -169,6 +170,62 @@ async def test_a_cool_cycles_aftermath_is_not_learned_as_passive_warming(
     assert _modes(climate_calls).count(HVAC_MODE_COOL) == 1
 
 
+async def test_mpc_does_not_cool_a_room_inside_its_band_on_a_cycles_aftermath(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The MPC half of the incident. A zone with a settled idle slope in its
+    cache (a slow overnight fall) cools, long enough for MPC to have a
+    recovery slope, and is released into the band. The aftermath then climbs
+    on humidity alone. Fitted as the live idle slope that is +1.9 °C/h, and
+    MPC -- projecting the room out of the top of the band within the minute
+    -- cools a room that is inside it. It is not the room's drift, so MPC
+    plans with the one it has, and leaves the room alone."""
+    freezer.move_to("2026-09-24 11:00:00+00:00")
+    coordinator = await _enabled_zone(
+        hass,
+        humidity_entity_id=HUMIDITY_ENTITY,
+        use_apparent_temperature=True,
+        mpc_enabled=True,
+        manual_low=19.0,
+        manual_high=21.0,
+    )
+    overnight = -0.15 / 60
+    await coordinator._store.async_update_zone(
+        "office",
+        persisted_idle_slope=overnight,
+        persisted_idle_slope_at=(dt_util.utcnow() - timedelta(minutes=20)).isoformat(),
+    )
+
+    # Apparent 21.7 -> 21.1 over twenty minutes of cooling: the fifth report
+    # is the first refresh with a cool run long enough for a recovery slope.
+    for temp, humidity in ((20.5, 65.0), (20.45, 64.0), (20.4, 63.0), (20.35, 62.0), (20.3, 61.0)):
+        await _report(hass, freezer, temp, humidity)
+        assert coordinator.data.decision.action == ACTION_COOL
+    assert coordinator.data.mpc_ready is True
+    # Dried to apparent 20.4 and released, by MPC as much as by hysteresis.
+    await _report(hass, freezer, 20.1, 56.0)
+    assert coordinator.data.mpc_decision.action == ACTION_IDLE
+    assert coordinator.data.decision.action == ACTION_IDLE
+    released = len(climate_calls)
+
+    # The aftermath: the room holds at 20.1 while the humidity climbs back,
+    # to apparent 20.98 -- still inside the band.
+    for humidity in (58.0, 60.0, 62.0, 63.0):
+        await _report(hass, freezer, 20.1, humidity)
+    assert coordinator.data.decision_room == pytest.approx(20.98, abs=0.01)
+    assert coordinator.data.decision_room < 21.0
+
+    assert coordinator.data.mpc_ready is True
+    assert coordinator.data.idle_slope_source == "cached"
+    assert coordinator.data.thermal_slopes.idle == overnight
+    assert coordinator.data.mpc_decision.action == ACTION_IDLE
+    assert coordinator.data.decision.action == ACTION_IDLE
+    assert HVAC_MODE_COOL not in _modes(climate_calls[released:])
+
+
 async def test_an_unreachable_unit_does_not_make_an_old_idle_slope_look_new(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -215,13 +272,17 @@ async def test_an_unreachable_unit_does_not_make_an_old_idle_slope_look_new(
     # keeps reporting. Every command is dropped, nothing is sampled.
     _set_climate(hass, STATE_UNAVAILABLE)
     frozen = list(coordinator._samples_cache)
-    for k in range(15):
-        # The last digit alternates so every report is a state change.
-        await _report(hass, freezer, 22.8 + 0.02 * (k % 2))
-        assert coordinator._samples_cache == frozen
-        assert coordinator.data.idle_slope_source == "live"
-        zone = coordinator.get_zone_data()
-        assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == measured
+    with patch.object(
+        coordinator._store, "async_update_zone", wraps=coordinator._store.async_update_zone
+    ) as writes:
+        for k in range(15):
+            # The last digit alternates so every report is a state change.
+            await _report(hass, freezer, 22.8 + 0.02 * (k % 2))
+            assert coordinator._samples_cache == frozen
+            assert coordinator.data.idle_slope_source == "live"
+    assert not [c for c in writes.call_args_list if "persisted_idle_slope_at" in c.kwargs]
+    zone = coordinator.get_zone_data()
+    assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == measured
 
     # The unit is back. Its first sample prunes the idle run, which is now
     # older than the window, and the cache takes over -- saying how old the
