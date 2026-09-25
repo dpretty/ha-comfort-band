@@ -34,6 +34,7 @@ from custom_components.comfort_band.const import (
     SIGNAL_ACTIVE_PROFILE_CHANGED,
 )
 from custom_components.comfort_band.coordinator import ZoneCoordinator, ZoneState
+from custom_components.comfort_band.predictor import Sample
 from custom_components.comfort_band.storage import ComfortBandStore
 
 TEMP_ENTITY = "sensor.office_temp"  # external sensor; non-colliding with comfort_band's mirror
@@ -733,14 +734,18 @@ def _seed_idle_drift(
     coordinator: ZoneCoordinator, *, start_temp: float, slope_per_h: float, now: datetime
 ) -> None:
     """Pre-populate the coordinator's in-memory samples cache with an idle
-    drift segment. 16 samples at 120s spacing = 30 minutes of history.
+    drift segment. 16 samples at 120s spacing = 30 minutes of history, the
+    first at `start_temp` -- preceded by the settle window's worth of lead-in
+    on the same line, which the idle slope leaves out (v0.19.0), so the 16
+    are exactly the samples behind the estimate.
     """
-    from custom_components.comfort_band.const import ACTION_IDLE
+    from custom_components.comfort_band.const import ACTION_IDLE, IDLE_SETTLE_MINUTES
     from custom_components.comfort_band.predictor import Sample
 
     slope_per_minute = slope_per_h / 60.0
+    lead = IDLE_SETTLE_MINUTES * 60 // 120
     samples: list[Sample] = []
-    for i in range(16):
+    for i in range(-lead, 16):
         t = now - timedelta(seconds=120 * (15 - i))
         temp = start_temp + slope_per_minute * (120 * i / 60.0)
         samples.append(Sample(t=t, temp=temp, action=ACTION_IDLE))
@@ -1207,19 +1212,20 @@ async def test_passive_acceptance_suppresses_heat_end_to_end(
 def _seed_full_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> None:
     """Pre-populate samples covering idle / heat / cool trailing runs so MPC's
     `is_ready` check returns True. Layout (oldest → newest):
-      - cool segment 60-50 min ago
-      - heat segment 40-30 min ago
-      - idle segment 20-10 min ago
+      - cool segment 84-74 min ago
+      - heat segment 64-54 min ago
+      - idle segment 50-10 min ago, of which 20-10 min ago is behind the
+        estimate: the idle slope leaves the first half hour of a run out
+        (v0.19.0), and a run straight after a heat cycle is what that is for
     `_latest_run_of` walks backwards by action class, so each segment is
     recoverable independently. WLS recency weighting (τ=20 min) means the
     most recent (idle) gets full weight; older segments still produce a
     slope estimate.
     """
-    from custom_components.comfort_band.const import ACTION_COOL, ACTION_HEAT, ACTION_IDLE
-    from custom_components.comfort_band.predictor import Sample
+    from custom_components.comfort_band.const import ACTION_COOL, ACTION_HEAT
 
     samples: list[Sample] = []
-    base = now - timedelta(minutes=60)
+    base = now - timedelta(minutes=84)
     for i in range(6):
         samples.append(
             Sample(
@@ -1228,7 +1234,7 @@ def _seed_full_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> Non
                 action=ACTION_COOL,
             )
         )
-    base = now - timedelta(minutes=40)
+    base = now - timedelta(minutes=64)
     for i in range(6):
         samples.append(
             Sample(
@@ -1237,16 +1243,23 @@ def _seed_full_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -> Non
                 action=ACTION_HEAT,
             )
         )
-    base = now - timedelta(minutes=20)
-    for i in range(6):
-        samples.append(
-            Sample(
-                t=base + timedelta(minutes=2 * i),
-                temp=21.0,
-                action=ACTION_IDLE,
-            )
-        )
+    samples.extend(_settled_flat_idle(now))
     coordinator._samples_cache = samples
+
+
+def _settled_flat_idle(now: datetime) -> list[Sample]:
+    """A flat idle run at 21.0 from 50 to 10 min before `now`, 2 min apart.
+
+    Its first half hour is the settle window the idle slope leaves out, so the
+    six samples from 20 to 10 min ago -- the idle segment these seeds had
+    before v0.19.0 -- are the ones behind the estimate.
+    """
+    from custom_components.comfort_band.const import ACTION_IDLE
+
+    base = now - timedelta(minutes=50)
+    return [
+        Sample(t=base + timedelta(minutes=2 * i), temp=21.0, action=ACTION_IDLE) for i in range(21)
+    ]
 
 
 async def test_three_way_gate_routes_to_mpc_when_enabled_and_ready(
@@ -1653,11 +1666,10 @@ def _seed_heat_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -
     install in cold months) at the point where MPC should be eligible to
     activate under the relaxed v0.8.1 gate.
     """
-    from custom_components.comfort_band.const import ACTION_HEAT, ACTION_IDLE
-    from custom_components.comfort_band.predictor import Sample
+    from custom_components.comfort_band.const import ACTION_HEAT
 
     samples: list[Sample] = []
-    base = now - timedelta(minutes=40)
+    base = now - timedelta(minutes=64)
     for i in range(6):
         samples.append(
             Sample(
@@ -1666,15 +1678,7 @@ def _seed_heat_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -
                 action=ACTION_HEAT,
             )
         )
-    base = now - timedelta(minutes=20)
-    for i in range(6):
-        samples.append(
-            Sample(
-                t=base + timedelta(minutes=2 * i),
-                temp=21.0,
-                action=ACTION_IDLE,
-            )
-        )
+    samples.extend(_settled_flat_idle(now))
     coordinator._samples_cache = samples
 
 
@@ -1709,11 +1713,10 @@ def _seed_cool_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -
     heat data. Models a cool-only zone (summer install) at the point where
     v0.8.1's relaxed gate should activate MPC.
     """
-    from custom_components.comfort_band.const import ACTION_COOL, ACTION_IDLE
-    from custom_components.comfort_band.predictor import Sample
+    from custom_components.comfort_band.const import ACTION_COOL
 
     samples: list[Sample] = []
-    base = now - timedelta(minutes=40)
+    base = now - timedelta(minutes=64)
     for i in range(6):
         samples.append(
             Sample(
@@ -1722,15 +1725,7 @@ def _seed_cool_only_slope_data(coordinator: ZoneCoordinator, *, now: datetime) -
                 action=ACTION_COOL,
             )
         )
-    base = now - timedelta(minutes=20)
-    for i in range(6):
-        samples.append(
-            Sample(
-                t=base + timedelta(minutes=2 * i),
-                temp=21.0,
-                action=ACTION_IDLE,
-            )
-        )
+    samples.extend(_settled_flat_idle(now))
     coordinator._samples_cache = samples
 
 
@@ -2289,9 +2284,11 @@ async def test_live_idle_slope_is_persisted(
     assert state.idle_slope_cached_age_min is None
     assert state.thermal_slopes.idle is not None
     zone = coordinator._store.get_zone("office")
-    # The persisted value equals the live estimate, with a timestamp set.
+    # The persisted value equals the live estimate, stamped with the newest
+    # sample behind it (the seed's last, taken at "now" here).
     assert zone["persisted_idle_slope"] == state.thermal_slopes.idle
-    assert zone["persisted_idle_slope_at"] is not None
+    assert state.thermal_slopes.idle_measured_at == coordinator._samples_cache[-1].t
+    assert zone["persisted_idle_slope_at"] == coordinator._samples_cache[-1].t.isoformat()
 
 
 async def test_persist_skipped_for_non_learning_zone(
@@ -2447,32 +2444,117 @@ async def test_cached_idle_without_recovery_stays_not_ready(
     assert state.mpc_ready is False
 
 
+async def test_persisted_idle_slope_is_stamped_with_the_newest_sample_behind_it(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.19.0: the stamp says when the drift was observed. Here the idle run
+    ended seven minutes ago and a heat cycle has run since: the slope is still
+    live, because its run is still in the window, but it is not seven minutes
+    younger than that -- stamped "now", it would outlive its 24 h by however
+    long the run sat in the buffer."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    now = dt_util.utcnow()
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=now - timedelta(minutes=7))
+    idle_end = coordinator._samples_cache[-1].t
+    coordinator._samples_cache += [
+        Sample(t=idle_end + timedelta(minutes=2 * (i + 1)), temp=20.8 + 0.1 * i, action=ACTION_HEAT)
+        for i in range(3)
+    ]
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "live"
+    zone = coordinator._store.get_zone("office")
+    assert zone["persisted_idle_slope"] == state.thermal_slopes.idle
+    assert zone["persisted_idle_slope_at"] == idle_end.isoformat()
+
+
 async def test_persisted_idle_slope_write_is_throttled(
     hass: HomeAssistant,
     coordinator: ZoneCoordinator,
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """The persisted-idle-slope write is throttled to <=1 per
-    SAMPLE_PERSIST_INTERVAL_S (300 s): a refresh within the window must not
-    advance the timestamp; one past it must."""
+    """A newly measured idle slope is written at most once per
+    SAMPLE_PERSIST_INTERVAL_S (300 s), stamped with its newest sample: one
+    measured inside the window waits, one past it is written."""
+    from unittest.mock import AsyncMock, patch
+
     freezer.move_to("2026-05-19 12:00:00+00:00")
     await coordinator._store.async_update_zone("office", learning_enabled=True)
     _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
 
-    await coordinator._async_update_data()
-    first_at = coordinator._store.get_zone("office")["persisted_idle_slope_at"]
-    assert first_at is not None
+    def _measure() -> None:
+        last = coordinator._samples_cache[-1]
+        coordinator._samples_cache.append(
+            Sample(t=dt_util.utcnow(), temp=last.temp - 0.005, action=ACTION_IDLE)
+        )
 
-    # A refresh 60 s later (< 300 s) must NOT rewrite the timestamp.
-    freezer.tick(timedelta(seconds=60))
-    await coordinator._async_update_data()
-    assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] == first_at
+    # The samples are this test's to add, so the apply task must not add its own.
+    with patch.object(coordinator, "_maybe_apply_action", AsyncMock()):
+        await coordinator._async_update_data()
+        first_at = coordinator._store.get_zone("office")["persisted_idle_slope_at"]
+        assert first_at == dt_util.utcnow().isoformat()
 
-    # Past the interval, the next refresh refreshes the timestamp.
-    freezer.tick(timedelta(seconds=300))
-    await coordinator._async_update_data()
-    assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] != first_at
+        # A new sample 60 s on (< 300 s): measured, but not written yet.
+        freezer.tick(timedelta(seconds=60))
+        _measure()
+        await coordinator._async_update_data()
+        assert coordinator._store.get_zone("office")["persisted_idle_slope_at"] == first_at
+
+        # Past the interval the newest measurement is written, with its own stamp.
+        freezer.tick(timedelta(seconds=300))
+        _measure()
+        await coordinator._async_update_data()
+        zone = coordinator._store.get_zone("office")
+        assert zone["persisted_idle_slope_at"] == dt_util.utcnow().isoformat()
+
+
+async def test_an_idle_slope_with_nothing_new_behind_it_is_not_rewritten(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A buffer that stops growing -- every command dropped while the climate
+    entity is unreachable, so nothing is appended and nothing ages out -- goes
+    on producing the same live idle slope from the same samples. That is not a
+    new measurement, and writing it again with a fresh stamp is how an idle
+    slope an hour and a half old came back as the cache "10 min old", good for
+    another day. Nothing is written; and once the run has left the window, the
+    cache says how old the measurement really is."""
+    from unittest.mock import AsyncMock, patch
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    await coordinator._store.async_update_zone("office", learning_enabled=True)
+    _seed_idle_drift(coordinator, start_temp=21.0, slope_per_h=-0.5, now=dt_util.utcnow())
+    measured_at = coordinator._samples_cache[-1].t
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+
+    with patch.object(coordinator, "_maybe_apply_action", AsyncMock()):
+        await coordinator._async_update_data()
+        zone = coordinator._store.get_zone("office")
+        stored = (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"])
+        assert stored[1] == measured_at.isoformat()
+        # An hour of refreshes, each past the throttle, on a buffer that
+        # gains nothing.
+        for _ in range(12):
+            freezer.tick(timedelta(minutes=5))
+            state = await coordinator._async_update_data()
+            assert state.idle_slope_source == "live"
+            zone = coordinator._store.get_zone("office")
+            assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == stored
+
+        # The unit is back and the first new sample prunes the old run.
+        coordinator._samples_cache = []
+        state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "cached"
+    assert state.thermal_slopes.idle == stored[0]
+    assert state.idle_slope_cached_age_min == pytest.approx(60.0, abs=0.1)
 
 
 async def test_thermal_slope_sensor_exposes_idle_source_attributes(

@@ -117,6 +117,18 @@ SLOPE_MIN_SAMPLES: Final = 4
 SLOPE_WEIGHT_TAU_MINUTES: Final = 20.0
 SLOPE_EPSILON_PER_HOUR: Final = 0.05
 
+# v0.19.0: how much of the start of an idle run the idle slope leaves out. An
+# idle run almost always begins at the release of a heat or cool cycle, and for
+# a while after that the room is still answering the cycle rather than drifting:
+# the air relaxes back toward furniture and walls the cycle never reached, and
+# after cooling the fan re-evaporates the water left on the coil, which a zone
+# on apparent temperature reads as warming. Ten days of two zones' history put
+# the first live idle slope after a cool release at a median of about +1.4 °C/h
+# (-0.9 after a heat release), against roughly +/-0.25 half an hour on. A zone
+# that cycles every twenty minutes only ever saw that aftermath, persisted it as
+# its passive rate, and pre-cooled on a cold night on the strength of it.
+IDLE_SETTLE_MINUTES: Final = 30
+
 # v0.12.0: persisted idle slope. The idle (passive heat-loss) rate is a
 # slow-changing thermal property, so we remember the last good idle slope
 # beyond the 90-min sample window. When a heating-dominated room chases a
@@ -126,7 +138,8 @@ SLOPE_EPSILON_PER_HOUR: Final = 0.05
 # the remembered idle slope keeps MPC ready through the chase. The max age
 # is generous enough to bridge overnight -> morning but expires day-to-day so
 # a stale value can't mislead MPC indefinitely (e.g. after a window is left
-# open, furniture moved, season change).
+# open, furniture moved, season change). Since v0.19.0 the age runs from the
+# newest sample behind the value, not from when it was last written.
 PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES: Final = 24 * 60
 
 # Passive drift acceptance (v0.7+). When hysteresis would fire heat / cool

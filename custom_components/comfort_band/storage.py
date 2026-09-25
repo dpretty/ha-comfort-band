@@ -183,7 +183,9 @@ class StoredZone(TypedDict):
     # the live window can only produce short idle blips. °C/min, signed
     # (negative = cooling toward ambient). None = none learned yet.
     # `persisted_idle_slope_at` is the ISO-8601 UTC timestamp of that slope,
-    # used to expire it after `PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`.
+    # used to expire it after `PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`. Since
+    # v0.19.0 it is when the newest sample behind the slope was taken; earlier
+    # releases wrote the time of the refresh that last recomputed it.
     persisted_idle_slope: float | None
     persisted_idle_slope_at: str | None
     # v0.13.0: deterministic fan-boost (opt-in, per zone). When

@@ -175,11 +175,14 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # from the persisted last-good value because the live window only
             # had idle blips (MPC stays ready through a heating chase);
             # "none" = no idle slope available. `idle_slope_cached_age_min` is
-            # the age of the cached value in minutes (null unless "cached").
+            # the age of the cached value in minutes (null unless "cached") --
+            # since v0.19.0, measured from the newest sample behind it.
             # NB: when source is "cached", `method_idle` above reads "cached"
             # but the per-segment `sample_count_idle` / `std_dev_idle` still
             # describe the (sub-threshold) *live* idle samples, not the cached
-            # value — those diagnostics always reflect the current window.
+            # value — those diagnostics always reflect the current window, and
+            # since v0.19.0 only its settled part: they read 0 for the first
+            # IDLE_SETTLE_MINUTES of every idle stretch.
             "idle_slope_source": data.idle_slope_source,
             "idle_slope_cached_age_min": data.idle_slope_cached_age_min,
             "recovery_slope_heat": (
