@@ -18,9 +18,11 @@ in/out via dataclasses; `now` is injected so unit tests stay pure.
 
 Slope segmentation: three slopes per zone (idle, recovery_heat, recovery_cool),
 each computed over the most recent contiguous run of like-actioned samples in
-the buffer -- for idle, less its first IDLE_SETTLE_MINUTES (v0.19.0; see
-`_settled`). Each may be None when its segment has fewer than
-SLOPE_MIN_SAMPLES samples or the WLS denominator is near-singular.
+the buffer -- contiguous in time as well, with no gap longer than
+SAMPLE_MAX_GAP_MINUTES inside it (v0.20.0; see `_latest_run_of`) -- and for
+idle, less its first IDLE_SETTLE_MINUTES (v0.19.0; see `_settled`). Each may be
+None when its segment has fewer than SLOPE_MIN_SAMPLES samples or the WLS
+denominator is near-singular.
 
 Three projection thresholds, summarised:
 - Anticipatory **shutoff** projects at the band edge (`low`/`high`): fires
@@ -51,6 +53,7 @@ from .const import (
     IDLE_SETTLE_MINUTES,
     PASSIVE_FORECAST_MOVEMENT_MIN_C,
     SAMPLE_MAX_COUNT,
+    SAMPLE_MAX_GAP_MINUTES,
     SAMPLE_MIN_INTERVAL_S,
     SAMPLE_WINDOW_MINUTES,
     SLOPE_EPSILON_PER_HOUR,
@@ -299,6 +302,18 @@ def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
     match. The trailing-run constraint means each action's slope reflects
     the most recent cycle of that action — passive drift before a heat
     cycle does not bleed into the slope used for the next heat cycle.
+
+    Contiguous in time as well as in label (v0.20.0): the run stops at the
+    first gap of more than SAMPLE_MAX_GAP_MINUTES between consecutive
+    samples. Nothing is sampled while the room sensor is dark, while the
+    climate entity is unreachable (a dropped command appends nothing), or
+    while Home Assistant is down, so the samples either side of such a gap
+    were otherwise joined into one run spanning time nobody observed -- and
+    the fit across it is set by whatever happened in the gap. Its two
+    clusters sit far apart on the time axis, which gives the older one the
+    leverage to tilt the line however little weight it carries: a room that
+    stepped down during the gap and has held level since reads as still
+    falling, for as long as the samples before the gap stay in the window.
     """
     end: int | None = None
     for i in range(len(samples) - 1, -1, -1):
@@ -307,8 +322,13 @@ def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
             break
     if end is None:
         return []
+    max_gap = timedelta(minutes=SAMPLE_MAX_GAP_MINUTES)
     start = end - 1
-    while start > 0 and samples[start - 1].action == action:
+    while (
+        start > 0
+        and samples[start - 1].action == action
+        and samples[start].t - samples[start - 1].t <= max_gap
+    ):
         start -= 1
     return samples[start:end]
 
@@ -330,7 +350,9 @@ def _settled(run: list[Sample]) -> list[Sample]:
     buffer cannot say what came before a run at its start: the release may
     just have aged out -- and trimming only visible releases was measured
     letting exactly those runs back in, the transient intact, once the cycle
-    in front of them was pruned -- or a flush may have emptied it. The price
+    in front of them was pruned -- or a flush may have emptied it, or (since
+    v0.20.0) the run may start after a gap in sampling, which nothing watched
+    and anything could have happened in, so it settles again. The price
     is paid by a run that has idled for longer than the window: it loses its
     oldest half hour, under 4 % of the fit's weight but about a third of its
     leverage, so its slope is somewhat noisier (replayed over ten days of two

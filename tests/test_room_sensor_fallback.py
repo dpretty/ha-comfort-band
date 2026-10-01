@@ -505,12 +505,17 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Nothing is sampled from a stand-in, so a heat cycle it commands leaves
-    a gap in the buffer -- and the predictor joins runs by action label alone.
-    Without a flush before hand-back, the idle samples on either side of the
-    outage become one idle run spanning a real heat cycle: the idle slope
-    reads as strong passive warming, is persisted, and a learning zone cools
-    inside the deadband on the strength of it. The incident shape exactly:
-    idle, a router reboot's worth of stand-in heat, idle again."""
+    a gap in the buffer -- and the predictor joined runs by action label
+    alone. Without a flush before hand-back, the idle samples on either side
+    of the outage become one idle run spanning a real heat cycle: the idle
+    slope reads as strong passive warming, is persisted, and a learning zone
+    cools inside the deadband on the strength of it. The incident shape
+    exactly: idle, a router reboot's worth of stand-in heat, idle again.
+
+    Since v0.20.0 a run also stops at a gap longer than SAMPLE_MAX_GAP_MINUTES,
+    which this outage is, so it would now be split without the flush too. The
+    flush still matters for an outage short enough to be spanned -- the grace
+    period and one short cycle fit inside the limit -- and is what this pins."""
     freezer.move_to("2026-09-15 08:40:00+00:00")
     coordinator = await _enabled_zone(hass)
     await coordinator._store.async_update_zone("office", learning_enabled=True)

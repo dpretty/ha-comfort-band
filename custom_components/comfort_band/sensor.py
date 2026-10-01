@@ -150,7 +150,11 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
     sensor reporting every minute, 50 with one reporting every five, and
     never with one reporting less often than about every 20 minutes, which
     leaves too few samples in the hour of window that remains. Meanwhile
-    the cached idle slope is shown, if the zone has one.
+    the cached idle slope is shown, if the zone has one. A run also starts
+    again after a gap in sampling longer than SAMPLE_MAX_GAP_MINUTES
+    (v0.20.0), so all of this repeats after an outage: a resumed heat or
+    cool run is unknown for its first few samples, and a resumed idle run
+    settles again.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);
