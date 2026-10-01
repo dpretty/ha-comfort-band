@@ -124,9 +124,10 @@ async def test_a_cool_cycle_does_not_resume_across_a_climate_outage(
     brought it back in `cool` with the room a degree warmer. It reconnects in
     the mode it was left in, so nothing tells the zone. Joined across the
     outage, the cool run's two halves fitted as a room that cooling barely
-    moved -- or warmed -- so the recovery slope was rejected, then wrong,
-    until the samples from before the outage had aged out of the window, and
-    MPC sat out that half hour while the unit was cooling at its usual rate.
+    moved -- or warmed -- so the recovery slope was rejected, then too
+    shallow, until the samples from before the outage had aged out of the
+    window: MPC sat out the first twenty minutes and planned with the wrong
+    rate for the next ten, while the unit was cooling at its usual rate.
     After an outage the run starts again, and MPC is back on the resumed
     cycle's fourth sample. That is also the price when the unit *did* keep
     cooling, as it did in production: nothing in the buffer tells the two
@@ -208,13 +209,15 @@ async def test_an_idle_slope_is_not_fitted_across_a_sensor_outage(
     -- long past the grace period, and the unit publishes no reading to stand
     in. When it returns the room is 0.6 °C cooler, and it holds there.
     Joined, the idle run's settled part reached back across the outage, and
-    the two levels fitted as passive cooling at 0.9 °C/h, though neither side
-    of the outage showed any drift at all. It was live for forty minutes,
-    fading as the samples from before the outage aged out, and written to the
-    cache stamped as measured after the outage: had the zone left idle in
-    that time, MPC would have planned the next day with it. The run that
-    resumes after the outage settles before it is fitted, and the cache keeps
-    what was measured before."""
+    the two levels fitted as passive cooling at up to 0.9 °C/h, though
+    neither side of the outage showed any drift at all. It was live for forty
+    minutes, fading as the samples from before the outage left the part of
+    the run that was fitted, and written to the cache stamped as measured
+    after the outage: had the zone left idle in that time, MPC could have
+    planned with it until the next settled idle slope replaced it, for up to
+    a day. Split, the samples after the outage are fitted on their own once
+    there are four of them, and until then the cache keeps what was measured
+    before."""
     freezer.move_to("2026-09-24 08:00:00+00:00")
     coordinator = await _enabled_zone(hass)
     _set_climate(hass, HVAC_MODE_FAN_ONLY, 22.5)
@@ -245,19 +248,20 @@ async def test_an_idle_slope_is_not_fitted_across_a_sensor_outage(
     await _report(hass, freezer, 20.41)
     assert coordinator.data.idle_slope_source == "cached"
     assert coordinator.data.thermal_slopes.idle == measured[0]
-    assert coordinator.data.thermal_slopes.sample_count_idle == 0
+    assert coordinator.data.thermal_slopes.sample_count_idle == 1
     zone = coordinator.get_zone_data()
     assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == measured
 
-    # The resumed run settles with the cache standing in, unchanged, until it
-    # has four samples past the settle window: fifty minutes at this cadence.
+    # The cache stands in, unchanged, until there are four samples from after
+    # the outage -- twenty minutes at this cadence. The idle stretch began long
+    # before the outage, so they are past its settle window already.
     for k in range(20):
         if coordinator.data.idle_slope_source != "cached":
             break
         zone = coordinator.get_zone_data()
         assert (zone["persisted_idle_slope"], zone["persisted_idle_slope_at"]) == measured
         await _report(hass, freezer, 20.4 + 0.01 * (k % 2))
-    assert dt_util.utcnow() - resumed == timedelta(minutes=IDLE_SETTLE_MINUTES + 20)
+    assert dt_util.utcnow() - resumed == SLOPE_MIN_SAMPLES * REPORT
 
     # And the slope it then gives is fitted from what was seen after the
     # outage alone, and is what the cache now holds.
@@ -268,7 +272,7 @@ async def test_an_idle_slope_is_not_fitted_across_a_sensor_outage(
     assert abs(slopes.idle * 60.0) < 0.05
     assert slopes.idle_measured_at is not None
     behind = [s for s in coordinator._samples_cache if s.t <= slopes.idle_measured_at]
-    assert behind[-SLOPE_MIN_SAMPLES].t >= resumed + timedelta(minutes=IDLE_SETTLE_MINUTES)
+    assert behind[-SLOPE_MIN_SAMPLES].t == resumed
     zone = coordinator.get_zone_data()
     assert zone["persisted_idle_slope_at"] == slopes.idle_measured_at.isoformat()
 

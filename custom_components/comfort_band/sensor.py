@@ -146,15 +146,15 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
     SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
     first few samples of a heat or cool run are expected to be unknown. The
     live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
-    idle run plus four samples more (v0.19.0): about 35 minutes with a
-    sensor reporting every minute, 50 with one reporting every five, and
-    never with one reporting less often than about every 20 minutes, which
-    leaves too few samples in the hour of window that remains. Meanwhile
-    the cached idle slope is shown, if the zone has one. A run also starts
-    again after a gap in sampling longer than SAMPLE_MAX_GAP_MINUTES
-    (v0.20.0), so all of this repeats after an outage: a resumed heat or
-    cool run is unknown for its first few samples, and a resumed idle run
-    settles again.
+    idle stretch plus four samples more (v0.19.0): about 35 minutes with a
+    sensor reporting every minute, 50 with one reporting every five.
+    Meanwhile the cached idle slope is shown, if the zone has one. A run also
+    stops at a gap in sampling longer than SAMPLE_MAX_GAP_MINUTES (v0.20.0):
+    after an outage a resumed heat or cool run is unknown for its first few
+    samples, and a resumed idle stretch until four samples from after the
+    outage are past its settle window. A room reading that changes less often
+    than that never gives a slope at all, heat and cool included: each of its
+    samples is a run of its own.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);

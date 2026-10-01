@@ -515,7 +515,8 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     Since v0.20.0 a run also stops at a gap longer than SAMPLE_MAX_GAP_MINUTES,
     which this outage is, so it would now be split without the flush too. The
     flush still matters for an outage short enough to be spanned -- the grace
-    period and one short cycle fit inside the limit -- and is what this pins."""
+    period and one short cycle fit inside the limit -- and what this pins is
+    that it happens."""
     freezer.move_to("2026-09-15 08:40:00+00:00")
     coordinator = await _enabled_zone(hass)
     await coordinator._store.async_update_zone("office", learning_enabled=True)

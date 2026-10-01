@@ -20,9 +20,9 @@ Slope segmentation: three slopes per zone (idle, recovery_heat, recovery_cool),
 each computed over the most recent contiguous run of like-actioned samples in
 the buffer -- contiguous in time as well, with no gap longer than
 SAMPLE_MAX_GAP_MINUTES inside it (v0.20.0; see `_latest_run_of`) -- and for
-idle, less its first IDLE_SETTLE_MINUTES (v0.19.0; see `_settled`). Each may be
-None when its segment has fewer than SLOPE_MIN_SAMPLES samples or the WLS
-denominator is near-singular.
+idle, less any samples in the first IDLE_SETTLE_MINUTES of the idle stretch it
+belongs to (v0.19.0; see `_settled`). Each may be None when its segment has
+fewer than SLOPE_MIN_SAMPLES samples or the WLS denominator is near-singular.
 
 Three projection thresholds, summarised:
 - Anticipatory **shutoff** projects at the band edge (`low`/`high`): fires
@@ -294,7 +294,9 @@ def append_sample(
     return pruned, True
 
 
-def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
+def _latest_run_of(
+    samples: list[Sample], action: str, *, across_gaps: bool = False
+) -> list[Sample]:
     """Most recent contiguous run of samples with `s.action == action`.
 
     Returns [] if no such run exists. Walks backward to find the latest
@@ -313,7 +315,12 @@ def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
     clusters sit far apart on the time axis, which gives the older one the
     leverage to tilt the line however little weight it carries: a room that
     stepped down during the gap and has held level since reads as still
-    falling, for as long as the samples before the gap stay in the window.
+    falling, for as long as samples from before the gap are among those
+    fitted.
+
+    With `across_gaps` the run is joined by label alone, as it was before
+    v0.20.0: the whole stretch of the action the buffer can see, which is
+    what the idle settle window is measured from (see `_settled`).
     """
     end: int | None = None
     for i in range(len(samples) - 1, -1, -1):
@@ -327,40 +334,49 @@ def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
     while (
         start > 0
         and samples[start - 1].action == action
-        and samples[start].t - samples[start - 1].t <= max_gap
+        and (across_gaps or samples[start].t - samples[start - 1].t <= max_gap)
     ):
         start -= 1
     return samples[start:end]
 
 
-def _settled(run: list[Sample]) -> list[Sample]:
+def _settled(run: list[Sample], *, since: datetime) -> list[Sample]:
     """The part of an idle run that is passive drift rather than aftermath.
 
-    Drops every sample in the first IDLE_SETTLE_MINUTES after the run's first
-    sample. An idle run nearly always starts at the release of a heat or cool
-    cycle, and until the room has settled it moves back against that cycle --
-    after cooling, fast enough to read as warming at a couple of degrees an
-    hour. That is a fact about the cycle, not about the room: projected over
-    MPC's horizon (and, persisted, for a day after) it makes a cold night look
-    warm enough to cool against, and the next cycle's aftermath then confirms
-    it.
+    Drops every sample in the first IDLE_SETTLE_MINUTES after `since`, the
+    first sample of the idle stretch the run belongs to. An idle run nearly
+    always starts at the release of a heat or cool cycle, and until the room
+    has settled it moves back against that cycle -- after cooling, fast enough
+    to read as warming at a couple of degrees an hour. That is a fact about
+    the cycle, not about the room: projected over MPC's horizon (and,
+    persisted, for a day after) it makes a cold night look warm enough to
+    cool against, and the next cycle's aftermath then confirms it.
 
-    Measured from the run's first sample in the buffer whatever precedes it,
-    rather than only when a heat or cool sample is visibly in front. The
-    buffer cannot say what came before a run at its start: the release may
-    just have aged out -- and trimming only visible releases was measured
+    Measured from the stretch's first sample in the buffer whatever precedes
+    it, rather than only when a heat or cool sample is visibly in front. The
+    buffer cannot say what came before a stretch at its start: the release
+    may just have aged out -- and trimming only visible releases was measured
     letting exactly those runs back in, the transient intact, once the cycle
-    in front of them was pruned -- or a flush may have emptied it, or (since
-    v0.20.0) the run may start after a gap in sampling, which nothing watched
-    and anything could have happened in, so it settles again. The price
-    is paid by a run that has idled for longer than the window: it loses its
-    oldest half hour, under 4 % of the fit's weight but about a third of its
-    leverage, so its slope is somewhat noisier (replayed over ten days of two
-    zones, such slopes moved by a median 0.03 °C/h).
+    in front of them was pruned -- or a flush may have emptied it. The price
+    is paid by a stretch that has idled for longer than the window: it loses
+    its oldest half hour, under 4 % of the fit's weight but about a third of
+    its leverage, so its slope is somewhat noisier (replayed over ten days of
+    two zones, such slopes moved by a median 0.03 °C/h).
+
+    A gap in sampling inside the stretch (v0.20.0) splits the run that is
+    fitted, but not the window, which stays where the stretch began. The unit
+    was left idle on both sides of the gap, and nothing the zone commanded in
+    between could have changed that (a stand-in that changes the action
+    flushes the buffer), so there is no new release to wait out: the samples
+    after the gap are fitted as soon as there are enough of them. Restarting
+    the window at every gap was measured too. Over ten days of five zones it
+    withheld the live slope three times as long, and the slope MPC planned
+    with after an outage -- the cached one, meanwhile -- was further from what
+    the room went on to do than the joined fit had been. Once the samples
+    from before a long gap have left the window, though, the stretch's first
+    sample is the first one after the gap, and the window starts again there.
     """
-    if not run:
-        return run
-    settled_from = run[0].t + timedelta(minutes=IDLE_SETTLE_MINUTES)
+    settled_from = since + timedelta(minutes=IDLE_SETTLE_MINUTES)
     return [s for s in run if s.t >= settled_from]
 
 
@@ -471,10 +487,16 @@ def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
     """Compute per-action slopes over the most recent contiguous run of each
     action class, plus buffer bookkeeping for the sensor's attributes.
 
-    The idle run is fitted without its first IDLE_SETTLE_MINUTES (`_settled`);
-    the recovery runs are fitted whole, since the cycle is what they measure.
+    The idle run is fitted without any samples in the first
+    IDLE_SETTLE_MINUTES of its idle stretch (`_settled`); the recovery runs
+    are fitted whole, since the cycle is what they measure.
     """
-    idle_run = _settled(_latest_run_of(samples, ACTION_IDLE))
+    idle_stretch = _latest_run_of(samples, ACTION_IDLE, across_gaps=True)
+    idle_run = (
+        _settled(_latest_run_of(samples, ACTION_IDLE), since=idle_stretch[0].t)
+        if idle_stretch
+        else []
+    )
     heat_run = _latest_run_of(samples, ACTION_HEAT)
     cool_run = _latest_run_of(samples, ACTION_COOL)
 

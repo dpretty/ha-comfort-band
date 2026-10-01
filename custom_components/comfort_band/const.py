@@ -65,9 +65,13 @@ SAMPLE_MAX_COUNT: Final = 200
 # dark and read as warming at 1.5 °C/h against the 0.4 seen afterwards,
 # spanned 19.6 minutes. Seventeen sits between two and three lost reports from
 # a sensor reporting every five minutes, so neither lands on the edge (fifteen
-# would split two of them about half the time). Home Assistant passes on only
-# a change, though, so a coarse sensor in a steady room can go longer than
-# this without anything being wrong, and its runs are split there too.
+# sits exactly on two of them). A restart's gap also includes up to
+# SAMPLE_PERSIST_INTERVAL_S of samples taken but not yet written to disk, so
+# this bounds how short a restart must be for a run to survive it as well.
+# Home Assistant passes on only a change, though, so a room reading that
+# changes less often than this -- a coarse sensor in a steady room, or in a
+# slow heat or cool cycle -- is split at every quiet stretch, and such cycles
+# get no recovery slope.
 SAMPLE_MAX_GAP_MINUTES: Final = 17
 
 # How often the coordinator persists the in-memory sample buffer. The buffer
