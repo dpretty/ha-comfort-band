@@ -14,6 +14,7 @@ from custom_components.comfort_band.const import (
     HVAC_MODE_COOL,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
+    IDLE_SETTLE_MINUTES,
     SAMPLE_MAX_COUNT,
     SAMPLE_MIN_INTERVAL_S,
     SAMPLE_WINDOW_MINUTES,
@@ -54,6 +55,32 @@ def _samples_at(
         temp = start_temp + slope_per_minute * (interval_s * i / 60.0)
         out.append(Sample(t=t, temp=temp, action=action))
     return out
+
+
+def _settled_idle(
+    interval_s: float, count: int, *, start_temp: float, slope_per_h: float
+) -> list[Sample]:
+    """An idle run whose settled part is exactly `_samples_at(interval_s, count)`.
+
+    Since v0.19.0 the idle slope leaves out the first IDLE_SETTLE_MINUTES of an
+    idle run, so one that starts at `_T0` would contribute nothing. This one
+    starts that long before `_T0` on the same line, so the samples a test
+    reasons about -- `_T0` onwards -- are exactly the ones behind the estimate.
+    `interval_s` must divide the settle window, as 120 s does.
+    """
+    lead = round(IDLE_SETTLE_MINUTES * 60 / interval_s)
+    slope_per_minute = slope_per_h / 60.0
+    lead_in = [
+        Sample(
+            t=_T0 - timedelta(seconds=interval_s * (lead - i)),
+            temp=start_temp - slope_per_minute * (interval_s * (lead - i) / 60.0),
+            action=ACTION_IDLE,
+        )
+        for i in range(lead)
+    ]
+    return lead_in + _samples_at(
+        interval_s, count, action=ACTION_IDLE, start_temp=start_temp, slope_per_h=slope_per_h
+    )
 
 
 def _inputs(
@@ -123,7 +150,7 @@ def test_flat_line_yields_zero_slope() -> None:
     honest report that we used WLS and it found no slope, vs a "none"
     tag which would mean we had no slope to compute at all.
     """
-    samples = _samples_at(120, 10, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    samples = _settled_idle(120, 10, start_temp=21.0, slope_per_h=0.0)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is not None
     assert abs(slopes.idle) < 1e-6
@@ -140,7 +167,7 @@ def test_flat_line_yields_zero_slope() -> None:
 
 def test_monotone_idle_drift_recovered() -> None:
     # -0.5 °C/h over 30 min (16 samples at 120s) — should recover to within 0.01 °C/h.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=-0.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is not None
     slope_per_hour = slopes.idle * 60.0
@@ -196,7 +223,7 @@ def test_valid_cool_slope_kept() -> None:
 def test_idle_slope_keeps_both_signs() -> None:
     """The guard applies only to recovery slopes; idle drift is legitimately ±
     (a room can passively warm or cool), so a negative idle slope is kept."""
-    samples = _samples_at(120, 10, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-1.5)
+    samples = _settled_idle(120, 10, start_temp=22.0, slope_per_h=-1.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is not None
     assert slopes.idle * 60.0 == pytest.approx(-1.5, abs=0.01)
@@ -204,9 +231,7 @@ def test_idle_slope_keeps_both_signs() -> None:
 
 
 def test_segment_below_min_samples_yields_none() -> None:
-    samples = _samples_at(
-        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.5
-    )
+    samples = _settled_idle(120, SLOPE_MIN_SAMPLES - 1, start_temp=21.0, slope_per_h=0.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is None
 
@@ -215,13 +240,15 @@ def test_recency_weights_actually_weight() -> None:
     # Build a clean linear drift, then perturb the OLDEST sample by +1 °C.
     # Recency weighting (τ=20min) should make that bend less than 10% vs.
     # perturbing the NEWEST sample.
-    base = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    base = _settled_idle(120, 16, start_temp=22.0, slope_per_h=-0.5)
     base_slope = estimate_slopes(base, now=base[-1].t).idle
     assert base_slope is not None
 
-    # Perturb oldest
+    # Perturb the oldest sample behind the estimate (the settling lead-in in
+    # front of it is not fitted at all).
+    oldest = len(base) - 16
     perturb_old = list(base)
-    perturb_old[0] = Sample(t=base[0].t, temp=base[0].temp + 1.0, action=ACTION_IDLE)
+    perturb_old[oldest] = Sample(t=base[oldest].t, temp=base[oldest].temp + 1.0, action=ACTION_IDLE)
     slope_old = estimate_slopes(perturb_old, now=base[-1].t).idle
     assert slope_old is not None
 
@@ -251,7 +278,10 @@ def test_segmenting_isolates_trailing_run() -> None:
         heat_run.append(Sample(t=t, temp=heat_start_temp + 0.05 * i, action=ACTION_HEAT))
     idle_after_t0 = heat_run[-1].t + timedelta(seconds=120)
     idle_after = []
-    for i in range(6):
+    # Long enough to outlast the settle window, so the trailing run has a
+    # settled part to fit (six samples past the first half hour).
+    settle = IDLE_SETTLE_MINUTES * 60 // 120
+    for i in range(settle + 6):
         t = idle_after_t0 + timedelta(seconds=120 * i)
         idle_after.append(Sample(t=t, temp=heat_run[-1].temp - 0.02 * i, action=ACTION_IDLE))
     samples = idle_before + heat_run + idle_after
@@ -328,7 +358,7 @@ def test_startup_heat_when_steep_idle_drift_down() -> None:
     # Wait: 20.15 > 19.7. Need steeper drift.
     # -6 °C/h → 20.4 - 0.5 = 19.9 > 19.7. Still no.
     # -10 °C/h → 20.4 - 0.833 = 19.57 < 19.7. Triggers.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0)
+    samples = _settled_idle(120, 16, start_temp=21.0, slope_per_h=-10.0)
     # Build inputs with the *current* room being just slightly below the start_temp so it's
     # inside the band but the projection drops below the deadband edge.
     inputs = _inputs(20.4, current=ACTION_IDLE)
@@ -349,7 +379,7 @@ def test_startup_cool_when_steep_idle_drift_up() -> None:
     # cool because projection 22.8 + 10/60*5 = 23.63 crosses the deadband.
     from custom_components.comfort_band.hysteresis import decide as hysteresis_decide
 
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=10.0)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=10.0)
     inputs = _inputs(22.8, current=ACTION_IDLE)
     assert hysteresis_decide(inputs).action == ACTION_IDLE  # predictor must fire earlier
     decision = _decide_from_samples(
@@ -365,7 +395,7 @@ def test_startup_cool_when_steep_idle_drift_up() -> None:
 
 
 def test_startup_falls_through_when_slope_flat() -> None:
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    samples = _settled_idle(120, 16, start_temp=21.0, slope_per_h=0.0)
     inputs = _inputs(21.0, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -379,7 +409,7 @@ def test_startup_falls_through_when_slope_flat() -> None:
 
 def test_startup_falls_through_when_projection_inside_deadband() -> None:
     # Drift -3 °C/h, room at 21.5, projection: 21.5 - 0.25 = 21.25 > 19.7. No trigger.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-3.0)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=-3.0)
     inputs = _inputs(21.5, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -392,7 +422,7 @@ def test_startup_falls_through_when_projection_inside_deadband() -> None:
 
 
 def test_startup_works_when_current_action_unknown() -> None:
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0)
+    samples = _settled_idle(120, 16, start_temp=21.0, slope_per_h=-10.0)
     inputs = _inputs(20.4, current=ACTION_UNKNOWN)
     decision = _decide_from_samples(
         samples,
@@ -407,7 +437,7 @@ def test_startup_works_when_current_action_unknown() -> None:
 def test_startup_cool_works_when_current_action_unknown() -> None:
     # Symmetric to the heat case: ACTION_UNKNOWN routes through the same
     # idle/unknown branch, so cool startup must fire too.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=10.0)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=10.0)
     inputs = _inputs(22.8, current=ACTION_UNKNOWN)
     decision = _decide_from_samples(
         samples,
@@ -543,7 +573,7 @@ def test_passive_heat_suppressed_when_idle_slope_recovers() -> None:
     # Room is below the deadband entry (hysteresis would fire heat), but the
     # idle slope is positive and projection lands comfortably inside the
     # band within lookahead. Predictor should override hysteresis to idle.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=8.0)
+    samples = _settled_idle(120, 16, start_temp=18.5, slope_per_h=8.0)
     inputs = _inputs(19.5, current=ACTION_IDLE)  # 0.5 below low=20 (within tolerance 0.5)
     # Projection: 19.5 + 8/60*5 = 20.17 > low (20.0). Movement 0.67 >= 0.1.
     decision = _decide_from_samples(
@@ -559,7 +589,7 @@ def test_passive_heat_suppressed_when_idle_slope_recovers() -> None:
 def test_passive_cool_suppressed_when_idle_slope_recovers() -> None:
     # Symmetric: room above deadband (hyst would cool), but slope is
     # negative and projection lands comfortably inside the band.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=24.0, slope_per_h=-8.0)
+    samples = _settled_idle(120, 16, start_temp=24.0, slope_per_h=-8.0)
     inputs = _inputs(23.5, current=ACTION_IDLE)  # 0.5 above high=23
     # Projection: 23.5 - 8/60*5 = 22.83 < high. Movement 0.67 >= 0.1.
     decision = _decide_from_samples(
@@ -575,7 +605,7 @@ def test_passive_cool_suppressed_when_idle_slope_recovers() -> None:
 def test_passive_falls_through_when_slope_wrong_sign() -> None:
     # Hyst says heat but slope is negative (room cooling further). Passive
     # branch requires a recovering slope -- fall through to hysteresis.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=20.0, slope_per_h=-2.0)
+    samples = _settled_idle(120, 16, start_temp=20.0, slope_per_h=-2.0)
     inputs = _inputs(19.5, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -592,7 +622,7 @@ def test_passive_falls_through_when_projection_does_not_reach_band() -> None:
     # (19.65 vs floor 19.5) and movement clears the jitter guard, but the
     # slope is too shallow for the projection to actually reach the band
     # within lookahead. Predictor must defer to hysteresis.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=19.3, slope_per_h=2.0)
+    samples = _settled_idle(120, 16, start_temp=19.3, slope_per_h=2.0)
     inputs = _inputs(19.65, current=ACTION_IDLE)  # within tolerance 0.5
     # Projection: 19.65 + 2/60*5 = 19.817 < low (20). Movement 0.167 > 0.1.
     # Comfort floor: 19.65 >= low - 0.5 = 19.5. Only projection fails.
@@ -609,7 +639,7 @@ def test_passive_falls_through_when_projection_does_not_reach_band() -> None:
 def test_passive_falls_through_when_deviation_exceeds_tolerance() -> None:
     # Room is deeper below band than passive_tolerance allows -- comfort
     # floor wins, predictor doesn't suppress even with a strong slope.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.0, slope_per_h=20.0)
+    samples = _settled_idle(120, 16, start_temp=18.0, slope_per_h=20.0)
     inputs = _inputs(19.0, current=ACTION_IDLE)  # 1.0 below low, tolerance 0.5
     # Projection: 19.0 + 20/60*5 = 20.67 >= low. But room < (low - tolerance).
     decision = _decide_from_samples(
@@ -628,7 +658,7 @@ def test_passive_falls_through_when_forecast_movement_below_min() -> None:
     # forecast moves the room by < PASSIVE_FORECAST_MOVEMENT_MIN_C (0.1 °C).
     # Without this jitter guard a sensor-noise slope could spuriously
     # suppress a hysteresis-correct heat call.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=19.4, slope_per_h=0.6)
+    samples = _settled_idle(120, 16, start_temp=19.4, slope_per_h=0.6)
     inputs = _inputs(19.6, current=ACTION_IDLE)
     # Projection: 19.6 + 0.6/60*5 = 19.65. Even though >= low would fail,
     # the key assertion is movement = 0.05 < 0.1, so suppression must NOT
@@ -654,9 +684,7 @@ def test_passive_falls_through_when_forecast_movement_below_min() -> None:
 def test_passive_falls_through_when_idle_slope_none() -> None:
     # Fewer than SLOPE_MIN_SAMPLES idle samples -> idle_slope is None ->
     # predictor cannot evaluate passive branch -> hysteresis fires heat.
-    samples = _samples_at(
-        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=18.5, slope_per_h=6.0
-    )
+    samples = _settled_idle(120, SLOPE_MIN_SAMPLES - 1, start_temp=18.5, slope_per_h=6.0)
     inputs = _inputs(19.5, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -675,7 +703,7 @@ def test_passive_works_when_current_action_unknown() -> None:
     # 19.6 sits visibly *inside* the comfort tolerance (low - 0.5 = 19.5) so
     # the test isn't sensitive to inclusive-vs-exclusive interpretation of
     # the floor predicate.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=8.0)
+    samples = _settled_idle(120, 16, start_temp=18.5, slope_per_h=8.0)
     inputs = _inputs(19.6, current=ACTION_UNKNOWN)
     # Projection: 19.6 + 8/60*5 = 20.27 >= low (20.0); movement 0.67 >= 0.1.
     decision = _decide_from_samples(
@@ -692,7 +720,7 @@ def test_passive_cool_works_when_current_action_unknown() -> None:
     # Symmetric to the heat-side test above: hot room recovering on its own
     # while last_action is unknown. Room 23.3 sits above the band edge
     # (high=23.0) but inside the comfort tolerance (high + 0.5 = 23.5).
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=24.5, slope_per_h=-8.0)
+    samples = _settled_idle(120, 16, start_temp=24.5, slope_per_h=-8.0)
     inputs = _inputs(23.3, current=ACTION_UNKNOWN)
     # Projection: 23.3 - 8/60*5 = 22.63 <= high (23.0); movement 0.67 >= 0.1.
     decision = _decide_from_samples(
@@ -709,7 +737,7 @@ def test_passive_tolerance_zero_disables_suppression() -> None:
     # passive_tolerance=0 means even a room right at low - 0.001 won't
     # be tolerated. Provides users an "always defer to hysteresis on
     # band exits" knob for restoring pre-v0.7 behaviour.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=18.5, slope_per_h=6.0)
+    samples = _settled_idle(120, 16, start_temp=18.5, slope_per_h=6.0)
     inputs = _inputs(19.5, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -738,9 +766,7 @@ def test_falls_through_when_buffer_empty() -> None:
 
 
 def test_falls_through_when_segment_too_short() -> None:
-    samples = _samples_at(
-        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=-10.0
-    )
+    samples = _settled_idle(120, SLOPE_MIN_SAMPLES - 1, start_temp=21.0, slope_per_h=-10.0)
     inputs = _inputs(20.4, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -753,7 +779,7 @@ def test_falls_through_when_segment_too_short() -> None:
 
 
 def test_unknown_decision_when_room_is_none() -> None:
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    samples = _settled_idle(120, 16, start_temp=21.0, slope_per_h=0.0)
     decision = _decide_from_samples(
         samples,
         _inputs(None, current=ACTION_IDLE),
@@ -849,16 +875,19 @@ def test_estimate_slopes_ignores_fan_mode_in_v0_8() -> None:
     not pre-partition or the v0.7 estimator behaviour regresses.
     """
     samples = []
-    for i in range(8):
+    # Eight samples past the settle window, which the idle slope leaves out.
+    settle = IDLE_SETTLE_MINUTES * 60 // 120
+    for i in range(settle + 8):
         t = _T0 + timedelta(seconds=120 * i)
         # Alternate fan_mode every other sample — would split into 4 segments
         # if estimate_slopes did naive segmentation by (action, fan_mode).
         fan = "low" if i % 2 == 0 else "high"
         samples.append(Sample(t=t, temp=21.0 + 0.05 * i, action=ACTION_IDLE, fan_mode=fan))
     slopes = estimate_slopes(samples, now=samples[-1].t)
-    # 0.05 °C / 120 s = 0.025 °C/min = 1.5 °C/h. One slope, all 8 samples used.
+    # 0.05 °C / 120 s = 0.025 °C/min = 1.5 °C/h. One slope, all 8 settled samples used.
     assert slopes.idle is not None
-    assert slopes.sample_count == 8
+    assert slopes.idle * 60.0 == pytest.approx(1.5, abs=0.01)
+    assert slopes.sample_count_idle == 8
 
 
 # ----- serialization -----
@@ -971,7 +1000,7 @@ def test_load_samples_drops_corrupt_entries() -> None:
 def test_startup_slope_at_epsilon_treated_as_flat() -> None:
     # Build samples that yield a slope just at +epsilon (0.05 °C/h).
     # The predicate is strict `> epsilon`, so we should fall through.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.5, slope_per_h=0.05)
+    samples = _settled_idle(120, 16, start_temp=22.5, slope_per_h=0.05)
     inputs = _inputs(22.5, current=ACTION_IDLE)
     decision = _decide_from_samples(
         samples,
@@ -1013,7 +1042,7 @@ def test_per_segment_sample_counts_populated() -> None:
     cool runs and assert each per-segment count matches its run length
     while `sample_count` reflects the union.
     """
-    idle_run = _samples_at(120, 6, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.0)
+    idle_run = _settled_idle(120, 6, start_temp=21.0, slope_per_h=0.0)
     # Splice in a heat run after the idle stretch (shift timestamps so
     # they don't overlap with idle).
     heat_start_t = idle_run[-1].t + timedelta(seconds=120)
@@ -1039,7 +1068,9 @@ def test_per_segment_sample_counts_populated() -> None:
     all_samples = idle_run + heat_run + cool_run
 
     slopes = estimate_slopes(all_samples, now=all_samples[-1].t)
-    assert slopes.sample_count == 15
+    # The aggregate counts the idle run's settling lead-in too (15 samples at
+    # 120 s); the idle count is only the part behind the estimate.
+    assert slopes.sample_count == 15 + 6 + 5 + 4
     assert slopes.sample_count_idle == 6
     assert slopes.sample_count_recovery_heat == 5
     assert slopes.sample_count_recovery_cool == 4
@@ -1053,7 +1084,9 @@ def test_std_dev_near_zero_for_quantized_plateau() -> None:
     throughout the window, NOT a genuinely stable room. The slope
     can't be trusted in this regime.
     """
-    samples = _quantized_samples([(20.5, 10)], action=ACTION_IDLE, interval_s=600)
+    # Ten samples past the settle window (the first half hour's are not fitted).
+    settle = IDLE_SETTLE_MINUTES * 60 // 600
+    samples = _quantized_samples([(20.5, settle + 10)], action=ACTION_IDLE, interval_s=600)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.std_dev_idle == pytest.approx(0.0)
     assert slopes.sample_count_idle == 10
@@ -1068,7 +1101,7 @@ def test_std_dev_positive_for_clean_drift() -> None:
     """
     # -0.5 °C/h over 30 min (16 samples, 120s apart) → temp ranges over
     # ~0.25 °C. std_dev should be a sizable fraction of that range.
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=-0.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.std_dev_idle > 0.05
 
@@ -1078,9 +1111,7 @@ def test_method_none_when_segment_has_too_few_samples() -> None:
     "slope = 0 because data is flat" (wls). Important for diagnostics:
     a "none" method should not be misread as "the room is stable".
     """
-    samples = _samples_at(
-        120, SLOPE_MIN_SAMPLES - 1, action=ACTION_IDLE, start_temp=21.0, slope_per_h=0.5
-    )
+    samples = _settled_idle(120, SLOPE_MIN_SAMPLES - 1, start_temp=21.0, slope_per_h=0.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.idle is None
     assert slopes.method_idle == "none"
@@ -1094,7 +1125,7 @@ def test_method_wls_when_slope_computed() -> None:
     string field — v0.9.1 only emits "wls" or "none", but the schema
     is in place for future fallback methods.
     """
-    samples = _samples_at(120, 16, action=ACTION_IDLE, start_temp=22.0, slope_per_h=-0.5)
+    samples = _settled_idle(120, 16, start_temp=22.0, slope_per_h=-0.5)
     slopes = estimate_slopes(samples, now=samples[-1].t)
     assert slopes.method_idle == "wls"
 
@@ -1121,3 +1152,127 @@ def test_thermal_slopes_back_compat_positional_constructor() -> None:
     assert s.method_idle == "none"
     assert s.method_recovery_heat == "none"
     assert s.method_recovery_cool == "none"
+    assert s.idle_measured_at is None
+
+
+# ----- v0.19.0: idle settling -----
+
+
+def _run(
+    action: str, start: datetime, temps: list[float], *, every_min: float = 5.0
+) -> list[Sample]:
+    """`temps` as one run of `action`, `every_min` apart from `start`."""
+    return [
+        Sample(t=start + timedelta(minutes=every_min * i), temp=temp, action=action)
+        for i, temp in enumerate(temps)
+    ]
+
+
+def test_an_idle_run_straight_after_a_cool_cycle_gives_no_idle_slope() -> None:
+    """The run behind the incident's +1.49 °C/h, sample for sample: a zone on
+    apparent temperature, five minutes of cooling, then fan_only. The raw
+    temperature over these five samples moved +0.04 °C/h; what rose was the
+    humidity (58.8 -> 62.8 %) as the fan blew across the wet coil, and at
+    20 °C that is 0.08 °C of apparent temperature per point. Learned as
+    passive drift it was persisted, cached for a day, and cooled a room on a
+    5 °C night. All of it lies inside the settle window, so there is no idle
+    slope to learn -- and nothing for the coordinator to persist."""
+    cool = _run(ACTION_COOL, _T0, [21.44])
+    # 10:26:11, 10:31:04, 10:35:57, 10:37:30 (a band-ramp timer refresh), 10:40:50.
+    offsets_s = [293, 586, 879, 972, 1172]
+    idle = [
+        Sample(t=_T0 + timedelta(seconds=o), temp=temp, action=ACTION_IDLE)
+        for o, temp in zip(offsets_s, [20.888, 20.725, 20.975, 20.975, 21.174], strict=True)
+    ]
+    slopes = estimate_slopes(cool + idle, now=idle[-1].t + timedelta(seconds=293))
+    assert slopes.idle is None
+    assert slopes.method_idle == "none"
+    assert slopes.sample_count_idle == 0
+    assert slopes.idle_measured_at is None
+
+
+def test_the_idle_slope_is_fitted_from_the_settled_part_of_the_run() -> None:
+    """After a cool release the room climbs back for a while and then drifts
+    on its own. The slope is the drift; the climb is the cycle's."""
+    cool = _run(ACTION_COOL, _T0, [22.0, 21.8, 21.6, 21.4])
+    released = cool[-1].t + timedelta(minutes=5)
+    # +2 °C/h for the first half hour, then -0.3 °C/h.
+    rebound = [21.4 + 2.0 / 12 * i for i in range(6)]
+    drift = [rebound[-1] + 2.0 / 12 - 0.3 / 12 * i for i in range(7)]
+    idle = _run(ACTION_IDLE, released, rebound + drift)
+    slopes = estimate_slopes(cool + idle, now=idle[-1].t)
+    assert slopes.idle is not None
+    assert slopes.idle * 60.0 == pytest.approx(-0.3, abs=0.01)
+    assert slopes.sample_count_idle == 7
+
+
+def test_a_heat_cycles_aftermath_is_left_out_too() -> None:
+    """The mirror image, with no humidity in it: after a heat cycle the air
+    falls back toward walls the cycle did not reach, which read as a room
+    losing heat fast -- and a zone that believes that pre-heats."""
+    heat = _run(ACTION_HEAT, _T0, [19.0, 19.3, 19.6, 19.9])
+    released = heat[-1].t + timedelta(minutes=5)
+    fall = [19.9 - 1.5 / 12 * i for i in range(6)]
+    flat = [fall[-1] - 1.5 / 12] * 7
+    idle = _run(ACTION_IDLE, released, fall + flat)
+    slopes = estimate_slopes(heat + idle, now=idle[-1].t)
+    assert slopes.idle is not None
+    assert abs(slopes.idle * 60.0) < 0.01
+    # The diagnostics describe the same settled samples: flat, so no spread.
+    assert slopes.sample_count_idle == len(flat)
+    assert slopes.std_dev_idle == 0.0
+
+
+def test_a_run_whose_release_has_aged_out_is_still_left_out() -> None:
+    """Once the cycle in front of an idle run is pruned, the run starts the
+    buffer and nothing says it began at a release. Trimming only runs with a
+    visible release let exactly these back in, transient intact -- a +3.8
+    °C/h slope from ten minutes of fan_only, persisted for hours."""
+    idle = _run(ACTION_IDLE, _T0, [18.25, 18.25, 18.49, 18.81], every_min=3.3)
+    cool = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [19.0 - 0.1 * i for i in range(15)])
+    slopes = estimate_slopes(idle + cool, now=cool[-1].t)
+    assert slopes.idle is None
+    assert slopes.recovery_cool is not None
+
+
+def test_the_settle_window_is_measured_inclusively_from_the_runs_first_sample() -> None:
+    """A sample exactly IDLE_SETTLE_MINUTES after the run's first is behind the
+    estimate; one a moment earlier is not."""
+    start = _T0
+    edge = start + timedelta(minutes=IDLE_SETTLE_MINUTES)
+    settled = [edge + timedelta(minutes=5 * i) for i in range(SLOPE_MIN_SAMPLES)]
+    run = [Sample(t=start, temp=21.0, action=ACTION_IDLE)] + [
+        Sample(t=t, temp=21.0 - 0.01 * i, action=ACTION_IDLE) for i, t in enumerate(settled)
+    ]
+    slopes = estimate_slopes(run, now=settled[-1])
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
+    assert slopes.idle is not None
+
+    early = [run[0], Sample(t=edge - timedelta(seconds=1), temp=21.0, action=ACTION_IDLE)]
+    slopes = estimate_slopes(early + run[2:], now=settled[-1])
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES - 1
+    assert slopes.idle is None
+
+
+def test_idle_measured_at_is_the_newest_sample_behind_the_slope() -> None:
+    """What the coordinator stamps the persisted idle slope with: when the
+    drift was last observed -- not the buffer's newest sample, which here
+    belongs to the heat cycle that followed, and not the time of estimation."""
+    idle = _settled_idle(120, 6, start_temp=21.0, slope_per_h=-0.3)
+    heat = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=2), [20.8, 21.0, 21.2, 21.4, 21.6])
+    slopes = estimate_slopes(idle + heat, now=heat[-1].t + timedelta(minutes=3))
+    assert slopes.idle is not None
+    assert slopes.idle_measured_at == idle[-1].t
+    assert slopes.last_updated == heat[-1].t
+
+
+def test_recovery_runs_are_fitted_whole() -> None:
+    """Only idle is trimmed. A heat or cool run is the cycle itself, and MPC's
+    readiness rests on having one: a short cool run straight after idle must
+    still give a recovery slope."""
+    idle = _settled_idle(120, 6, start_temp=23.0, slope_per_h=0.5)
+    after = idle[-1].t + timedelta(minutes=2)
+    cool = _run(ACTION_COOL, after, [23.1, 22.9, 22.7, 22.5], every_min=2)
+    slopes = estimate_slopes(idle + cool, now=cool[-1].t)
+    assert slopes.recovery_cool is not None
+    assert slopes.sample_count_recovery_cool == 4

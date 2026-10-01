@@ -144,7 +144,13 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
 
     Returns None (HA "unknown") when the relevant segment has fewer than
     SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
-    first ~5-10 min after install/restart is expected to be unknown.
+    first few samples of a heat or cool run are expected to be unknown. The
+    live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
+    idle run plus four samples more (v0.19.0): about 35 minutes with a
+    sensor reporting every minute, 50 with one reporting every five, and
+    never with one reporting less often than about every 20 minutes, which
+    leaves too few samples in the hour of window that remains. Meanwhile
+    the cached idle slope is shown, if the zone has one.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);
@@ -175,11 +181,14 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # from the persisted last-good value because the live window only
             # had idle blips (MPC stays ready through a heating chase);
             # "none" = no idle slope available. `idle_slope_cached_age_min` is
-            # the age of the cached value in minutes (null unless "cached").
+            # the age of the cached value in minutes (null unless "cached") --
+            # since v0.19.0, measured from the newest sample behind it.
             # NB: when source is "cached", `method_idle` above reads "cached"
             # but the per-segment `sample_count_idle` / `std_dev_idle` still
             # describe the (sub-threshold) *live* idle samples, not the cached
-            # value — those diagnostics always reflect the current window.
+            # value — those diagnostics always reflect the current window, and
+            # since v0.19.0 only its settled part: they read 0 for the first
+            # IDLE_SETTLE_MINUTES of every idle stretch.
             "idle_slope_source": data.idle_slope_source,
             "idle_slope_cached_age_min": data.idle_slope_cached_age_min,
             "recovery_slope_heat": (

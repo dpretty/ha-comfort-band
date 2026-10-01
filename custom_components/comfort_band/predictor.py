@@ -18,7 +18,8 @@ in/out via dataclasses; `now` is injected so unit tests stay pure.
 
 Slope segmentation: three slopes per zone (idle, recovery_heat, recovery_cool),
 each computed over the most recent contiguous run of like-actioned samples in
-the buffer. Each may be None when its segment has fewer than
+the buffer -- for idle, less its first IDLE_SETTLE_MINUTES (v0.19.0; see
+`_settled`). Each may be None when its segment has fewer than
 SLOPE_MIN_SAMPLES samples or the WLS denominator is near-singular.
 
 Three projection thresholds, summarised:
@@ -47,6 +48,7 @@ from .const import (
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    IDLE_SETTLE_MINUTES,
     PASSIVE_FORECAST_MOVEMENT_MIN_C,
     SAMPLE_MAX_COUNT,
     SAMPLE_MIN_INTERVAL_S,
@@ -123,6 +125,14 @@ class ThermalSlopes:
     Defaults on the new fields preserve backward compatibility with any
     tests that construct ThermalSlopes positionally (additions at the end
     don't shift existing arg positions).
+
+    v0.19.0: the idle diagnostics (``sample_count_idle``, ``std_dev_idle``)
+    describe the settled part of the idle run -- the samples actually behind
+    ``idle`` -- so they read 0 for the first IDLE_SETTLE_MINUTES of every idle
+    stretch. ``idle_measured_at`` is when the newest of those samples was
+    taken (None whenever ``idle`` is): the coordinator stamps the persisted
+    idle slope with it, so that stamp says when the drift was observed rather
+    than when a refresh last happened to recompute it.
     """
 
     idle: float | None
@@ -140,6 +150,7 @@ class ThermalSlopes:
     method_idle: str = "none"
     method_recovery_heat: str = "none"
     method_recovery_cool: str = "none"
+    idle_measured_at: datetime | None = None
 
     def for_action(self, action: str | None) -> float | None:
         """Return the slope matching `action`, falling back to idle.
@@ -302,6 +313,35 @@ def _latest_run_of(samples: list[Sample], action: str) -> list[Sample]:
     return samples[start:end]
 
 
+def _settled(run: list[Sample]) -> list[Sample]:
+    """The part of an idle run that is passive drift rather than aftermath.
+
+    Drops every sample in the first IDLE_SETTLE_MINUTES after the run's first
+    sample. An idle run nearly always starts at the release of a heat or cool
+    cycle, and until the room has settled it moves back against that cycle --
+    after cooling, fast enough to read as warming at a couple of degrees an
+    hour. That is a fact about the cycle, not about the room: projected over
+    MPC's horizon (and, persisted, for a day after) it makes a cold night look
+    warm enough to cool against, and the next cycle's aftermath then confirms
+    it.
+
+    Measured from the run's first sample in the buffer whatever precedes it,
+    rather than only when a heat or cool sample is visibly in front. The
+    buffer cannot say what came before a run at its start: the release may
+    just have aged out -- and trimming only visible releases was measured
+    letting exactly those runs back in, the transient intact, once the cycle
+    in front of them was pruned -- or a flush may have emptied it. The price
+    is paid by a run that has idled for longer than the window: it loses its
+    oldest half hour, under 4 % of the fit's weight but about a third of its
+    leverage, so its slope is somewhat noisier (replayed over ten days of two
+    zones, such slopes moved by a median 0.03 °C/h).
+    """
+    if not run:
+        return run
+    settled_from = run[0].t + timedelta(minutes=IDLE_SETTLE_MINUTES)
+    return [s for s in run if s.t >= settled_from]
+
+
 def _wls_slope(segment: list[Sample], *, now: datetime) -> float | None:
     """Weighted-least-squares slope (°C/minute) with exponential recency weights.
 
@@ -408,8 +448,11 @@ def _reject_wrong_sign(
 def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
     """Compute per-action slopes over the most recent contiguous run of each
     action class, plus buffer bookkeeping for the sensor's attributes.
+
+    The idle run is fitted without its first IDLE_SETTLE_MINUTES (`_settled`);
+    the recovery runs are fitted whole, since the cycle is what they measure.
     """
-    idle_run = _latest_run_of(samples, ACTION_IDLE)
+    idle_run = _settled(_latest_run_of(samples, ACTION_IDLE))
     heat_run = _latest_run_of(samples, ACTION_HEAT)
     cool_run = _latest_run_of(samples, ACTION_COOL)
 
@@ -447,6 +490,7 @@ def estimate_slopes(samples: list[Sample], *, now: datetime) -> ThermalSlopes:
         method_idle=idle_method,
         method_recovery_heat=heat_method,
         method_recovery_cool=cool_method,
+        idle_measured_at=idle_run[-1].t if idle_slope is not None else None,
     )
 
 

@@ -39,6 +39,7 @@ from custom_components.comfort_band.const import (
     FALLBACK_GRACE_S,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
+    IDLE_SETTLE_MINUTES,
     ROOM_SOURCE_CLIMATE,
     ROOM_SOURCE_FALLBACK_SENSOR,
     ROOM_SOURCE_NONE,
@@ -60,6 +61,9 @@ PAST_GRACE = timedelta(seconds=FALLBACK_GRACE_S + 5)
 # request-refresh cooldown (a second request inside it is deferred, not
 # dropped) -- so consecutive waits in one test each see their refresh land.
 PAST_DEBOUNCE = timedelta(seconds=15)
+# Idle samples a test drives, one a minute, to have a live idle slope: the
+# settle window the idle slope leaves out (v0.19.0), then ten minutes of it.
+IDLE_SAMPLES = IDLE_SETTLE_MINUTES + 10
 
 _COORDINATORS: list[ZoneCoordinator] = []
 
@@ -511,14 +515,14 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     coordinator = await _enabled_zone(hass)
     await coordinator._store.async_update_zone("office", learning_enabled=True)
     _set_climate(hass, 20.0, HVAC_MODE_FAN_ONLY)
-    # Ten minutes of flat idle samples (the last digit alternates so every
+    # Forty minutes of flat idle samples (the last digit alternates so every
     # write is a state change; samples are rate-limited to one a minute).
-    for i in range(10):
+    for i in range(IDLE_SAMPLES):
         hass.states.async_set(TEMP_ENTITY, "20.0" if i % 2 == 0 else "20.02", {})
         await _settle(hass, freezer, timedelta(seconds=61))
     assert coordinator.data.decision.action == ACTION_IDLE
     assert coordinator.data.idle_slope_source == "live"
-    assert len(coordinator._samples_cache) == 10
+    assert len(coordinator._samples_cache) == IDLE_SAMPLES
 
     # The sensor dies with the unit's own reading at 15. Inside the grace
     # window the buffer is intact and still the zone's own; what it has
@@ -541,7 +545,7 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     assert coordinator.data.room_source == ROOM_SOURCE_CLIMATE
     assert coordinator.data.decision.action == ACTION_HEAT
     assert coordinator.get_zone_data()["last_action"] == ACTION_HEAT
-    assert len(coordinator._samples_cache) == 10
+    assert len(coordinator._samples_cache) == IDLE_SAMPLES
     assert coordinator.get_zone_data()["samples"] == samples_in_store
 
     # The first refresh to find the heat committed is what flushes.
@@ -572,7 +576,9 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     # slope, so MPC runs on the cached pre-outage value rather than a phantom.
     assert [s.temp for s in coordinator._samples_cache] == [21.6, 21.58]
     slopes = coordinator.data.thermal_slopes
-    assert slopes.sample_count_idle == 1, "the buffer as this refresh found it"
+    # The run this refresh found is one sample, and inside its settle window
+    # at that, so nothing is behind a live estimate.
+    assert slopes.sample_count_idle == 0
     assert slopes.sample_count_idle < SLOPE_MIN_SAMPLES
     assert coordinator.data.idle_slope_source == "cached"
     assert slopes.idle == persisted_before
@@ -689,7 +695,7 @@ async def test_the_persisted_idle_slope_stamp_does_not_advance_on_a_stand_in(
     coordinator = await _enabled_zone(hass)
     await coordinator._store.async_update_zone("office", learning_enabled=True)
     _set_climate(hass, 20.0, HVAC_MODE_FAN_ONLY)
-    for i in range(10):
+    for i in range(IDLE_SAMPLES):
         hass.states.async_set(TEMP_ENTITY, "20.0" if i % 2 == 0 else "20.02", {})
         await _settle(hass, freezer, timedelta(seconds=61))
     assert coordinator.data.idle_slope_source == "live"
@@ -704,7 +710,7 @@ async def test_the_persisted_idle_slope_stamp_does_not_advance_on_a_stand_in(
     await _settle(hass, freezer, PAST_GRACE)
     assert coordinator.data.room_source == ROOM_SOURCE_CLIMATE
     assert coordinator.data.decision.action == ACTION_IDLE
-    assert len(coordinator._samples_cache) == 10
+    assert len(coordinator._samples_cache) == IDLE_SAMPLES
     # Each refresh is past the persist throttle, so only the guard holds it.
     for reading in (20.2, 20.4, 20.6):
         _set_climate(hass, reading, HVAC_MODE_FAN_ONLY)

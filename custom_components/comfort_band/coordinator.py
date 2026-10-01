@@ -143,7 +143,8 @@ class ZoneState:
     # hysteresis run on the *live* slopes (the cache must not change reactive
     # control). `idle_slope_source` records which path produced the idle value
     # ("live" | "cached" | "none") and `idle_slope_cached_age_min` is the age
-    # (min) of the substituted value (None unless source is "cached"). Both
+    # (min) of the substituted value -- since v0.19.0, from the newest sample
+    # behind it -- and None unless source is "cached". Both
     # surface on the thermal_slope sensor so users can see when MPC is running
     # on the cached value.
     thermal_slopes: ThermalSlopes
@@ -1170,15 +1171,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         - **Live idle slope present** -> remember it (throttled write) and
           return the slopes unchanged. ``source="live"``. Not remembered
-          when ``persist_ok`` is False: the stamp has to say when the value
-          was measured, and while a stand-in drives control (v0.18.0)
-          nothing is -- the buffer is frozen, so a live slope is the
-          pre-outage one, and re-stamping it on every stand-in refresh
-          would carry it past its 24 h expiry on the strength of nothing.
+          when ``persist_ok`` is False: while a stand-in drives control
+          (v0.18.0) nothing is measured -- the buffer is frozen, so a live
+          slope is the pre-outage one. Since v0.19.0 the stamp is the
+          measurement time, so a frozen buffer can move it at most once, to
+          the newest sample it already holds when a write the throttle held
+          back catches up (see `_maybe_persist_idle_slope`). A stand-in writes
+          nothing at all, so the value it hands back is exactly the one it
+          was handed.
         - **Live idle slope absent** but a persisted one exists within
           ``PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES`` -> substitute it via
           ``dataclasses.replace`` (tagging ``method_idle="cached"``) so MPC
-          stays ready through a heating chase. ``source="cached"``, age in min.
+          stays ready through a heating chase. ``source="cached"``, with the
+          age in minutes since the newest sample behind the value.
         - **Live idle slope absent** and no usable persisted one (never
           learned, or expired) -> return unchanged. ``source="none"``. An
           expired value is cleared from storage so it can't resurface.
@@ -1196,7 +1201,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             # shadow `mpc_ready` signal — warm for zones being evaluated for MPC
             # before the user flips mpc_enabled on.
             if zone["learning_enabled"] and persist_ok:
-                await self._maybe_persist_idle_slope(slopes.idle, now_utc)
+                await self._maybe_persist_idle_slope(slopes, zone, now_utc)
             return slopes, "live", None
 
         persisted = zone["persisted_idle_slope"]
@@ -1218,23 +1223,53 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             await self._clear_persisted_idle_slope()
             return slopes, "none", None
 
-        effective = replace(slopes, idle=persisted, method_idle="cached")
+        effective = replace(
+            slopes, idle=persisted, method_idle="cached", idle_measured_at=persisted_at
+        )
         # Clamp the reported age at 0 to absorb minor clock skew (a timestamp
         # written by a slightly-ahead clock would otherwise read negative).
         return effective, "cached", round(max(0.0, age_min), 1)
 
-    async def _maybe_persist_idle_slope(self, slope: float, now_utc: datetime) -> None:
+    async def _maybe_persist_idle_slope(
+        self, slopes: ThermalSlopes, zone: StoredZone, now_utc: datetime
+    ) -> None:
         """Persist a fresh live idle slope, throttled to bound flash wear.
 
-        Writes at most once per ``SAMPLE_PERSIST_INTERVAL_S`` (mirroring the
-        sample-buffer cadence), refreshing both the value and the timestamp.
-        That keeps ``persisted_idle_slope_at`` tracking "this slope is current"
-        to within ~5 min, so the cached value's age at the start of a heating
-        chase reflects time-since-idle (when the chase began), not
-        time-since-first-observed. The first call after setup / a manual-edit
-        flush (``_last_idle_slope_persist_at is None``) writes immediately. The
-        idle rate is slow-changing, so a value up to 5 min stale is fine.
+        Stamped with when the drift was observed -- the newest sample behind
+        the value (``ThermalSlopes.idle_measured_at``) -- so the cached value's
+        age at the start of a heating chase is the time since the room was last
+        seen idling. Until v0.19.0 the stamp was this refresh's time, and a
+        slope stays live for as long as its run is in the buffer, which is not
+        the same thing as being current: a run still in the window after the
+        zone has moved on, and above all a buffer that has stopped growing, kept
+        being re-stamped as new. That is what happened when a climate entity
+        went unreachable -- every command dropped, so nothing was appended and
+        nothing aged out -- and an idle slope measured an hour and a half
+        earlier came back as the cache at "10 min old", good for another day.
+
+        Nothing is written while the newest sample behind the value is the one
+        already stored: nothing new has been measured, which is the frozen
+        buffer again. Keyed on the stamp rather than the value, because the
+        value of an unchanged run still moves -- in its last digits as the
+        recency weights are recomputed against a later ``now``, and by more
+        when the head of a run that has stopped growing is pruned -- and
+        neither is a measurement. Otherwise at most once per
+        ``SAMPLE_PERSIST_INTERVAL_S`` (mirroring the sample-buffer cadence); the
+        stamp can lag the newest sample by that much, which errs towards
+        expiring early. The first write after setup / a manual-edit flush
+        (``_last_idle_slope_persist_at is None``) is immediate. The sample
+        buffer's own writes are throttled separately, so after a restart the
+        stored stamp can be up to one interval newer than the newest sample
+        restored with the buffer, and the first write can move it back by that
+        much -- early expiry again.
         """
+        slope = slopes.idle
+        measured_at = slopes.idle_measured_at
+        if slope is None or measured_at is None:
+            return
+        stamp = measured_at.isoformat()
+        if zone["persisted_idle_slope_at"] == stamp:
+            return
         due = (
             self._last_idle_slope_persist_at is None
             or (now_utc - self._last_idle_slope_persist_at).total_seconds()
@@ -1245,7 +1280,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(
             self.zone_name,
             persisted_idle_slope=slope,
-            persisted_idle_slope_at=now_utc.isoformat(),
+            persisted_idle_slope_at=stamp,
         )
         # Advance the throttle only after the write lands (mirrors the
         # sample-persist path) so a failed write doesn't push the next attempt
