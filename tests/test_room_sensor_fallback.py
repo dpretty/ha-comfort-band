@@ -513,10 +513,10 @@ async def test_a_stand_in_cycle_does_not_bleed_into_the_idle_slope(
     exactly: idle, a router reboot's worth of stand-in heat, idle again.
 
     Since v0.20.0 a run also stops at a gap longer than SAMPLE_MAX_GAP_MINUTES,
-    which this outage is, so it would now be split without the flush too. The
-    flush still matters for an outage short enough to be spanned -- the grace
-    period and one short cycle fit inside the limit -- and what this pins is
-    that it happens."""
+    which this outage is, but the idle settle window does not: it is measured
+    from where the idle stretch began, gaps and all. So without the flush the
+    samples after hand-back -- the heat cycle's aftermath -- would still be
+    fitted as passive drift, on their own rather than joined to those before."""
     freezer.move_to("2026-09-15 08:40:00+00:00")
     coordinator = await _enabled_zone(hass)
     await coordinator._store.async_update_zone("office", learning_enabled=True)

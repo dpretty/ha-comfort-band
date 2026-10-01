@@ -365,14 +365,18 @@ def _settled(run: list[Sample], *, since: datetime) -> list[Sample]:
 
     A gap in sampling inside the stretch (v0.20.0) splits the run that is
     fitted, but not the window, which stays where the stretch began. The unit
-    was left idle on both sides of the gap, and nothing the zone commanded in
-    between could have changed that (a stand-in that changes the action
-    flushes the buffer), so there is no new release to wait out: the samples
-    after the gap are fitted as soon as there are enough of them. Restarting
-    the window at every gap was measured too. Over ten days of five zones it
-    withheld the live slope three times as long, and the slope MPC planned
-    with after an outage -- the cached one, meanwhile -- was further from what
-    the room went on to do than the joined fit had been. Once the samples
+    was left idle on both sides of the gap, and a cycle a stand-in commands in
+    between empties the buffer instead (`_flush_samples_for_stand_in`), so
+    there is normally no new release to wait out: the samples after the gap
+    are fitted as soon as there are enough of them. Not always: when
+    `set_hvac_mode` raises but the unit took the command anyway (a cloud
+    timeout), nothing is recorded while the unit runs, and the aftermath of
+    the cycle it ran is fitted as drift, as it was before v0.20.0. Restarting
+    the window at every gap would wait that out, and was measured: over ten
+    days of five zones it withheld the live slope three times as long, and the
+    slope MPC planned with after an outage -- the cached one, meanwhile --
+    was further from what the room went on to do than the joined fit had
+    been. Once the samples
     from before a long gap have left the window, though, the stretch's first
     sample is the first one after the gap, and the window starts again there.
     """

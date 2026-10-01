@@ -1392,7 +1392,7 @@ def test_once_the_samples_before_a_long_gap_age_out_the_window_starts_again() ->
 def test_two_lost_reports_are_spanned_and_three_are_not() -> None:
     """Where the limit sits, in the terms it was chosen in. A sensor reporting
     every 293 seconds, the cadence of the zones it was measured on, leaves a
-    14.6-minute gap when it loses two reports in a row, which a run spans,
+    14.7-minute gap when it loses two reports in a row, which a run spans,
     and a 19.5-minute one when it loses three, which it does not -- below the
     19.6 minutes of the one join in that history that misled."""
     cadence = timedelta(seconds=293)

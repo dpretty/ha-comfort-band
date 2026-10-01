@@ -1115,14 +1115,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         """Empty the sample buffer once a stand-in has changed the action.
 
         Nothing is sampled from a stand-in, but the cycle it commands is real:
-        the buffer simply has a gap where the heat or cool run was.
-        `predictor._latest_run_of` joins runs by action label across any gap
-        of up to SAMPLE_MAX_GAP_MINUTES -- since v0.20.0 a longer one is a
-        boundary already, but the grace period and a short cycle fit inside
-        that -- so on such a hand-back the idle samples from before the outage
-        and those after it would form one idle run spanning that cycle, and
-        the idle slope would read as strong passive warming (or cooling) --
-        which a learning zone then acts on: an anticipatory cool inside the
+        the buffer simply has a gap where the heat or cool run was, with idle
+        samples on both sides of it. A gap of up to SAMPLE_MAX_GAP_MINUTES
+        joins them into one idle run spanning that cycle; a longer one splits
+        the run (v0.20.0) but not the idle settle window, which is measured
+        from where the idle stretch began, gaps and all. Either way the
+        cycle's aftermath after hand-back would be fitted as passive drift,
+        and the idle slope would read as strong passive warming (or cooling)
+        -- which a learning zone then acts on: an anticipatory cool inside the
         deadband, or passive drift accepted in place of a heat call. Flushing
         makes the hand-back a clean segment boundary, as a sensor swap is.
 

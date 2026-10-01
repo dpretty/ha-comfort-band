@@ -6,8 +6,9 @@ for a dropped command), Home Assistant running. When any of those stops, the
 buffer simply has a hole in it -- and the predictor joined the runs either
 side of the hole by action label alone, so a slope could be fitted across an
 hour in which nothing was seen. In production on 24 Sep 2026 a cool run from
-10:45 to 11:10 was joined to a sample at 12:13 across a 63-minute climate
-outage. The unit had kept cooling, so the recovery slope was right by luck.
+10:45 to 11:10 was joined to a sample at 12:13, across the hour in which the
+climate entity was unreachable. The unit had kept cooling, so the recovery
+slope was right by luck.
 A run now stops at any gap of more than SAMPLE_MAX_GAP_MINUTES.
 
 Every test here drives an enabled zone through the real listeners, because
