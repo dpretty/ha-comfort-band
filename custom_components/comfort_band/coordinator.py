@@ -1119,7 +1119,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         samples on both sides of it. A gap of up to SAMPLE_MAX_GAP_MINUTES
         joins them into one idle run spanning that cycle; a longer one splits
         the run (v0.20.0) but not the idle settle window, which is measured
-        from where the idle stretch began, gaps and all. Either way the
+        from where the idle stretch began, gaps and all, for as long as the
+        samples from before the outage are still in the window. Either way the
         cycle's aftermath after hand-back would be fitted as passive drift,
         and the idle slope would read as strong passive warming (or cooling)
         -- which a learning zone then acts on: an anticipatory cool inside the

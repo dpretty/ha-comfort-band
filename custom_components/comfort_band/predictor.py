@@ -376,9 +376,9 @@ def _settled(run: list[Sample], *, since: datetime) -> list[Sample]:
     days of five zones it withheld the live slope three times as long, and the
     slope MPC planned with after an outage -- the cached one, meanwhile --
     was further from what the room went on to do than the joined fit had
-    been. Once the samples
-    from before a long gap have left the window, though, the stretch's first
-    sample is the first one after the gap, and the window starts again there.
+    been. Once the samples from before a long gap have left the window,
+    though, the stretch's first sample is the first one after the gap, and
+    the window starts again there.
     """
     settled_from = since + timedelta(minutes=IDLE_SETTLE_MINUTES)
     return [s for s in run if s.t >= settled_from]
