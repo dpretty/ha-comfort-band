@@ -294,6 +294,9 @@ def test_segmenting_isolates_trailing_run() -> None:
     assert slopes.idle is not None
     # idle_after is -0.02 °C / 2min = -0.6 °C/h
     assert slopes.idle * 60.0 == pytest.approx(-0.6, abs=0.05)
+    # Settled from where the trailing stretch began, not from the earlier one:
+    # only its last six samples are past the half hour.
+    assert slopes.sample_count_idle == 6
     # Heat run captured separately.
     assert slopes.recovery_heat is not None
     assert slopes.recovery_heat > 0
@@ -1240,25 +1243,19 @@ def test_a_run_whose_release_has_aged_out_is_still_left_out() -> None:
 
 def test_the_settle_window_is_measured_inclusively_from_the_runs_first_sample() -> None:
     """A sample exactly IDLE_SETTLE_MINUTES after the run's first is behind the
-    estimate; one a moment earlier is not. The settle window is filled with a
-    sample every five minutes, as a reporting sensor fills it: left empty it
-    would be a gap, and the run would start after it (v0.20.0)."""
+    estimate; one a moment earlier is not."""
     start = _T0
     edge = start + timedelta(minutes=IDLE_SETTLE_MINUTES)
-    settling = [
-        Sample(t=start + timedelta(minutes=5 * i), temp=21.0, action=ACTION_IDLE)
-        for i in range(IDLE_SETTLE_MINUTES // 5)
-    ]
     settled = [edge + timedelta(minutes=5 * i) for i in range(SLOPE_MIN_SAMPLES)]
-    run = settling + [
+    run = [Sample(t=start, temp=21.0, action=ACTION_IDLE)] + [
         Sample(t=t, temp=21.0 - 0.01 * i, action=ACTION_IDLE) for i, t in enumerate(settled)
     ]
     slopes = estimate_slopes(run, now=settled[-1])
     assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
     assert slopes.idle is not None
 
-    early = Sample(t=edge - timedelta(seconds=1), temp=21.0, action=ACTION_IDLE)
-    slopes = estimate_slopes([*settling, early, *run[len(settling) + 1 :]], now=settled[-1])
+    early = [run[0], Sample(t=edge - timedelta(seconds=1), temp=21.0, action=ACTION_IDLE)]
+    slopes = estimate_slopes(early + run[2:], now=settled[-1])
     assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES - 1
     assert slopes.idle is None
 
@@ -1366,11 +1363,12 @@ def test_an_outage_straight_after_a_release_still_waits_out_the_aftermath() -> N
     and the sensor drops out five minutes later; back twenty minutes on, the
     room is still answering the cycle, and nothing inside the stretch's first
     half hour is fitted -- however soon after the gap it was sampled."""
+    earlier = _run(ACTION_IDLE, _T0 - timedelta(minutes=30), [22.8] * 6)
     cool = _run(ACTION_COOL, _T0, [23.0, 22.8, 22.6, 22.4])
     released = cool[-1].t + timedelta(minutes=5)
     rebound = _run(ACTION_IDLE, released, [22.4, 22.6])
     after = _run(ACTION_IDLE, released + timedelta(minutes=25), [23.0, 23.3, 23.3, 23.3, 23.3])
-    slopes = estimate_slopes(_buffer(cool, rebound, after), now=after[-1].t)
+    slopes = estimate_slopes(_buffer(earlier, cool, rebound, after), now=after[-1].t)
     assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
     assert slopes.idle == pytest.approx(0.0, abs=1e-9)
 

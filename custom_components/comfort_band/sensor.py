@@ -152,9 +152,10 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
     stops at a gap in sampling longer than SAMPLE_MAX_GAP_MINUTES (v0.20.0):
     after an outage a resumed heat or cool run is unknown for its first few
     samples, and a resumed idle stretch until four samples from after the
-    outage are past its settle window. A room reading that changes less often
-    than that never gives a slope at all, heat and cool included: each of its
-    samples is a run of its own.
+    outage are past its settle window. A zone whose readings -- the room's,
+    and the humidity sensor's if it has one -- change less often than that,
+    with nothing else prompting a refresh in between, never gives a slope at
+    all, heat and cool included: each of its samples is a run of its own.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);

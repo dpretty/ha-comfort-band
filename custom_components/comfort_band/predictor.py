@@ -343,8 +343,8 @@ def _latest_run_of(
 def _settled(run: list[Sample], *, since: datetime) -> list[Sample]:
     """The part of an idle run that is passive drift rather than aftermath.
 
-    Drops every sample in the first IDLE_SETTLE_MINUTES after `since`, the
-    first sample of the idle stretch the run belongs to. An idle run nearly
+    Drops every sample in the first IDLE_SETTLE_MINUTES after `since`, when
+    the idle stretch the run belongs to began. An idle run nearly
     always starts at the release of a heat or cool cycle, and until the room
     has settled it moves back against that cycle -- after cooling, fast enough
     to read as warming at a couple of degrees an hour. That is a fact about
