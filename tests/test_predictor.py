@@ -1373,6 +1373,19 @@ def test_an_outage_straight_after_a_release_still_waits_out_the_aftermath() -> N
     assert slopes.idle == pytest.approx(0.0, abs=1e-9)
 
 
+def test_the_settle_window_is_measured_from_the_stretch_across_every_gap() -> None:
+    """From where the idle stretch began, however many gaps lie in between --
+    not from the segment before the last one. The sensor drops out twice in
+    quick succession, as it did in one of the replayed zones, and the samples
+    after the second gap are fitted as soon as there are four of them."""
+    before = _run(ACTION_IDLE, _T0, [21.0] * 13)
+    between = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=20), [20.6])
+    after = _run(ACTION_IDLE, between[-1].t + timedelta(minutes=18), [20.6] * SLOPE_MIN_SAMPLES)
+    slopes = estimate_slopes(_buffer(before, between, after), now=after[-1].t)
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
+    assert slopes.idle == pytest.approx(0.0, abs=1e-9)
+
+
 def test_once_the_samples_before_a_long_gap_age_out_the_window_starts_again() -> None:
     """The stretch's first sample is the first one the buffer still holds.
     After an hour-long outage the samples after it are fitted at once, but
