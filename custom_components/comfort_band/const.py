@@ -52,6 +52,28 @@ LOOKAHEAD_MAX: Final = 15
 SAMPLE_WINDOW_MINUTES: Final = 90
 SAMPLE_MIN_INTERVAL_S: Final = 60
 SAMPLE_MAX_COUNT: Final = 200
+# v0.20.0: the longest gap between consecutive samples that one run may span
+# (inclusive). Nothing is sampled while the room sensor is dark, while the
+# climate entity is unreachable (except in shadow mode or while a min-cycle
+# gate holds) or while Home Assistant is down, and the runs either side
+# of such a gap used to be joined by action label alone -- a slope
+# fitted across time nobody watched. A zone samples whenever its room reading
+# (or its humidity sensor, if it has one) changes, at most once a minute: every
+# 293 seconds for the battery sensors it was measured on. Ten days of five
+# zones' history put every gap inside a run with nothing dark at 14.7 minutes or
+# less -- two lost reports -- and every longer one at an outage of the room
+# sensor or the climate entity. The one join among those that misled, a room
+# that rose 0.6 °C while its sensor was dark and read as warming at 1.5 °C/h
+# against the 0.4 seen afterwards, spanned 19.6 minutes. Seventeen sits between
+# two and three lost reports from a sensor reporting every five minutes, so
+# neither lands on the edge (fifteen sits exactly on two of them). A restart's
+# gap also includes up to SAMPLE_PERSIST_INTERVAL_S of samples taken but not yet
+# written to disk, so this bounds how short a restart must be for a run to
+# survive it as well. Home Assistant passes on only a change, though, so a zone
+# whose readings change less often than this -- a coarse sensor with no humidity
+# sensor, in a steady room or a slow heat or cool cycle -- is split at every
+# quiet stretch, and such cycles get no recovery slope.
+SAMPLE_MAX_GAP_MINUTES: Final = 17
 
 # How often the coordinator persists the in-memory sample buffer. The buffer
 # is appended ~1/min (SAMPLE_MIN_INTERVAL_S), but writing the whole sample
@@ -117,7 +139,8 @@ SLOPE_MIN_SAMPLES: Final = 4
 SLOPE_WEIGHT_TAU_MINUTES: Final = 20.0
 SLOPE_EPSILON_PER_HOUR: Final = 0.05
 
-# v0.19.0: how much of the start of an idle run the idle slope leaves out. An
+# v0.19.0: how much of the start of an idle stretch the idle slope leaves out
+# (since v0.20.0, measured from where the stretch began, across any gap). An
 # idle run almost always begins at the release of a heat or cool cycle, and for
 # a while after that the room is still answering the cycle rather than drifting:
 # the air relaxes back toward furniture and walls the cycle never reached, and

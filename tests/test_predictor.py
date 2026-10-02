@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from custom_components.comfort_band import predictor
 from custom_components.comfort_band.const import (
     ACTION_COOL,
     ACTION_HEAT,
@@ -16,6 +18,7 @@ from custom_components.comfort_band.const import (
     HVAC_MODE_HEAT,
     IDLE_SETTLE_MINUTES,
     SAMPLE_MAX_COUNT,
+    SAMPLE_MAX_GAP_MINUTES,
     SAMPLE_MIN_INTERVAL_S,
     SAMPLE_WINDOW_MINUTES,
     SLOPE_MIN_SAMPLES,
@@ -291,6 +294,9 @@ def test_segmenting_isolates_trailing_run() -> None:
     assert slopes.idle is not None
     # idle_after is -0.02 °C / 2min = -0.6 °C/h
     assert slopes.idle * 60.0 == pytest.approx(-0.6, abs=0.05)
+    # Settled from where the trailing stretch began, not from the earlier one:
+    # only its last six samples are past the half hour.
+    assert slopes.sample_count_idle == 6
     # Heat run captured separately.
     assert slopes.recovery_heat is not None
     assert slopes.recovery_heat > 0
@@ -1276,3 +1282,202 @@ def test_recovery_runs_are_fitted_whole() -> None:
     slopes = estimate_slopes(idle + cool, now=cool[-1].t)
     assert slopes.recovery_cool is not None
     assert slopes.sample_count_recovery_cool == 4
+
+
+# ----- v0.20.0: a run never spans a gap in sampling -----
+
+
+def _buffer(*runs: list[Sample]) -> list[Sample]:
+    """`runs` as the coordinator's buffer holds them: appended in order, so
+    whatever has fallen out of the window by the last one has been pruned."""
+    out: list[Sample] = []
+    for run in runs:
+        for s in run:
+            out, appended = append_sample(out, now=s.t, temp=s.temp, action=s.action)
+            assert appended
+    return out
+
+
+def test_a_cool_run_restarts_after_a_gap_in_sampling() -> None:
+    """The production case behind this: a cool run from 10:45 to 11:10, the
+    climate entity unreachable for an hour -- every command dropped, so
+    nothing sampled -- and the first sample after it at 12:13. Joined, the
+    recovery slope was fitted across the hour as if it had been watched. The
+    unit had in fact kept cooling, so the value came out right; nothing in the
+    buffer could have said so. After the gap the run starts again."""
+    before = _run(
+        ACTION_COOL,
+        datetime(2026, 9, 24, 10, 45, tzinfo=UTC),
+        [23.0, 22.9, 22.8, 22.7, 22.6, 22.5],
+    )
+    after = _run(ACTION_COOL, datetime(2026, 9, 24, 12, 13, tzinfo=UTC), [21.24])
+    slopes = estimate_slopes(_buffer(before, after), now=after[-1].t)
+    assert slopes.sample_count_recovery_cool == 1
+    assert slopes.recovery_cool is None
+    assert slopes.method_recovery_cool == "none"
+
+
+def test_after_a_gap_the_recovery_slope_is_fitted_from_what_was_seen_after_it() -> None:
+    """The same outage, where the unit did not keep cooling: it lost power
+    with the network, and its auto-restart brought it back in `cool` an hour
+    later with the room a degree warmer. Joined, the run's two halves describe
+    two different hours, and the fit across them is no cooling rate at all:
+    here it came out rising, so it was rejected as sign-wrong, then too
+    shallow, until the samples from before the gap had aged out -- half an
+    hour without a usable recovery slope. Fitted from what was seen after the
+    gap, it is the rate the unit is cooling at by the fourth sample."""
+    before = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    after = _run(ACTION_COOL, before[-1].t + timedelta(minutes=63), [23.5, 23.4, 23.3, 23.2])
+    slopes = estimate_slopes(_buffer(before, after), now=after[-1].t)
+    assert slopes.sample_count_recovery_cool == 4
+    assert slopes.recovery_cool is not None
+    assert slopes.recovery_cool * 60.0 == pytest.approx(-1.2, abs=0.01)
+
+
+def test_an_idle_run_that_resumes_after_a_gap_is_fitted_from_what_came_after() -> None:
+    """The idle half. An hour of level idle; the room sensor drops off its
+    mesh for 25 minutes; it comes back 0.6 °C lower -- the evening came on, or
+    a door was left open -- and the room holds there. Joined, the run's
+    settled part reached back across the gap, and the two levels fitted as the
+    room falling at up to 0.9 °C/h, a drift it showed on neither side of the
+    gap, fading over the next forty minutes. Split, the samples after the gap
+    are fitted on their own as soon as there are enough of them: the stretch
+    was idle on both sides of the gap and long past its settle window."""
+    before = _run(ACTION_IDLE, _T0, [21.0] * 13)
+    after = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=25), [20.4] * SLOPE_MIN_SAMPLES)
+    slopes = estimate_slopes(_buffer(before, after[:1]), now=after[0].t)
+    assert slopes.idle is None
+    assert slopes.sample_count_idle == 1
+    assert slopes.idle_measured_at is None
+
+    slopes = estimate_slopes(_buffer(before, after), now=after[-1].t)
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
+    assert slopes.idle is not None
+    assert slopes.idle == pytest.approx(0.0, abs=1e-9)
+    assert slopes.idle_measured_at == after[-1].t
+
+
+def test_an_outage_straight_after_a_release_still_waits_out_the_aftermath() -> None:
+    """A gap splits the run that is fitted but not the settle window, which
+    is measured from where the idle stretch began. A cool cycle is released
+    and the sensor drops out five minutes later; back twenty minutes on, the
+    room is still answering the cycle, and nothing inside the stretch's first
+    half hour is fitted -- however soon after the gap it was sampled."""
+    earlier = _run(ACTION_IDLE, _T0 - timedelta(minutes=30), [22.8] * 6)
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.8, 22.6, 22.4])
+    released = cool[-1].t + timedelta(minutes=5)
+    rebound = _run(ACTION_IDLE, released, [22.4, 22.6])
+    after = _run(ACTION_IDLE, released + timedelta(minutes=25), [23.0, 23.3, 23.3, 23.3, 23.3])
+    slopes = estimate_slopes(_buffer(earlier, cool, rebound, after), now=after[-1].t)
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
+    assert slopes.idle == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_settle_window_is_measured_from_the_stretch_across_every_gap() -> None:
+    """From where the idle stretch began, however many gaps lie in between --
+    not from the segment before the last one. The sensor drops out twice in
+    quick succession, as it did in one of the replayed zones, and the samples
+    after the second gap are fitted as soon as there are four of them."""
+    before = _run(ACTION_IDLE, _T0, [21.0] * 13)
+    between = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=20), [20.6])
+    after = _run(ACTION_IDLE, between[-1].t + timedelta(minutes=20), [20.6] * SLOPE_MIN_SAMPLES)
+    slopes = estimate_slopes(_buffer(before, between, after), now=after[-1].t)
+    assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
+    assert slopes.idle == pytest.approx(0.0, abs=1e-9)
+
+
+def test_once_the_samples_before_a_long_gap_age_out_the_window_starts_again() -> None:
+    """The stretch's first sample is the first one the buffer still holds.
+    After an hour-long outage the samples after it are fitted at once, but
+    when the last sample from before it leaves the window the stretch starts
+    after the gap, and so does the settle window: the slope drops out until
+    four samples are past it again."""
+    before = _run(ACTION_IDLE, _T0, [21.0] * 13)
+    after = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=60), [20.4] * 10)
+    for n, expected in ((4, 4), (8, 2), (10, 4)):
+        slopes = estimate_slopes(_buffer(before, after[:n]), now=after[n - 1].t)
+        assert slopes.sample_count_idle == expected, n
+        assert (slopes.idle is not None) is (expected >= SLOPE_MIN_SAMPLES), n
+
+
+def test_two_lost_reports_are_spanned_and_three_are_not() -> None:
+    """Where the limit sits, in the terms it was chosen in. A sensor reporting
+    every 293 seconds, the cadence of the zones it was measured on, leaves a
+    14.7-minute gap when it loses two reports in a row, which a run spans,
+    and a 19.5-minute one when it loses three, which it does not -- below the
+    19.6 minutes of the one join in that history that misled."""
+    cadence = timedelta(seconds=293)
+    for lost, expected in ((2, 4), (3, 2)):
+        before = [
+            Sample(t=_T0 + cadence * i, temp=23.0 - 0.1 * i, action=ACTION_COOL) for i in range(2)
+        ]
+        resumed = before[-1].t + cadence * (lost + 1)
+        after = [
+            Sample(t=resumed + cadence * i, temp=22.5 - 0.1 * i, action=ACTION_COOL)
+            for i in range(2)
+        ]
+        slopes = estimate_slopes(before + after, now=after[-1].t)
+        assert slopes.sample_count_recovery_cool == expected, lost
+
+
+def test_a_gap_of_exactly_the_limit_is_still_spanned() -> None:
+    """Inclusive, like the settle window: the limit is the longest gap a run
+    may span, and anything longer starts a new one."""
+    before = _run(ACTION_COOL, _T0, [23.0, 22.9])
+    limit = timedelta(minutes=SAMPLE_MAX_GAP_MINUTES)
+    for gap, expected in ((limit, 4), (limit + timedelta(seconds=1), 2)):
+        after = _run(ACTION_COOL, before[-1].t + gap, [22.7, 22.6])
+        slopes = estimate_slopes(before + after, now=after[-1].t)
+        assert slopes.sample_count_recovery_cool == expected, gap
+
+
+def test_a_gap_between_two_actions_shortens_neither_run() -> None:
+    """Only a run carrying on across a gap is cut short. Here the outage ends
+    with the zone idle, so the cool cycle before it is still a whole, watched
+    cycle: its slope stands, and with it MPC's readiness."""
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    idle = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=63), [21.6])
+    slopes = estimate_slopes(_buffer(cool, idle), now=idle[-1].t)
+    assert slopes.sample_count_recovery_cool == 6
+    assert slopes.recovery_cool is not None
+    assert slopes.recovery_cool * 60.0 == pytest.approx(-1.2, abs=0.01)
+
+
+def test_a_buffer_with_no_gap_past_the_limit_is_estimated_exactly_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split costs a zone that never loses sight of its room nothing.
+    Buffers built the way a zone builds them -- a sensor reporting about every
+    five minutes, a report lost now and then, heat, cool and idle in runs of
+    their own lengths -- are estimated field for field as they were before the
+    split, at every refresh, so long as no two consecutive samples are further
+    apart than the limit."""
+    limit = timedelta(minutes=SAMPLE_MAX_GAP_MINUTES)
+    # The patch below has to reach the run finder, or every comparison is
+    # between the split and itself and passes whatever the split does.
+    gapped = _run(ACTION_COOL, _T0, [23.0, 22.9]) + _run(
+        ACTION_COOL, _T0 + timedelta(minutes=5) + 2 * limit, [22.7, 22.6]
+    )
+    with monkeypatch.context() as m:
+        m.setattr(predictor, "SAMPLE_MAX_GAP_MINUTES", 10**6)
+        joined_gapped = estimate_slopes(gapped, now=gapped[-1].t)
+    assert joined_gapped != estimate_slopes(gapped, now=gapped[-1].t)
+
+    rng = random.Random(20260924)
+    trend = {ACTION_IDLE: -0.2 / 60, ACTION_HEAT: 2.0 / 60, ACTION_COOL: -1.5 / 60}
+    for _ in range(200):
+        buffer: list[Sample] = []
+        t, temp, action = _T0, 21.0, ACTION_IDLE
+        for _ in range(60):
+            lost = rng.choices((0, 1, 2), weights=(85, 12, 3))[0]
+            step = min(timedelta(minutes=(lost + 1) * rng.uniform(4.5, 5.0)), limit)
+            t += step
+            temp += trend[action] * step.total_seconds() / 60.0 + rng.gauss(0.0, 0.03)
+            if rng.random() < 0.15:
+                action = rng.choice([a for a in trend if a != action])
+            buffer, _ = append_sample(buffer, now=t, temp=round(temp, 2), action=action)
+            split = estimate_slopes(buffer, now=t)
+            with monkeypatch.context() as m:
+                m.setattr(predictor, "SAMPLE_MAX_GAP_MINUTES", 10**6)
+                joined = estimate_slopes(buffer, now=t)
+            assert split == joined
