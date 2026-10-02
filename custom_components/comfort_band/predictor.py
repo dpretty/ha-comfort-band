@@ -308,7 +308,8 @@ def _latest_run_of(
     Contiguous in time as well as in label (v0.20.0): the run stops at the
     first gap of more than SAMPLE_MAX_GAP_MINUTES between consecutive
     samples. Nothing is sampled while the room sensor is dark, while the
-    climate entity is unreachable (a dropped command appends nothing), or
+    climate entity is unreachable (a dropped command appends nothing;
+    only shadow mode and the min-cycle gates sample on regardless), or
     while Home Assistant is down, so the samples either side of such a gap
     were otherwise joined into one run spanning time nobody observed -- and
     the fit across it is set by whatever happened in the gap. Its two

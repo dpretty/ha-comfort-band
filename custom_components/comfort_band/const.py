@@ -54,8 +54,9 @@ SAMPLE_MIN_INTERVAL_S: Final = 60
 SAMPLE_MAX_COUNT: Final = 200
 # v0.20.0: the longest gap between consecutive samples that one run may span
 # (inclusive). Nothing is sampled while the room sensor is dark, while the
-# climate entity is unreachable or while Home Assistant is down, and the runs
-# either side of such a gap used to be joined by action label alone -- a slope
+# climate entity is unreachable (except in shadow mode or while a min-cycle
+# gate holds) or while Home Assistant is down, and the runs either side
+# of such a gap used to be joined by action label alone -- a slope
 # fitted across time nobody watched. A zone samples whenever its room reading
 # (or its humidity sensor, if it has one) changes, at most once a minute: every
 # 293 seconds for the battery sensors it was measured on. Ten days of five

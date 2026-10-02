@@ -1380,7 +1380,7 @@ def test_the_settle_window_is_measured_from_the_stretch_across_every_gap() -> No
     after the second gap are fitted as soon as there are four of them."""
     before = _run(ACTION_IDLE, _T0, [21.0] * 13)
     between = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=20), [20.6])
-    after = _run(ACTION_IDLE, between[-1].t + timedelta(minutes=18), [20.6] * SLOPE_MIN_SAMPLES)
+    after = _run(ACTION_IDLE, between[-1].t + timedelta(minutes=20), [20.6] * SLOPE_MIN_SAMPLES)
     slopes = estimate_slopes(_buffer(before, between, after), now=after[-1].t)
     assert slopes.sample_count_idle == SLOPE_MIN_SAMPLES
     assert slopes.idle == pytest.approx(0.0, abs=1e-9)
