@@ -650,14 +650,14 @@ def carry_over_recovery_slopes(
     was fitted, and the run's own is judged from the refresh it takes over.
     Once the run has ended its own fit stands, as before (see `_too_young`).
     At a five-minute cadence four samples normally span about fifteen minutes,
-    so this rarely matters there -- twice in ten days of five zones' history,
-    when extra samples gave a running cycle four inside ten minutes. A unit
-    still not moving the room once the span is up loses the cycle then, as it
-    did at the fourth minute before. It also ends, as a gap in sampling would
-    end it, when a run still running has had no sample for longer than
-    SAMPLE_MAX_GAP_MINUTES: the next sample would start a resumed run, which
-    borrows nothing, and until then the run cannot grow out of its youth (see
-    `_previous_cycle_slope`).
+    so this rarely matters there: in ten days of five zones' history, extra
+    samples gave a running cycle four inside ten minutes four times, and two
+    of those changed a decision. A unit still not moving the room once the
+    span is up loses the cycle then, as it did at the fourth minute before. It
+    also ends, as a gap in sampling would end it, when a run still running has
+    had no sample for longer than SAMPLE_MAX_GAP_MINUTES: the next sample
+    would start a resumed run, which borrows nothing, and until then the run
+    cannot grow out of its youth (see `_previous_cycle_slope`).
 
     Nothing outlives the buffer: the previous cycle is one the buffer still
     holds, which is pruned to the 90-minute window as samples are appended.

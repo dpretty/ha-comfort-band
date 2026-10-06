@@ -143,8 +143,9 @@ SLOPE_EPSILON_PER_HOUR: Final = 0.05
 # how many samples it needs, before its own fit replaces the previous cycle's
 # slope MPC borrowed for it (`predictor.carry_over_recovery_slopes`). Four
 # samples take fifteen minutes at the five-minute cadence of a battery sensor,
-# so this rarely matters there (twice in ten days of five zones' history, when
-# extra samples gave a running cycle four inside ten minutes); at a sample a
+# so this rarely matters there (in ten days of five zones' history, extra
+# samples gave a running cycle four inside ten minutes four times, and two of
+# those changed a decision); at a sample a
 # minute they take three, which is less than many units need to move the room at
 # all: a slow unit's fit that early came out the wrong way round and lost MPC
 # the cycle. Only a run still running waits: an ended run's fit stands.

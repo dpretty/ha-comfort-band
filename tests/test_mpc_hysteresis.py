@@ -10,9 +10,10 @@ slope at all. The headline pair below runs one zone through both.
 
 Every test drives an enabled zone through the real listeners. The room answers
 what the unit was last told, `lag` reports late, so the zone closes its own
-loop as in production. v0.21.0's behaviour is the same code with the two
-v0.22.0 changes taken out (`_as_v021`): the hold in `mpc.plan`, which keys on
-`ThermalSlopes.carried_over`, and the carry-over's minimum span.
+loop as in production. v0.21.0's behaviour is the same code with the hold in
+`mpc.plan` (which keys on `ThermalSlopes.carried_over`) and the carry-over's
+minimum span taken out (`_as_v021`). The gap rule stays in, but never binds in
+those runs: a sample comes every report.
 """
 
 from __future__ import annotations
@@ -201,7 +202,7 @@ async def _zone(hass: HomeAssistant, *, mpc: bool = True, name: str = "office") 
 
 @contextmanager
 def _as_v021() -> Iterator[None]:
-    """The same code with v0.22.0's two changes taken out: MPC no longer sees
+    """The same code with v0.22.0's hold and span taken out: MPC no longer sees
     which slopes are borrowed, so it holds nothing, and a young run's own fit
     replaces the borrowed one as soon as it has the samples for one."""
     with (
@@ -455,7 +456,8 @@ async def test_a_cycle_held_while_its_commands_raise_is_let_go(
     and then flipping between cool and idle there, refresh after refresh.
     Once the run has had no sample for longer than a gap in sampling, it
     borrows nothing (as a run resumed after that gap would not), MPC is no
-    longer ready, and the reactive path lets the room back into its band."""
+    longer ready, and the reactive path lets the room warm back up through its
+    band."""
     freezer.move_to("2026-09-24 12:00:00+00:00")
     coordinator = await _zone(hass)
     room = _Room(
