@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 
 import pytest
 
-from custom_components.comfort_band import predictor
+from custom_components.comfort_band import hysteresis, mpc, predictor
 from custom_components.comfort_band.const import (
     ACTION_COOL,
     ACTION_HEAT,
@@ -23,7 +25,9 @@ from custom_components.comfort_band.const import (
     SAMPLE_MAX_GAP_MINUTES,
     SAMPLE_MIN_INTERVAL_S,
     SAMPLE_WINDOW_MINUTES,
+    SLOPE_EPSILON_PER_HOUR,
     SLOPE_MIN_SAMPLES,
+    SLOPE_WEIGHT_TAU_MINUTES,
 )
 from custom_components.comfort_band.hysteresis import (
     HysteresisDecision,
@@ -1986,3 +1990,175 @@ def test_at_a_sample_a_minute_only_young_runs_borrow() -> None:
             assert planned == expected
     # Not vacuous: the span sets aside fits of the young run's own.
     assert replaced_a_fit > 100
+
+
+# ----- v0.22.1: a run of one reading fits exactly flat -----
+
+
+def _flat_times(rng: random.Random) -> list[datetime]:
+    """When a run's samples were taken: four to eight of them, a minute or a
+    battery sensor's five apart, with the jitter a zone's refreshes have."""
+    count = rng.randint(SLOPE_MIN_SAMPLES, 8)
+    every = rng.choice((60.0, 293.0, 300.0)) + rng.uniform(-5.0, 5.0)
+    start = _T0 + timedelta(seconds=rng.uniform(0.0, 86400.0))
+    return [start + timedelta(seconds=every * i + rng.uniform(0.0, 3.0)) for i in range(count)]
+
+
+def test_a_run_of_one_reading_fits_exactly_flat_at_every_refresh() -> None:
+    """A recovery run whose readings are all the same -- a sensor reporting
+    unchanged values, or refreshes on humidity with apparent temperature off
+    -- fits 0 in exact arithmetic. In floating point it fitted the rounding
+    left between two equal products, about 1e-15 °C/min either way, with its
+    sign set by the weights and so by `now`: the sign guard discarded the run
+    at one refresh and let it through at the next. Fitted relative to its
+    first reading it is exactly 0 at every refresh, and the guard discards it
+    every time."""
+    rng = random.Random(20261007)
+    fields = {ACTION_HEAT: "recovery_heat", ACTION_COOL: "recovery_cool"}
+    for _ in range(300):
+        times = _flat_times(rng)
+        temp = round(rng.uniform(16.0, 26.0), rng.choice((1, 2, 3)))
+        for action, field in fields.items():
+            run = [Sample(t=t, temp=temp, action=action) for t in times]
+            for k in range(10):
+                now = times[-1] + timedelta(seconds=30 * k)
+                assert predictor._wls_slope(run, now=now) == 0.0
+                slopes = estimate_slopes(run, now=now)
+                assert getattr(slopes, field) is None
+                assert getattr(slopes, f"method_{field}") == "rejected"
+                assert getattr(slopes, f"sample_count_{field}") == len(run)
+
+
+def test_an_idle_run_of_one_reading_reads_exactly_flat() -> None:
+    """Idle keeps both signs, so a flat idle run is not discarded: it is
+    measured as what it is, a room holding still, rather than as +/-1e-15."""
+    samples = _settled_idle(120, 8, start_temp=20.37, slope_per_h=0.0)
+    for k in range(10):
+        slopes = estimate_slopes(samples, now=samples[-1].t + timedelta(seconds=30 * k))
+        assert slopes.idle == 0.0
+        assert slopes.method_idle == "wls"
+
+
+def _exact_wls_slope(segment: list[Sample], *, now: datetime) -> Fraction:
+    """The fit `_wls_slope` makes, worked in exact arithmetic on the same
+    weights and with the readings as they come."""
+    t_oldest = segment[0].t
+    s_w = s_wx = s_wy = s_wxx = s_wxy = Fraction(0)
+    for sample in segment:
+        x = Fraction((sample.t - t_oldest).total_seconds() / 60.0)
+        y = Fraction(sample.temp)
+        age_min = max((now - sample.t).total_seconds() / 60.0, 0.0)
+        w = Fraction(math.exp(-age_min / SLOPE_WEIGHT_TAU_MINUTES))
+        s_w += w
+        s_wx += w * x
+        s_wy += w * y
+        s_wxx += w * x * x
+        s_wxy += w * x * y
+    return (s_w * s_wxy - s_wx * s_wy) / (s_w * s_wxx - s_wx * s_wx)
+
+
+def test_fitting_relative_to_the_first_reading_leaves_the_slope_as_it_was() -> None:
+    """Moving every reading by the same amount moves the line, not its slope;
+    only the rounding changes. Runs a zone fits -- a minute or five apart, a
+    trend of either sign and none, readings to two decimals -- come out as
+    the same fit worked exactly with the readings as they come, to well
+    inside anything a decision could notice. (Replayed over ten days of five
+    zones' history, the largest change was 3e-13 °C/h, and no decision,
+    readiness or method changed.)"""
+    rng = random.Random(20261008)
+    for _ in range(300):
+        count = rng.randint(SLOPE_MIN_SAMPLES, 40)
+        every = rng.choice((60.0, 293.0, 300.0))
+        trend = rng.choice((-2.4, -0.3, 0.0, 0.05, 1.8)) / 60.0
+        temp = rng.uniform(16.0, 26.0)
+        run = []
+        for i in range(count):
+            temp += trend * every / 60.0 + rng.gauss(0.0, 0.02)
+            t = _T0 + timedelta(seconds=every * i)
+            run.append(Sample(t=t, temp=round(temp, 2), action=ACTION_HEAT))
+        now = run[-1].t + timedelta(seconds=rng.uniform(0.0, 300.0))
+        slope = predictor._wls_slope(run, now=now)
+        assert slope is not None
+        assert slope == pytest.approx(float(_exact_wls_slope(run, now=now)), rel=1e-9, abs=1e-15)
+
+
+def test_a_change_of_reading_too_small_for_the_predictor_is_still_a_slope() -> None:
+    """The guard did not gain a margin. A run that moved at all is fitted the
+    right way round however slowly it moved -- here 0.001 °C in fifteen
+    minutes, under a tenth of the predictor's flatness threshold -- and kept:
+    the smallest recovery fit in ten days of five zones' history was 0.005
+    °C/h, and these are measurements, not rounding. See `_reject_wrong_sign`
+    for why the threshold was not taken."""
+    for action, temps, field in (
+        (ACTION_HEAT, [18.9, 18.9, 18.9, 18.901], "recovery_heat"),
+        (ACTION_COOL, [24.6, 24.6, 24.6, 24.599], "recovery_cool"),
+    ):
+        run = _run(action, _T0, temps)
+        slopes = estimate_slopes(run, now=run[-1].t)
+        slope = getattr(slopes, field)
+        assert getattr(slopes, f"method_{field}") == "wls"
+        assert slope is not None
+        assert 0.0 < abs(slope * 60.0) < SLOPE_EPSILON_PER_HOUR / 10
+
+
+def test_a_flat_cycle_lends_nothing_to_the_next() -> None:
+    """v0.21.0 carries the previous cycle's slope over a cycle too young for
+    its own, through the sign guard. A previous cycle of one reading lent its
+    rounding at the refreshes where that came out the right way round, and
+    MPC planned the new cycle as one that holds the room where it is. It now
+    lends nothing at any refresh."""
+    flat = _run(ACTION_HEAT, _T0, [18.9] * 5)
+    idle = _run(ACTION_IDLE, flat[-1].t + timedelta(minutes=5), [18.9] * 3)
+    new = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [18.9])
+    buffer = _buffer(flat, idle, new)
+    for k in range(40):
+        planned = _planned(buffer, new[-1].t + timedelta(seconds=7 * k + 1))
+        assert planned.recovery_heat is None
+        assert planned.method_recovery_heat == "none"
+
+
+@pytest.mark.parametrize(
+    ("current", "room", "latest"),
+    [
+        # A heat cycle whose own run is flat and old enough to stand: v0.22.0
+        # released it at 9 of these 40 refreshes, 0.3 °C below the band.
+        (ACTION_HEAT, 18.9, [18.9] * 4),
+        # Idle below the band, after a flat heat cycle: v0.22.0 stayed idle at
+        # 13 of the 40, where hysteresis heats.
+        (ACTION_IDLE, 18.85, []),
+    ],
+    ids=["flat-own-run", "flat-cycle-before"],
+)
+def test_mpc_does_not_leave_a_room_below_its_band_on_a_flat_heat_run(
+    current: str, room: float, latest: list[float]
+) -> None:
+    """The finding's room: 19.2-21.0 °C, a heat run of one reading, and an idle
+    drift upwards. Planned as a unit that holds the room where it is, heating
+    scores no time in band, and nor does an hour of idling -- but idling ends
+    nearer the band, so MPC idled below it whenever the rounding came out
+    positive. Now heating has no slope, MPC is not ready, and the predictor
+    heats at every refresh."""
+    flat = _run(ACTION_HEAT, _T0, [18.9] * 5)
+    idle = _run(ACTION_IDLE, flat[-1].t + timedelta(minutes=5), [18.9] * 3)
+    new = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), latest)
+    buffer = _buffer(flat, idle, new)
+    inputs = HysteresisInputs(
+        room=room,
+        low=19.2,
+        high=21.0,
+        deadband_below=0.3,
+        deadband_above=0.5,
+        current_action=current,
+    )
+    hyst = hysteresis.decide(inputs)
+    assert hyst == heat_decision(19.2)
+    for k in range(40):
+        now = buffer[-1].t + timedelta(seconds=7 * k + 1)
+        live = estimate_slopes(buffer, now=now)
+        planned = replace(_planned(buffer, now), idle=0.3 / 60)
+        pred = decide(
+            live, inputs, lookahead_minutes=5, passive_tolerance=0.5, hysteresis_decision=hyst
+        )
+        assert planned.recovery_heat is None
+        assert not mpc.is_ready(planned)
+        assert mpc.plan(planned, inputs, horizon_minutes=60, predictor_decision=pred) == hyst

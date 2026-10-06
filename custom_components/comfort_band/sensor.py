@@ -222,7 +222,8 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # unreliable, regardless of sample count). `method_*` records
             # which estimator produced the slope: "wls", "none", "cached"
             # (idle only — the v0.12 persisted-slope fallback), "rejected"
-            # (recovery only — v0.15 sign guard discarded a wrong-sign fit),
+            # (recovery only — v0.15 sign guard discarded a wrong-sign fit, or
+            # since v0.22.1 the exactly-flat fit of a run of one reading),
             # or "previous" (recovery only — v0.21 carried the previous cycle's
             # slope over a cycle too young for its own; the per-segment count
             # and spread still describe that young run, as they do the live
