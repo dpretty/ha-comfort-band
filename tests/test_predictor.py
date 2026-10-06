@@ -14,6 +14,7 @@ from custom_components.comfort_band.const import (
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    CARRY_OVER_MIN_SPAN_MINUTES,
     HVAC_MODE_COOL,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
@@ -1535,11 +1536,13 @@ def test_a_new_cycle_plans_with_the_previous_one_until_it_can_be_fitted(
 
 
 def test_a_new_cycle_long_enough_to_fit_keeps_its_own_verdict() -> None:
-    """The v0.15.0 sign guard is untouched. A new run that can be fitted is
-    never replaced -- not even when the guard has discarded its fit, with a
-    clean cycle earlier in the buffer: the unit has started heating and the
-    room has not answered yet, and the guard's response to that (no slope,
-    so the reactive predictor heats a room below its band) stands."""
+    """The v0.15.0 sign guard is untouched. A new run that can be fitted, and
+    has been watched for CARRY_OVER_MIN_SPAN_MINUTES (as four samples at this
+    cadence have), is never replaced -- not even when the guard has discarded
+    its fit, with a clean cycle earlier in the buffer: the unit has started
+    heating and the room has not answered yet, and the guard's response to
+    that (no slope, so the reactive predictor heats a room below its band)
+    stands."""
     heat = _run(ACTION_HEAT, _T0, [19.0, 19.15, 19.3, 19.45, 19.6])
     idle = _run(ACTION_IDLE, heat[-1].t + timedelta(minutes=5), [19.55, 19.5, 19.45])
     lagging = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [19.4, 19.38, 19.37, 19.36])
@@ -1806,3 +1809,180 @@ def test_carrying_over_only_ever_fills_a_young_cycles_missing_slope() -> None:
             assert planned == expected
     # Not vacuous: young cycles with an earlier one to carry over from are common.
     assert carried > 500
+
+
+# ----- v0.22.0: a young run's own fit waits out a minimum span -----
+
+
+def _fast_cycle(temps: list[float], action: str = ACTION_COOL) -> tuple[list[Sample], list[Sample]]:
+    """A five-minute `action` cycle that can be fitted (1.2 °C/h the right way
+    round) and the idle after it, then -- in the second list -- a new run of
+    `action` sampled every minute with `temps`."""
+    sign = 1.0 if action == ACTION_HEAT else -1.0
+    earlier = _run(action, _T0, [22.0 + sign * 0.1 * i for i in range(6)])
+    end = earlier[-1].temp
+    idle = _run(ACTION_IDLE, earlier[-1].t + timedelta(minutes=5), [end, end - sign * 0.05])
+    young = _run(action, idle[-1].t + timedelta(minutes=5), temps, every_min=1.0)
+    return _buffer(earlier, idle), young
+
+
+@pytest.mark.parametrize("action", [ACTION_COOL, ACTION_HEAT])
+@pytest.mark.parametrize("wrong_way", [True, False], ids=["wrong-way-fit", "right-way-fit"])
+def test_a_fast_young_run_borrows_until_it_has_been_watched_long_enough(
+    action: str, wrong_way: bool
+) -> None:
+    """At a sample a minute a new run has the four samples a fit needs three
+    minutes in, before many units have moved the room at all. Its own fit --
+    the wrong way round, or the right way -- does not replace the borrowed
+    slope until the run has been watched for CARRY_OVER_MIN_SPAN_MINUTES;
+    then it does, whatever the guard makes of it."""
+    field = "recovery_heat" if action == ACTION_HEAT else "recovery_cool"
+    method = f"method_{field}"
+    sign = 1.0 if action == ACTION_HEAT else -1.0
+    step = -sign * 0.01 if wrong_way else sign * 0.06
+    before, young = _fast_cycle(
+        [22.6 + step * i for i in range(CARRY_OVER_MIN_SPAN_MINUTES + 1)], action
+    )
+    for n in range(SLOPE_MIN_SAMPLES, len(young) + 1):
+        buffer = before + young[:n]
+        now = buffer[-1].t
+        live = estimate_slopes(buffer, now=now)
+        assert getattr(live, method) == ("rejected" if wrong_way else "wls")
+        planned = carry_over_recovery_slopes(live, buffer, now=now)
+        if n <= CARRY_OVER_MIN_SPAN_MINUTES:
+            carried = getattr(planned, field)
+            assert getattr(planned, method) == "previous", n
+            assert carried is not None
+            assert carried * 60.0 == pytest.approx(sign * 1.2, abs=0.01)
+            assert planned == replace(live, **{field: carried, method: "previous"})
+        else:
+            # Ten minutes between its first sample and its eleventh.
+            assert young[n - 1].t - young[0].t == timedelta(minutes=CARRY_OVER_MIN_SPAN_MINUTES)
+            assert planned == live, n
+
+
+@pytest.mark.parametrize("wrong_way", [True, False], ids=["wrong-way-fit", "right-way-fit"])
+def test_a_fast_run_that_has_ended_is_judged_on_its_own_fit(wrong_way: bool) -> None:
+    """The span is for a cycle still running. A run that ended with four
+    samples inside ten minutes -- a five-minute zone's extra samples can do
+    that, as can the reactive path at a sample a minute -- is judged on its
+    own fit from the first sample after it, as before v0.22.0: a fit the guard
+    discarded leaves no slope, rather than lending the cycle before it on
+    through the idle, and a right-way fit is the one the next cycle borrows."""
+    step = 0.01 if wrong_way else -0.06
+    before, young = _fast_cycle([22.6 + step * i for i in range(SLOPE_MIN_SAMPLES + 1)])
+    running = before + young
+    now = running[-1].t
+    assert carry_over_recovery_slopes(
+        estimate_slopes(running, now=now), running, now=now
+    ).carried_over(ACTION_COOL)
+    ended = _buffer(
+        running, _run(ACTION_IDLE, running[-1].t + timedelta(minutes=1), [running[-1].temp])
+    )
+    now = ended[-1].t
+    live = estimate_slopes(ended, now=now)
+    assert live.method_recovery_cool == ("rejected" if wrong_way else "wls")
+    assert carry_over_recovery_slopes(live, ended, now=now) == live
+
+
+def test_a_running_young_run_with_no_sample_for_a_gap_borrows_nothing() -> None:
+    """A run still running that has had no sample for longer than
+    SAMPLE_MAX_GAP_MINUTES stops borrowing: whatever is appended next will
+    start a resumed run, which borrows nothing anyway, and meanwhile nothing
+    is being appended -- every command raising, say -- so the run would
+    otherwise stay young, and MPC's hold on it last, for as long as the run
+    it borrows from stayed fittable. A short run that has ended goes on
+    lending through however long an idle after it, as before."""
+    before, young = _fast_cycle([22.6, 22.58])
+    buffer = before + young
+    limit = timedelta(minutes=SAMPLE_MAX_GAP_MINUTES)
+    for quiet, carried in ((limit, True), (limit + timedelta(seconds=1), False)):
+        now = buffer[-1].t + quiet
+        live = estimate_slopes(buffer, now=now)
+        planned = carry_over_recovery_slopes(live, buffer, now=now)
+        assert planned.carried_over(ACTION_COOL) is carried
+        if not carried:
+            assert planned == live
+
+    ended = _buffer(buffer, _run(ACTION_IDLE, buffer[-1].t + timedelta(minutes=1), [22.6]))
+    now = ended[-1].t + 3 * limit
+    planned = carry_over_recovery_slopes(estimate_slopes(ended, now=now), ended, now=now)
+    assert planned.carried_over(ACTION_COOL)
+
+
+def test_a_fast_young_run_with_nothing_to_borrow_keeps_its_own_verdict() -> None:
+    """The span only decides when a borrowed slope gives way. With nothing to
+    borrow -- no earlier cycle in the buffer, or a cycle resumed after a gap
+    in sampling -- a young run that can be fitted keeps its own fit, or the
+    guard's verdict on it, from the fourth sample, as before."""
+    for step, method in ((+0.01, "rejected"), (-0.06, "wls")):
+        idle = _run(ACTION_IDLE, _T0, [22.5, 22.55, 22.6])
+        young = _run(
+            ACTION_COOL,
+            idle[-1].t + timedelta(minutes=5),
+            [22.6 + step * i for i in range(SLOPE_MIN_SAMPLES)],
+            every_min=1.0,
+        )
+        buffer = _buffer(idle, young)
+        live = estimate_slopes(buffer, now=buffer[-1].t)
+        assert live.method_recovery_cool == method
+        assert carry_over_recovery_slopes(live, buffer, now=buffer[-1].t) == live
+
+        before, _ = _fast_cycle([])
+        cool = [x for x in before if x.action == ACTION_COOL]
+        resumed = _run(
+            ACTION_COOL,
+            cool[-1].t + timedelta(minutes=SAMPLE_MAX_GAP_MINUTES + 3),
+            [22.6 + step * i for i in range(SLOPE_MIN_SAMPLES)],
+            every_min=1.0,
+        )
+        buffer = _buffer(cool, resumed)
+        live = estimate_slopes(buffer, now=buffer[-1].t)
+        assert live.method_recovery_cool == method
+        assert carry_over_recovery_slopes(live, buffer, now=buffer[-1].t) == live
+
+
+def test_at_a_sample_a_minute_only_young_runs_borrow() -> None:
+    """Buffers built at a sample a minute, as a mains-powered sensor or a
+    humid room builds them: MPC plans with exactly the estimate except for a
+    heat or cool run too young for its own fit -- fewer than four samples, or
+    still running and watched for less than CARRY_OVER_MIN_SPAN_MINUTES --
+    that began at a change of action, which plans with a borrowed slope of
+    the right sign."""
+    rng = random.Random(20261007)
+    trend = {ACTION_IDLE: 0.3 / 60, ACTION_HEAT: 2.0 / 60, ACTION_COOL: -1.8 / 60}
+    fields = {ACTION_HEAT: "recovery_heat", ACTION_COOL: "recovery_cool"}
+    span = timedelta(minutes=CARRY_OVER_MIN_SPAN_MINUTES)
+    replaced_a_fit = 0
+    for _ in range(150):
+        buffer: list[Sample] = []
+        t, temp, action = _T0, 21.0, ACTION_IDLE
+        for _ in range(150):
+            step = timedelta(minutes=rng.choice((1.0, 1.0, 1.0, 2.0, 25.0)))
+            t += step
+            temp += trend[action] * step.total_seconds() / 60.0 + rng.gauss(0.0, 0.03)
+            if rng.random() < 0.06:
+                action = rng.choice([a for a in trend if a != action])
+            buffer, _ = append_sample(buffer, now=t, temp=round(temp, 2), action=action)
+            live = estimate_slopes(buffer, now=t)
+            planned = carry_over_recovery_slopes(live, buffer, now=t)
+            expected = live
+            for act, field in fields.items():
+                value = getattr(planned, field)
+                if getattr(planned, f"method_{field}") != "previous":
+                    continue
+                run = predictor._latest_run_of(buffer, act)
+                # Too few samples, or still running and watched too briefly.
+                assert len(run) < SLOPE_MIN_SAMPLES or (
+                    run[-1] is buffer[-1] and run[-1].t - run[0].t < span
+                )
+                first = buffer.index(run[0])
+                assert first > 0
+                assert buffer[first - 1].action != act
+                assert value is not None
+                assert (value > 0) == (act == ACTION_HEAT)
+                replaced_a_fit += getattr(live, field) is not None
+                expected = replace(expected, **{field: value, f"method_{field}": "previous"})
+            assert planned == expected
+    # Not vacuous: the span sets aside fits of the young run's own.
+    assert replaced_a_fit > 100

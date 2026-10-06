@@ -34,6 +34,11 @@ is inclusive (`<=` / `>=`) to match `simulate`'s band-membership check
 and close a single-refresh edge case where MPC could pick idle at the
 exact band edge. Silent fallback, same posture as the not-ready path.
 
+Switching hysteresis (v0.22.0): MPC does not end a heat or cool cycle it is
+still planning on the previous cycle's slope, until the cycle has a slope of
+its own or the room reaches the band edge the cycle drives it towards. See
+`plan`.
+
 The planner is pure: state in / decision out, no IO. `simulate` does its
 own 1-minute integration so the cost function tracks any nonlinearities the
 caller wants to introduce later (e.g., v0.9's fan-mode-conditional slopes).
@@ -286,6 +291,69 @@ def plan(
     band active RIGHT NOW per the lookahead, which may differ from the
     snapshot if a refresh straddles a transition boundary) instead of
     ``inputs.low / inputs.high``.
+
+    Switching hysteresis (v0.22.0). The candidates are constant actions,
+    scored with nothing charged for switching, so around the room temperature
+    at which a cycle and idling score the same, MPC switches bang-bang. Ten
+    days of five zones' history had MPC end 104 cycles itself and restart the
+    same action within 15 minutes after 81 of them, a median 4.9 minutes
+    later. Since v0.21.0 MPC keeps the cycles it starts, and with them it
+    meets that point within a refresh or two of starting one: the cycle has
+    taken the room back across it. A cycle that young is planned on the
+    previous cycle's slope (`ThermalSlopes.carried_over`), and ending it
+    there does more than waste a start. The run is too short to fit, so the
+    next cycle has nothing to borrow, MPC is no longer ready when it starts,
+    and the reactive path takes the room until a cycle of its own runs long
+    enough to fit -- for a reactive path that ends its cycles early, possibly
+    never.
+
+    So MPC does not end a cycle it is still planning on a borrowed slope: not
+    for an idle that scores better, nor for the idle preference above. The
+    borrowing lasts until the cycle's run has four samples and has been
+    watched for CARRY_OVER_MIN_SPAN_MINUTES -- about fifteen minutes at a
+    battery sensor's five-minute cadence, ten at a sample a minute -- and the
+    cycle then leaves a slope for the next to borrow. Three things end a held
+    cycle all the same: the room reaching the band edge the cycle is driving
+    it towards (`low` for cool, `high` for heat, read as the bail-out reads
+    them, inclusive), at the first refresh that sees it, so it is released
+    within a refresh of reaching the edge; MPC not being ready or bailing out,
+    which hands the decision to the predictor, which the hold never touches;
+    and the cycle's run going longer than SAMPLE_MAX_GAP_MINUTES without a
+    sample, after which it borrows nothing (`predictor._previous_cycle_slope`:
+    nothing is recorded for a mode call that raises, though a cloud unit may
+    take it, and the run would otherwise stay young and held). It holds a
+    cycle against idle only: a switch to the other action -- a band about to
+    rise past a cooling room -- is not held, though the coordinator's
+    cross-mode gate keeps the unit on the held action for up to
+    `cross_mode_min_minutes` before it commands the reversal, as it does for
+    any reversal.
+
+    The hold keys on the slope rather than a clock, so it needs no state
+    beyond the buffer and holds equally at any cadence. A fifteen-minute
+    minimum on-time held as well at 293 seconds, but at 300 it let a cycle end
+    at three samples, too short to fit -- and lost 7-11 points of time in band
+    to that. Simulated from the 97 recorded MPC starts, three hours each, over
+    four shapes of unit lag (with and without a dead time) and a plant that
+    rebounds after a release as the recorded rooms do: at a five-minute
+    cadence, time in band rose from 73-81 % to 88-90 %, cycles of six minutes
+    or less fell from 25-55 % of all cycles to 0-5 %, and starts per hour from
+    0.67-0.88 to 0.58-0.64; at a sample a minute, time in band rose from
+    69-80 % to 91-92 %, and cycles of two and a half minutes or less fell from
+    12-214 to 0-4. The price is runtime: a cycle held to a fit cools or heats
+    further past the switching point, and the unit ran between 3.5 and 7
+    points more of the time. What it leaves is the switching itself, after
+    cycles that have run to a fit: MPC still restarted the action within 15
+    minutes after 15-21 % of the cycles it ended at a five-minute cadence
+    (17-49 % before), and 22-33 % at a sample a minute -- and the recorded
+    restarts above were all of that kind, after cycles running on slopes of
+    their own, which the hold leaves alone. Also measured, and worse on time
+    in band at a five-minute cadence for every plant: a margin on the ranking
+    (prefer the current action unless another beats it by 10-20 minutes in
+    band: 75-86 %); a temperature band around the switching point (0.1-0.3 °C:
+    76-87 %); and a minimum off-time before restarting (74-81 %, at most two
+    points better than none). A plain margin also held heat or cool through
+    the whole band whenever both scored the full horizon, nearly doubling
+    runtime.
     """
     if inputs.room is None:
         return UNKNOWN_DECISION
@@ -355,6 +423,21 @@ def plan(
         and idle_score.time_in_band_minutes >= horizon_minutes - MPC_SIMULATION_STEP_MINUTES
     ):
         best = idle_score
+    # Switching hysteresis (v0.22.0): a heat or cool cycle still planned on the
+    # previous cycle's slope is not ended until it has a slope of its own,
+    # unless the room has reached the band edge the cycle is driving it
+    # towards. After the idle preference, which it overrides; see the
+    # docstring for why.
+    current = inputs.current_action
+    if (
+        best.action.kind == ACTION_IDLE
+        and slopes.carried_over(current)
+        and not (current == ACTION_HEAT and inputs.room >= bail_high)
+        and not (current == ACTION_COOL and inputs.room <= bail_low)
+    ):
+        held = next((s for s in scores if s.action.kind == current), None)
+        if held is not None:
+            best = held
     if best.action.kind == ACTION_IDLE:
         return idle_decision()
     # target_temp is non-None for heat / cool actions (enumerate_actions
