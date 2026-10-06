@@ -138,7 +138,8 @@ class ZoneState:
     # v0.12.0: `thermal_slopes` here are the *effective* slopes — identical to
     # the live estimate except that, when the live idle slope is None but a
     # recent persisted idle slope exists, idle is substituted from storage so
-    # MPC stays ready through a heating chase. These drive `mpc.is_ready` /
+    # MPC stays ready through a heating chase (v0.21.0 adds a recovery
+    # substitution; see the end of this comment). These drive `mpc.is_ready` /
     # `mpc.plan` and the thermal_slope sensor only; the reactive predictor and
     # hysteresis run on the *live* slopes (the cache must not change reactive
     # control). `idle_slope_source` records which path produced the idle value
@@ -146,7 +147,10 @@ class ZoneState:
     # (min) of the substituted value -- since v0.19.0, from the newest sample
     # behind it -- and None unless source is "cached". Both
     # surface on the thermal_slope sensor so users can see when MPC is running
-    # on the cached value.
+    # on the cached value. v0.21.0 adds a second substitution, for the same
+    # consumers only: a heat or cool cycle too young for a recovery slope of
+    # its own carries over the previous cycle's, marked
+    # `method_recovery_* == "previous"` (`predictor.carry_over_recovery_slopes`).
     thermal_slopes: ThermalSlopes
     idle_slope_source: str
     idle_slope_cached_age_min: float | None
@@ -774,7 +778,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # Predictor runs every refresh (shadow mode). Slopes are computed once
         # and fed into both `decide()` (anticipation logic) and the
         # thermal_slope sensor's attributes (via ZoneState).
-        thermal_slopes = predictor.estimate_slopes(self._samples_cache, now=now_utc)
+        #
+        # One reading of the buffer for the whole refresh. The idle-slope write
+        # below can yield to an apply task that appends to it, and the
+        # carry-over has to see the buffer the estimate saw: a young run that
+        # gained its fourth sample in between would get neither its own slope
+        # nor the previous cycle's. Appends and flushes replace the list
+        # rather than change it, so this reference holds still.
+        samples = self._samples_cache
+        thermal_slopes = predictor.estimate_slopes(samples, now=now_utc)
         # v0.12.0: the idle (passive heat-loss) slope changes slowly, so we
         # remember the last good one beyond the 90-min sample window. When a
         # heating-dominated room chases a rising morning band, the live window
@@ -798,6 +810,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             idle_slope_cached_age_min,
         ) = await self._resolve_idle_slope(
             thermal_slopes, zone, now_utc, persist_ok=not fallback_active
+        )
+        # v0.21.0: and a heat or cool cycle too young for a recovery slope of
+        # its own plans with the previous cycle's -- the one MPC started it
+        # with. Without it MPC lost the slope on the refresh after every cycle
+        # it started, and the cycle was released at once if the room was inside
+        # its band. MPC-only for the cache's reason: the predictor below still
+        # gets the live slopes.
+        effective_slopes = predictor.carry_over_recovery_slopes(
+            effective_slopes, samples, now=now_utc
         )
         predicted_decision = predictor.decide(
             thermal_slopes,
@@ -1191,9 +1212,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
           learned, or expired) -> return unchanged. ``source="none"``. An
           expired value is cleared from storage so it can't resurface.
 
-        Only the idle slope is persisted: recovery slopes change faster and
-        are always present during a heating/cooling chase, so they don't have
-        the aging-out problem idle does.
+        Only the idle slope is persisted: recovery slopes change faster, and
+        every cycle long enough to fit measures one afresh. A cycle too young
+        for its own borrows the previous cycle's from the buffer instead
+        (v0.21.0, `predictor.carry_over_recovery_slopes`); persisting them as
+        well was measured and not taken.
         """
         if slopes.idle is not None:
             # Persist only for learning-enabled zones: the cache is a
