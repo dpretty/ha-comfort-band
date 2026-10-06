@@ -26,7 +26,9 @@ fewer than SLOPE_MIN_SAMPLES samples or the WLS denominator is near-singular.
 MPC plans with the same slopes but for two substitutions the coordinator
 makes: a cached idle slope while there is no live one (v0.12.0), and, since
 v0.21.0, the previous cycle's recovery slope for a heat or cool cycle too
-young for its own (see `carry_over_recovery_slopes`).
+young for its own (see `carry_over_recovery_slopes`; since v0.22.0 a run
+still running is young until it has been watched for
+CARRY_OVER_MIN_SPAN_MINUTES as well, and MPC holds a cycle while it is).
 
 Three projection thresholds, summarised:
 - Anticipatory **shutoff** projects at the band edge (`low`/`high`): fires
@@ -54,6 +56,7 @@ from .const import (
     ACTION_HEAT,
     ACTION_IDLE,
     ACTION_UNKNOWN,
+    CARRY_OVER_MIN_SPAN_MINUTES,
     IDLE_SETTLE_MINUTES,
     PASSIVE_FORECAST_MOVEMENT_MIN_C,
     SAMPLE_MAX_COUNT,
@@ -144,7 +147,9 @@ class ThermalSlopes:
     v0.21.0: in the slopes MPC plans with, a recovery ``method_*`` of
     ``"previous"`` marks a value carried over from the previous cycle (see
     `carry_over_recovery_slopes`). The counts and spreads beside it still
-    describe the latest run, as they do beside a cached idle slope.
+    describe the latest run, as they do beside a cached idle slope -- and
+    since v0.22.0 that run may have a fit of its own already, set aside until
+    it has been watched for long enough.
     """
 
     idle: float | None
@@ -177,6 +182,16 @@ class ThermalSlopes:
         if action == ACTION_COOL:
             return self.recovery_cool
         return self.idle
+
+    def carried_over(self, action: str | None) -> bool:
+        """Whether the recovery slope for `action` is the previous cycle's,
+        carried over to a cycle too young for its own (v0.21.0). Always False
+        for idle and unknown, which have no recovery slope."""
+        if action == ACTION_HEAT:
+            return self.method_recovery_heat == "previous"
+        if action == ACTION_COOL:
+            return self.method_recovery_cool == "previous"
+        return False
 
 
 # Slope-flatness threshold expressed in slope's native unit (°C/minute), so
@@ -589,42 +604,60 @@ def carry_over_recovery_slopes(
     median of 68 minutes, because the short run went on hiding the earlier one
     until a reactive cycle long enough to fit replaced it.
 
-    So until the new run can be fitted, it borrows the slope of the run of
-    that action before it -- the run MPC started the cycle with -- provided
-    that run is long enough to fit. The borrowed fit goes through the v0.15.0
-    sign guard like any other, so a previous cycle whose fit was discarded
-    lends nothing; and a new run long enough to fit always keeps its own
-    slope, or the guard's verdict on it. Only a new cycle borrows. A young run
-    whose sample before it is of its own action -- split from it only by a
-    gap in sampling -- is a cycle resumed after an outage, and v0.20.0 decided
-    against planning its resumption with the slope from before the outage,
-    since nothing says the unit kept doing what it was doing. A gap anywhere
-    else, in the idle before the new cycle or straight before its first
-    sample, still leaves a new cycle; and the previous cycle's slope stood
-    across that gap anyway, since v0.20.0 leaves a cycle that ended before an
-    outage its slope.
+    So until the new run is old enough for a fit of its own -- four samples,
+    watched for CARRY_OVER_MIN_SPAN_MINUTES (since v0.22.0; see below) -- it
+    borrows the slope of the run of that action before it, the run MPC started
+    the cycle with, provided that run is long enough to fit. The borrowed fit
+    goes through the v0.15.0 sign guard like any other, so a previous cycle
+    whose fit was discarded lends nothing; and a new run old enough always
+    keeps its own slope, or the guard's verdict on it. Only a new cycle
+    borrows. A young run whose sample before it is of its own action -- split
+    from it only by a gap in sampling -- is a cycle resumed after an outage,
+    and v0.20.0 decided against planning its resumption with the slope from
+    before the outage, since nothing says the unit kept doing what it was
+    doing. A gap anywhere else, in the idle before the new cycle or straight
+    before its first sample, still leaves a new cycle; and the previous
+    cycle's slope stood across that gap anyway, since v0.20.0 leaves a cycle
+    that ended before an outage its slope.
 
-    The previous cycle only, not the last one long enough to fit further
-    back. A cycle MPC itself ends after a sample or two is too short to lend
-    anything. It stays the latest run through the idle after it, still too
-    short to fit, so meanwhile the cycle before it lends, and MPC can start
-    the next cycle on that; but that next cycle finds only the short one
-    before it, and the reactive path takes it, as before. That bounds MPC's
-    own chatter: MPC has no switching hysteresis, and near the temperature at
-    which it switches it can end a cycle and start the next within minutes.
-    Walking further back was measured removing the bound: simulating three
-    hours on from each of the 97 starts at a one-minute cadence, it took the
-    cycles of two and a half minutes or less from 98 to 182, where carrying
-    over from the previous cycle only took them to 65.
+    The previous cycle only, not the last one long enough to fit further back.
+    v0.21.0 chose that to bound MPC's chatter: with no switching hysteresis,
+    MPC could end a cycle a sample or two in and start the next within
+    minutes, and the short run in between lent nothing, so the next cycle went
+    to the reactive path. Walking further back removed the bound -- simulating
+    three hours on from each of the 97 starts at a one-minute cadence, it took
+    the cycles of two and a half minutes or less from 98 to 182, where the
+    previous cycle only took them to 65. Since v0.22.0 MPC does not end a
+    cycle it is planning on a borrowed slope (`mpc.plan`), so a cycle it
+    starts runs long enough to lend unless something else ends it first, and a
+    run too short to lend comes from the band edge, a reversal to the other
+    action (not held), MPC deferring, the reactive path's own cycles, or a
+    hand edit. With the hold in place the walk back was measured again: it
+    gained at most half a point of time in band (no lag, at a sample a minute)
+    and 0.1-0.2 points on the rebound plant at five minutes, and nothing
+    elsewhere, so the simpler rule stays.
 
-    The carry-over ends when the young run can be fitted, and at about a
-    sample a minute -- the fastest a run grows -- that is three minutes in.
-    A unit that has not moved the room by then leaves those samples drifting
-    the old way: the fit comes out the wrong way round, the sign guard
-    discards it, nothing is carried over a rejected fit, and the reactive
-    path takes the cycle at its fourth minute rather than its first. Carrying
-    on past a rejected fit would override the guard's verdict, which this
-    leaves standing.
+    The carry-over ends when the young run has four samples and, while it is
+    still running, has been watched for CARRY_OVER_MIN_SPAN_MINUTES. Four
+    samples alone, as in v0.21.0, come three minutes in at about a sample a
+    minute -- the fastest a run grows -- and a unit that had not moved the
+    room by then left them drifting the old way: the fit came out the wrong
+    way round, the sign guard discarded it, nothing is carried over a rejected
+    fit, and the reactive path took the cycle at its fourth minute. Until the
+    run has been watched for the span, its own fit -- the right way round or
+    not -- is set aside for the borrowed one. The guard's verdict still stands
+    on the fit MPC uses: the borrowed one passed it when the previous cycle
+    was fitted, and the run's own is judged from the refresh it takes over.
+    Once the run has ended its own fit stands, as before (see `_too_young`).
+    At a five-minute cadence four samples normally span about fifteen minutes,
+    so this rarely matters there: in ten days of five zones' history, extra
+    samples gave a running cycle four inside ten minutes four times, and two
+    of those changed a decision. A unit still not moving the room once the
+    span is up loses the cycle then, as it did at the fourth minute before. It
+    also ends, as a gap in sampling would end it, when a run still running has
+    had no sample for longer than SAMPLE_MAX_GAP_MINUTES: the next sample
+    would start a resumed run, which borrows nothing, and until then the run
+    cannot grow out of its youth (see `_previous_cycle_slope`).
 
     Nothing outlives the buffer: the previous cycle is one the buffer still
     holds, which is pruned to the 90-minute window as samples are appended.
@@ -636,18 +669,11 @@ def carry_over_recovery_slopes(
     using the live slopes, so its anticipatory shutoff is untouched and a zone
     not on MPC controls exactly as before -- though its MPC shadow and the
     thermal_slope sensor do show the carried value, marked ``method_* ==
-    "previous"``.
+    "previous"``. That mark is also what MPC's hold keys on
+    (`ThermalSlopes.carried_over`).
     """
-    heat = (
-        _previous_cycle_slope(samples, ACTION_HEAT, now=now)
-        if slopes.recovery_heat is None
-        else None
-    )
-    cool = (
-        _previous_cycle_slope(samples, ACTION_COOL, now=now)
-        if slopes.recovery_cool is None
-        else None
-    )
+    heat = _previous_cycle_slope(samples, ACTION_HEAT, now=now)
+    cool = _previous_cycle_slope(samples, ACTION_COOL, now=now)
     if heat is not None:
         slopes = replace(slopes, recovery_heat=heat, method_recovery_heat="previous")
     if cool is not None:
@@ -658,18 +684,31 @@ def carry_over_recovery_slopes(
 def _previous_cycle_slope(samples: list[Sample], action: str, *, now: datetime) -> float | None:
     """The recovery slope a new `action` cycle borrows until it has its own.
 
-    None unless the latest run of `action` is too short to fit and began at a
-    change of action, and the run of `action` before it can be fitted and its
-    fit survives the sign guard; see `carry_over_recovery_slopes` for why.
+    None unless the latest run of `action` is too young for its own fit to
+    stand, began at a change of action and -- if still running -- has had a
+    sample within SAMPLE_MAX_GAP_MINUTES of `now`, and the run of `action`
+    before it can be fitted and its fit survives the sign guard; see
+    `carry_over_recovery_slopes` for why.
     """
     latest = _run_bounds(samples, action, len(samples))
-    if latest is None or latest[1] - latest[0] >= SLOPE_MIN_SAMPLES:
+    if latest is None or not _too_young(samples, *latest):
         return None
     start = latest[0]
     # The first run in the buffer has nothing before it to borrow from. The
     # same action straight before it makes it a cycle resumed after a gap in
     # sampling, which waits for a slope of its own.
     if start == 0 or samples[start - 1].action == action:
+        return None
+    # Nor does a run still running that has had no sample for longer than a
+    # gap (v0.22.0). Whatever is appended next will start a resumed run, which
+    # borrows nothing, so this stops borrowing now rather than then. Meanwhile
+    # nothing is being appended -- a quiet sensor, or every command raising,
+    # which for a cloud unit can still reach it -- so the run cannot grow out
+    # of its youth, and without this it would hold MPC's cycle for as long as
+    # the run it borrows from stayed fittable.
+    if latest[1] == len(samples) and now - samples[-1].t > timedelta(
+        minutes=SAMPLE_MAX_GAP_MINUTES
+    ):
         return None
     previous = _run_bounds(samples, action, start)
     if previous is None or previous[1] - previous[0] < SLOPE_MIN_SAMPLES:
@@ -679,6 +718,26 @@ def _previous_cycle_slope(samples: list[Sample], action: str, *, now: datetime) 
         want_positive=action == ACTION_HEAT,
     )
     return slope
+
+
+def _too_young(samples: list[Sample], start: int, end: int) -> bool:
+    """Whether the run `samples[start:end]` is too young for its own fit to
+    replace a borrowed one: fewer samples than a fit needs, or still running
+    and watched for less than CARRY_OVER_MIN_SPAN_MINUTES.
+
+    The span is for a cycle still in progress, whose early samples may only
+    show the unit coming up. Once the run has ended -- another action's sample
+    after it -- its fit is all there is to say about that cycle, and it stands
+    as it did before v0.22.0: the next cycle borrows it anyway. Left young, a
+    short run that ended on a fit the guard discarded went on lending the
+    cycle before it through the idle after it, and MPC started cycles on that
+    slope which the run then had nothing to lend to."""
+    if end - start < SLOPE_MIN_SAMPLES:
+        return True
+    if end < len(samples):
+        return False
+    span = samples[end - 1].t - samples[start].t
+    return span < timedelta(minutes=CARRY_OVER_MIN_SPAN_MINUTES)
 
 
 def project(temp: float, slope_per_minute: float | None, minutes: float) -> float | None:

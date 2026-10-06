@@ -7,7 +7,7 @@ that each fail one guard over a few large tests that confound failure modes.
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 
 import pytest
@@ -16,6 +16,7 @@ from custom_components.comfort_band.const import (
     ACTION_COOL,
     ACTION_HEAT,
     ACTION_IDLE,
+    ACTION_UNKNOWN,
     HVAC_MODE_COOL,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
@@ -746,3 +747,159 @@ def test_plan_bail_out_uses_snapshot_when_bands_per_step_none() -> None:
         bands_per_step=None,
     )
     assert result == predictor_decision
+
+
+# ----- v0.22.0: a cycle planned on a borrowed slope is held -----
+
+
+def _borrowed(action: str, **kwargs: float | None) -> ThermalSlopes:
+    """The slopes MPC plans with while `action`'s cycle is too young for a
+    slope of its own: that recovery slope carried over from the previous
+    cycle, marked so."""
+    field = "method_recovery_heat" if action == ACTION_HEAT else "method_recovery_cool"
+    return replace(_slopes(**kwargs), **{field: "previous"})
+
+
+@pytest.mark.parametrize(
+    ("action", "room", "held"),
+    [
+        (ACTION_COOL, 21.0, cool_decision(20.0)),
+        (ACTION_HEAT, 22.0, heat_decision(23.0)),
+    ],
+)
+def test_plan_holds_a_cycle_planned_on_a_borrowed_slope(
+    action: str, room: float, held: object
+) -> None:
+    """Idling keeps the flat room in band for the whole horizon and the cycle
+    would take it out within half an hour, so idle wins -- but the cycle is
+    still planned on the previous cycle's slope, so MPC holds it."""
+    inputs = _inputs(room, current=action)
+    own = plan(_slopes(idle=0.0), inputs, horizon_minutes=60, predictor_decision=idle_decision())
+    assert own == idle_decision()
+    result = plan(
+        _borrowed(action, idle=0.0), inputs, horizon_minutes=60, predictor_decision=idle_decision()
+    )
+    assert result == held
+
+
+def test_plan_hold_overrides_the_idle_preference() -> None:
+    """Cooling slowly enough to stay in band all horizon long scores as well
+    as idling, and the idle preference picks idle. A borrowed slope holds the
+    cycle against that too: the cycle has not shown yet what it does."""
+    inputs = _inputs(22.5, current=ACTION_COOL)
+    slopes = _slopes(idle=0.0, recovery_cool=-0.01)
+    assert plan(slopes, inputs, horizon_minutes=60, predictor_decision=idle_decision()) == (
+        idle_decision()
+    )
+    borrowed = _borrowed(ACTION_COOL, idle=0.0, recovery_cool=-0.01)
+    assert plan(borrowed, inputs, horizon_minutes=60, predictor_decision=idle_decision()) == (
+        cool_decision(20.0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "edge", "inside"),
+    [(ACTION_COOL, 20.0, 20.01), (ACTION_HEAT, 23.0, 22.99)],
+)
+def test_plan_releases_a_held_cycle_at_the_band_edge_it_drives_towards(
+    action: str, edge: float, inside: float
+) -> None:
+    """A cycle can always stop: once the room has reached the edge the cycle
+    is driving it towards -- the bottom for cooling, the top for heating,
+    inclusive like the bail-out -- the hold lets it go, borrowed slope or
+    not. Just inside the edge it still holds."""
+    slopes = _borrowed(action, idle=0.0)
+    at_edge = plan(
+        slopes,
+        _inputs(edge, current=action),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+    )
+    assert at_edge == idle_decision()
+    near = plan(
+        slopes,
+        _inputs(inside, current=action),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+    )
+    assert near.action == action
+
+
+def test_plan_hold_reads_the_band_edge_from_bands_per_step() -> None:
+    """The edge is the band in force now, as the bail-out reads it: with the
+    lookahead, `bands_per_step[0]`. Here it has risen to 21-24 while the
+    snapshot still says 20-23, and a room at 21.0 is at its bottom edge."""
+    slopes = _borrowed(ACTION_COOL, idle=0.0)
+    inputs = _inputs(21.0, current=ACTION_COOL)
+    snapshot = plan(slopes, inputs, horizon_minutes=60, predictor_decision=idle_decision())
+    assert snapshot == cool_decision(20.0)
+    lookahead = plan(
+        slopes,
+        inputs,
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+        bands_per_step=[(21.0, 24.0)] * 60,
+    )
+    assert lookahead == idle_decision()
+
+
+def test_plan_hold_only_keeps_a_cycle_from_ending() -> None:
+    """The hold stops MPC ending a cycle, not reversing it. When the band is
+    about to rise past a room that is cooling, MPC switches to heat, borrowed
+    cool slope or not -- the coordinator's cross-mode gate is what paces a
+    reversal."""
+    bands = [(20.0, 23.0)] * 5 + [(23.5, 26.0)] * 55
+    result = plan(
+        _borrowed(ACTION_COOL, idle=0.0),
+        _inputs(22.0, current=ACTION_COOL),
+        horizon_minutes=60,
+        predictor_decision=idle_decision(),
+        bands_per_step=bands,
+    )
+    assert result == heat_decision(23.0)
+
+
+@pytest.mark.parametrize("current", [ACTION_IDLE, ACTION_UNKNOWN])
+def test_plan_holds_nothing_without_a_cycle_running(current: str) -> None:
+    """Only a heat or cool cycle is held. Borrowed slopes with the unit idle
+    (a young cycle that has ended still lends through the idle after it)
+    leave MPC to start or not start a cycle as it would."""
+    slopes = replace(
+        _slopes(idle=0.0), method_recovery_heat="previous", method_recovery_cool="previous"
+    )
+    inputs = _inputs(21.5, current=current)
+    assert plan(slopes, inputs, horizon_minutes=60, predictor_decision=idle_decision()) == (
+        plan(_slopes(idle=0.0), inputs, horizon_minutes=60, predictor_decision=idle_decision())
+    )
+
+
+def test_plan_hold_never_reaches_a_zone_mpc_is_not_ready_for() -> None:
+    """The hold is part of MPC's plan: when MPC defers -- not ready, or the
+    room is outside the band on a side it has no slope for -- the predictor's
+    decision comes back untouched, borrowed slope or not."""
+    predictor_decision = idle_decision()
+    not_ready = _borrowed(ACTION_COOL, idle=None)
+    result = plan(
+        not_ready,
+        _inputs(21.0, current=ACTION_COOL),
+        horizon_minutes=60,
+        predictor_decision=predictor_decision,
+    )
+    assert result is predictor_decision
+    bail = _borrowed(ACTION_COOL, idle=0.0, recovery_heat=None)
+    result = plan(
+        bail,
+        _inputs(19.5, current=ACTION_COOL),
+        horizon_minutes=60,
+        predictor_decision=predictor_decision,
+    )
+    assert result is predictor_decision
+
+
+def test_carried_over_names_only_a_borrowed_recovery_slope() -> None:
+    slopes = replace(_slopes(), method_recovery_cool="previous")
+    assert slopes.carried_over(ACTION_COOL)
+    assert not slopes.carried_over(ACTION_HEAT)
+    assert not slopes.carried_over(ACTION_IDLE)
+    assert not slopes.carried_over(ACTION_UNKNOWN)
+    assert not slopes.carried_over(None)

@@ -816,7 +816,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # with. Without it MPC lost the slope on the refresh after every cycle
         # it started, and the cycle was released at once if the room was inside
         # its band. MPC-only for the cache's reason: the predictor below still
-        # gets the live slopes.
+        # gets the live slopes. (v0.22.0: `mpc.plan` holds a cycle while its
+        # slope is carried over, so the switching hysteresis is MPC-only too.)
         effective_slopes = predictor.carry_over_recovery_slopes(
             effective_slopes, samples, now=now_utc
         )

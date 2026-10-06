@@ -219,62 +219,7 @@ async def test_a_cycle_mpc_starts_is_not_released_on_the_next_refresh(
     assert modes[-1] == HVAC_MODE_FAN_ONLY
 
 
-async def test_at_a_one_minute_cadence_a_slow_unit_loses_the_cycle_at_its_first_fit(
-    hass: HomeAssistant,
-    hass_storage: dict[str, Any],
-    climate_calls: list[tuple[str, dict[str, Any]]],
-    freezer: FrozenDateTimeFactory,
-) -> None:
-    """The limit of carrying a slope over only until the young run can be
-    fitted. At one sample a minute the young run has four samples three
-    minutes in, and a unit that takes longer than that to move the room
-    leaves those samples still drifting the old way. That fit has the wrong
-    sign, and the v0.15.0 guard discards it, as it is there to. Nothing is
-    carried over a fit the guard has rejected, so the cycle has no slope, and
-    the reactive path releases a room inside its band -- at the fourth
-    minute rather than the first. Pinned, so that changing it is a decision:
-    keeping the guard's verdict was part of the brief."""
-    freezer.move_to("2026-09-24 18:30:00+00:00")
-    coordinator = await _zone_on_mpc(hass)
-    room = _Room(hass, freezer, climate_calls, temp=21.6, lag=3)
-
-    # As in the headline test: the predictor cools the room into the evening
-    # band, then the idle stretch settles and MPC starts a cool cycle.
-    await room.report()
-    for _ in range(60):
-        if coordinator.data.decision.action != ACTION_COOL:
-            break
-        await room.report()
-    assert coordinator.data.thermal_slopes.method_recovery_cool == "wls"
-    for _ in range(60):
-        await room.report()
-        if coordinator.data.decision.action == ACTION_COOL:
-            break
-    started = coordinator.data
-    assert started.mpc_ready
-    assert started.mpc_decision.action == ACTION_COOL
-    assert started.predicted_decision.action == ACTION_IDLE
-    assert started.decision_room is not None
-    assert started.decision_room < started.effective_high
-    mark = len(climate_calls)
-
-    # Three refreshes on the carried slope, the room still warming.
-    for samples in range(1, SLOPE_MIN_SAMPLES):
-        await room.report()
-        held = coordinator.data
-        assert held.thermal_slopes.sample_count_recovery_cool == samples
-        assert held.thermal_slopes.method_recovery_cool == "previous"
-        assert held.mpc_ready
-        assert held.decision.action == ACTION_COOL
-    assert HVAC_MODE_FAN_ONLY not in room.modes_since(mark)
-
-    # The fourth sample makes the run fittable, and its fit is the wrong way.
-    await room.report()
-    first_fit = coordinator.data
-    assert first_fit.thermal_slopes.sample_count_recovery_cool == SLOPE_MIN_SAMPLES
-    assert first_fit.thermal_slopes.method_recovery_cool == "rejected"
-    assert not first_fit.mpc_ready
-    assert first_fit.decision_room is not None
-    assert first_fit.decision_room < first_fit.effective_high
-    assert first_fit.decision.action == ACTION_IDLE
-    assert room.modes_since(mark) == [HVAC_MODE_FAN_ONLY]
+# The v0.21.0 limit pinned here -- at a sample a minute, a slow unit's first fit,
+# three minutes in, came out the wrong way round and lost MPC the cycle -- was
+# lifted in v0.22.0 by the carry-over's minimum span. It is kept, as v0.21.0
+# behaved, beside the tests of what replaced it in test_mpc_hysteresis.py.

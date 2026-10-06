@@ -139,6 +139,24 @@ SLOPE_MIN_SAMPLES: Final = 4
 SLOPE_WEIGHT_TAU_MINUTES: Final = 20.0
 SLOPE_EPSILON_PER_HOUR: Final = 0.05
 
+# v0.22.0: how long a new heat or cool run must have been watched, as well as
+# how many samples it needs, before its own fit replaces the previous cycle's
+# slope MPC borrowed for it (`predictor.carry_over_recovery_slopes`). Four
+# samples take fifteen minutes at the five-minute cadence of a battery sensor,
+# so this rarely matters there (in ten days of five zones' history, extra
+# samples gave a running cycle four inside ten minutes four times, and two of
+# those changed a decision); at a sample a
+# minute they take three, which is less than many units need to move the room at
+# all: a slow unit's fit that early came out the wrong way round and lost MPC
+# the cycle. Only a run still running waits: an ended run's fit stands.
+# Simulated from 97 recorded MPC starts at a one-minute cadence, ten minutes
+# took the cycles lost that way from as many as 83, depending on how slowly the
+# unit came up, to at most 1. Fifteen cut starts there by up to a fifth, but ran
+# the unit 1.4-1.8 points more of the time for a little less time in band, and
+# at a five-minute cadence it would make a fourth sample at 14.7 minutes too
+# young.
+CARRY_OVER_MIN_SPAN_MINUTES: Final = 10
+
 # v0.19.0: how much of the start of an idle stretch the idle slope leaves out
 # (since v0.20.0, measured from where the stretch began, across any gap). An
 # idle run almost always begins at the release of a heat or cool cycle, and for
