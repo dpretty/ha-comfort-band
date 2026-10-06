@@ -144,7 +144,13 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
 
     Returns None (HA "unknown") when the relevant segment has fewer than
     SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
-    first few samples of a heat or cool run are expected to be unknown. The
+    first few samples of a heat or cool run have no slope of their own. Since
+    v0.21.0, while the latest heat or cool run is that short -- a cycle just
+    started, or one MPC ended after a sample or two -- the slope shown is the
+    one MPC plans with, the previous cycle's, with `method_recovery_*` reading
+    "previous". It is unknown when that cycle was too short to fit (or its
+    fit was discarded), when there is none in the buffer, and when the run
+    resumed after a gap in sampling. The
     live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
     idle stretch plus four samples more (v0.19.0): about 35 minutes with a
     sensor reporting every minute, 50 with one reporting every five.
@@ -214,8 +220,12 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # value throughout the window (the slope estimate is then
             # unreliable, regardless of sample count). `method_*` records
             # which estimator produced the slope: "wls", "none", "cached"
-            # (idle only — the v0.12 persisted-slope fallback), or "rejected"
-            # (recovery only — v0.15 sign guard discarded a wrong-sign fit).
+            # (idle only — the v0.12 persisted-slope fallback), "rejected"
+            # (recovery only — v0.15 sign guard discarded a wrong-sign fit),
+            # or "previous" (recovery only — v0.21 carried the previous cycle's
+            # slope over a cycle too young for its own; the per-segment count
+            # and spread still describe that young run, as they do the live
+            # idle samples beside a cached idle slope).
             "sample_count_idle": s.sample_count_idle,
             "sample_count_recovery_heat": s.sample_count_recovery_heat,
             "sample_count_recovery_cool": s.sample_count_recovery_cool,

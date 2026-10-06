@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -34,6 +35,7 @@ from custom_components.comfort_band.predictor import (
     Sample,
     ThermalSlopes,
     append_sample,
+    carry_over_recovery_slopes,
     decide,
     estimate_slopes,
     load_samples,
@@ -1481,3 +1483,313 @@ def test_a_buffer_with_no_gap_past_the_limit_is_estimated_exactly_as_before(
                 m.setattr(predictor, "SAMPLE_MAX_GAP_MINUTES", 10**6)
                 joined = estimate_slopes(buffer, now=t)
             assert split == joined
+
+
+# ----- v0.21.0: a cycle too young for a recovery slope carries over the previous one -----
+
+
+def _planned(buffer: list[Sample], now: datetime) -> ThermalSlopes:
+    """What MPC plans with: the estimate, and whatever is carried over into it."""
+    return carry_over_recovery_slopes(estimate_slopes(buffer, now=now), buffer, now=now)
+
+
+@pytest.mark.parametrize(
+    ("action", "temps", "rate_per_h", "field"),
+    [
+        (ACTION_COOL, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5], -1.2, "recovery_cool"),
+        (ACTION_HEAT, [19.0, 19.15, 19.3, 19.45, 19.6], 1.8, "recovery_heat"),
+    ],
+)
+def test_a_new_cycle_plans_with_the_previous_one_until_it_can_be_fitted(
+    action: str, temps: list[float], rate_per_h: float, field: str
+) -> None:
+    """The incident's buffer, reduced: a cycle long enough to fit, the idle
+    after it, and the first sample of the cycle MPC has just started. The
+    estimate has nothing for a run of one sample, which is what left MPC no
+    longer ready. The slope it started the cycle with is carried over -- and
+    only that: the young run's own count and spread, the idle slope and the
+    other recovery slope are the estimate's. Once the new run can be fitted,
+    its own slope is used."""
+    method = f"method_{field}"
+    earlier = _run(action, _T0, temps)
+    idle = _run(ACTION_IDLE, earlier[-1].t + timedelta(minutes=5), [temps[-1]] * 3)
+    new = _run(action, idle[-1].t + timedelta(minutes=5), [temps[-1]])
+    buffer = _buffer(earlier, idle, new)
+    now = new[-1].t + timedelta(minutes=1)
+    live = estimate_slopes(buffer, now=now)
+    assert getattr(live, field) is None
+    assert getattr(live, method) == "none"
+    planned = carry_over_recovery_slopes(live, buffer, now=now)
+    carried = getattr(planned, field)
+    assert carried is not None
+    assert carried * 60.0 == pytest.approx(rate_per_h, abs=0.01)
+    assert planned == replace(live, **{field: carried, method: "previous"})
+
+    step = rate_per_h / 12
+    young = _run(action, new[0].t, [temps[-1] + step * i for i in range(SLOPE_MIN_SAMPLES)])
+    grown = _buffer(earlier, idle, young)
+    now = grown[-1].t + timedelta(minutes=1)
+    own = estimate_slopes(grown, now=now)
+    assert getattr(own, method) == "wls"
+    assert _planned(grown, now) == own
+
+
+def test_a_new_cycle_long_enough_to_fit_keeps_its_own_verdict() -> None:
+    """The v0.15.0 sign guard is untouched. A new run that can be fitted is
+    never replaced -- not even when the guard has discarded its fit, with a
+    clean cycle earlier in the buffer: the unit has started heating and the
+    room has not answered yet, and the guard's response to that (no slope,
+    so the reactive predictor heats a room below its band) stands."""
+    heat = _run(ACTION_HEAT, _T0, [19.0, 19.15, 19.3, 19.45, 19.6])
+    idle = _run(ACTION_IDLE, heat[-1].t + timedelta(minutes=5), [19.55, 19.5, 19.45])
+    lagging = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [19.4, 19.38, 19.37, 19.36])
+    buffer = _buffer(heat, idle, lagging)
+    live = estimate_slopes(buffer, now=buffer[-1].t)
+    assert live.method_recovery_heat == "rejected"
+    assert _planned(buffer, buffer[-1].t) == live
+
+
+def test_a_previous_cycle_whose_fit_was_discarded_lends_nothing() -> None:
+    """The slope carried over goes through the sign guard like any other. Here
+    the previous cycle fits sign-wrong, so nothing is carried over, and the
+    clean cycle before it is not reached for instead: the latest measurement
+    of heating is the one that counts, and the guard discarded it."""
+    clean = _run(ACTION_HEAT, _T0, [19.0, 19.15, 19.3, 19.45, 19.6])
+    idle = _run(ACTION_IDLE, clean[-1].t + timedelta(minutes=5), [19.55, 19.5])
+    wrong = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [19.45, 19.43, 19.42, 19.41])
+    idle_after = _run(ACTION_IDLE, wrong[-1].t + timedelta(minutes=5), [19.4, 19.38])
+    new = _run(ACTION_HEAT, idle_after[-1].t + timedelta(minutes=5), [19.36])
+    buffer = _buffer(clean, idle, wrong, idle_after, new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.recovery_heat is None
+    assert planned.method_recovery_heat == "none"
+
+
+def test_a_cycle_resumed_after_a_gap_carries_nothing_over() -> None:
+    """v0.20.0 decided that a cycle resumed after an outage waits for a slope
+    of its own rather than planning with the one from before the outage:
+    nothing in the buffer says the unit went on doing what it was doing. That
+    stands. What the gap decides is whether the young run is a new cycle at
+    all; a previous cycle that itself resumed after a gap, and went on long
+    enough to fit, was watched for all the samples behind its slope, and
+    lends it like any other."""
+    before = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    resumed_at = before[-1].t + timedelta(minutes=SAMPLE_MAX_GAP_MINUTES + 3)
+    after = _run(ACTION_COOL, resumed_at, [23.0])
+    planned = _planned(_buffer(before, after), after[-1].t)
+    assert planned.recovery_cool is None
+    assert planned.method_recovery_cool == "none"
+
+    resumed = _run(ACTION_COOL, resumed_at, [23.0, 22.8, 22.6, 22.4])
+    idle = _run(ACTION_IDLE, resumed[-1].t + timedelta(minutes=5), [22.45, 22.5])
+    new = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [22.55])
+    buffer = _buffer(before, resumed, idle, new)
+    assert len(buffer) == len(before) + len(resumed) + len(idle) + len(new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
+
+    # However short the cycle before the outage was: the run after the gap is
+    # its continuation, not a new cycle, so the cycle before *that* lends
+    # nothing either.
+    idle = _run(ACTION_IDLE, before[-1].t + timedelta(minutes=5), [22.55, 22.6])
+    short = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [22.65, 22.6])
+    after = _run(ACTION_COOL, short[-1].t + timedelta(minutes=SAMPLE_MAX_GAP_MINUTES + 3), [22.7])
+    buffer = _buffer(before, idle, short, after)
+    assert len(buffer) == len(before) + len(idle) + len(short) + len(after)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.recovery_cool is None
+    assert planned.method_recovery_cool == "none"
+
+
+def test_a_gap_before_a_new_cycle_does_not_stop_the_previous_one_lending() -> None:
+    """Only a cycle resumed after a gap borrows nothing: one whose sample
+    before it was of its own action. A gap anywhere else leaves a new cycle,
+    since the last thing seen before it was idle: in the idle between the two
+    cycles, or straight before the new cycle's first sample, as after a
+    restart while the zone idled. The previous cycle was watched for every
+    sample behind its slope, and that slope stood across the gap as the
+    latest cool slope (v0.20.0), so it is what MPC started the new cycle
+    with -- and what the new cycle borrows."""
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    idle = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [22.5, 22.55])
+    gap = timedelta(minutes=SAMPLE_MAX_GAP_MINUTES + 13)
+
+    resumed_idle = _run(ACTION_IDLE, idle[-1].t + gap, [22.6, 22.65])
+    new = _run(ACTION_COOL, resumed_idle[-1].t + timedelta(minutes=5), [22.7])
+    buffer = _buffer(cool, idle, resumed_idle, new)
+    assert len(buffer) == len(cool) + len(idle) + len(resumed_idle) + len(new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-1.2, abs=0.01)
+
+    new = _run(ACTION_COOL, idle[-1].t + gap, [22.7])
+    buffer = _buffer(cool, idle, new)
+    assert len(buffer) == len(cool) + len(idle) + len(new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-1.2, abs=0.01)
+
+
+def test_only_the_previous_cycle_lends_its_slope() -> None:
+    """The previous cycle, not the last one long enough to fit. A cycle MPC
+    ends itself after a sample or two stays the latest cool run through the
+    idle after it, still too short to fit, so meanwhile the cycle before it
+    lends, and MPC can start the next cycle on that. The next cycle then finds
+    nothing to borrow -- the run before it is the short one -- and the
+    reactive path takes it, as before. That is what keeps MPC, with no
+    switching hysteresis of its own, from chattering at its switching point
+    for as long as an older cycle stays in the buffer. And with two cycles
+    that can be fitted, the slope is the nearer one's, whatever the older one
+    says."""
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    idle = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [22.5, 22.55])
+    blip = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [22.6])
+    idle_after = _run(ACTION_IDLE, blip[-1].t + timedelta(minutes=5), [22.55, 22.6])
+    buffer = _buffer(cool, idle, blip, idle_after)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-1.2, abs=0.01)
+
+    new = _run(ACTION_COOL, idle_after[-1].t + timedelta(minutes=5), [22.65])
+    buffer = _buffer(cool, idle, blip, idle_after, new)
+    assert len(buffer) == len(cool) + len(idle) + len(blip) + len(idle_after) + len(new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.recovery_cool is None
+    assert planned.method_recovery_cool == "none"
+
+    nearer = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [22.6, 22.4, 22.2, 22.0])
+    idle_after = _run(ACTION_IDLE, nearer[-1].t + timedelta(minutes=5), [22.05, 22.1])
+    new = _run(ACTION_COOL, idle_after[-1].t + timedelta(minutes=5), [22.15])
+    buffer = _buffer(cool, idle, nearer, idle_after, new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
+
+
+def test_heat_and_cool_are_carried_over_independently() -> None:
+    """A zone that both heats and cools has the other recovery slope live
+    while a young cycle waits. Before v0.21.0 that kept MPC ready, but the
+    action just started dropped out of its candidates, so the cycle was
+    released all the same. The young cycle borrows its own action's previous
+    slope, and the live one is left as it is."""
+    heat = _run(ACTION_HEAT, _T0, [19.0, 19.15, 19.3, 19.45, 19.6])
+    idle = _run(ACTION_IDLE, heat[-1].t + timedelta(minutes=5), [19.6, 19.65])
+    cool = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [19.7, 19.5, 19.3, 19.1])
+    idle_after = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [19.15, 19.2])
+    new = _run(ACTION_COOL, idle_after[-1].t + timedelta(minutes=5), [19.25])
+    buffer = _buffer(heat, idle, cool, idle_after, new)
+    live = estimate_slopes(buffer, now=buffer[-1].t)
+    planned = carry_over_recovery_slopes(live, buffer, now=buffer[-1].t)
+    assert live.method_recovery_heat == "wls"
+    assert planned.recovery_heat == live.recovery_heat
+    assert planned.method_recovery_heat == "wls"
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
+
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.9, 22.8, 22.7, 22.6, 22.5])
+    idle = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [22.5, 22.45])
+    heat = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [22.4, 22.6, 22.8, 23.0])
+    idle_after = _run(ACTION_IDLE, heat[-1].t + timedelta(minutes=5), [22.95, 22.9])
+    new = _run(ACTION_HEAT, idle_after[-1].t + timedelta(minutes=5), [22.85])
+    buffer = _buffer(cool, idle, heat, idle_after, new)
+    live = estimate_slopes(buffer, now=buffer[-1].t)
+    planned = carry_over_recovery_slopes(live, buffer, now=buffer[-1].t)
+    assert live.method_recovery_cool == "wls"
+    assert planned.recovery_cool == live.recovery_cool
+    assert planned.method_recovery_cool == "wls"
+    assert planned.method_recovery_heat == "previous"
+    assert planned.recovery_heat is not None
+    assert planned.recovery_heat * 60.0 == pytest.approx(2.4, abs=0.01)
+
+    # Both young at once: each borrows its own action's previous slope.
+    heat = _run(ACTION_HEAT, _T0, [19.0, 19.15, 19.3, 19.45, 19.6])
+    idle = _run(ACTION_IDLE, heat[-1].t + timedelta(minutes=5), [19.6])
+    cool = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [19.7, 19.5, 19.3, 19.1])
+    idle_after = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [19.15])
+    young_heat = _run(ACTION_HEAT, idle_after[-1].t + timedelta(minutes=5), [19.1])
+    idle_between = _run(ACTION_IDLE, young_heat[-1].t + timedelta(minutes=5), [19.15])
+    young_cool = _run(ACTION_COOL, idle_between[-1].t + timedelta(minutes=5), [19.2])
+    buffer = _buffer(heat, idle, cool, idle_after, young_heat, idle_between, young_cool)
+    assert len(buffer) == 14
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.method_recovery_heat == "previous"
+    assert planned.recovery_heat is not None
+    assert planned.recovery_heat * 60.0 == pytest.approx(1.8, abs=0.01)
+    assert planned.method_recovery_cool == "previous"
+    assert planned.recovery_cool is not None
+    assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
+
+
+def test_a_cycle_straight_after_another_action_is_a_new_cycle() -> None:
+    """A young run begins a new cycle whatever action came before it, not only
+    idle: the other action straight before it, or a sample labelled unknown
+    (a gate held the action before anything had been committed)."""
+    cool = _run(ACTION_COOL, _T0, [23.0, 22.8, 22.6, 22.4])
+    idle = _run(ACTION_IDLE, cool[-1].t + timedelta(minutes=5), [22.45, 22.5])
+    for before in (ACTION_HEAT, ACTION_UNKNOWN):
+        between = _run(before, idle[-1].t + timedelta(minutes=5), [22.55])
+        new = _run(ACTION_COOL, between[-1].t + timedelta(minutes=5), [22.5])
+        buffer = _buffer(cool, idle, between, new)
+        planned = _planned(buffer, buffer[-1].t)
+        assert planned.method_recovery_cool == "previous", before
+        assert planned.recovery_cool is not None
+        assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
+
+
+def test_nothing_is_carried_over_without_an_earlier_cycle() -> None:
+    """With no earlier run of the action in the buffer -- after install, a
+    flush, or once the last one has aged out of the window -- there is
+    nothing to carry over, and the young cycle waits for its own slope."""
+    idle = _run(ACTION_IDLE, _T0, [21.0, 21.05, 21.1])
+    new = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [21.15])
+    buffer = _buffer(idle, new)
+    assert _planned(buffer, buffer[-1].t) == estimate_slopes(buffer, now=buffer[-1].t)
+
+
+def test_carrying_over_only_ever_fills_a_young_cycles_missing_slope() -> None:
+    """Over buffers built the way a zone builds them -- a sensor reporting
+    about every five minutes, the odd report lost, the odd outage, heat, cool
+    and idle in runs of their own lengths -- MPC plans with exactly the
+    estimate, except where a heat or cool slope is missing because its run
+    is too young to fit: only there is a slope carried over, of the right
+    sign, and marked as such."""
+    rng = random.Random(20261006)
+    trend = {ACTION_IDLE: 0.3 / 60, ACTION_HEAT: 2.0 / 60, ACTION_COOL: -1.8 / 60}
+    fields = {ACTION_HEAT: "recovery_heat", ACTION_COOL: "recovery_cool"}
+    carried = 0
+    for _ in range(300):
+        buffer: list[Sample] = []
+        t, temp, action = _T0, 21.0, ACTION_IDLE
+        for _ in range(60):
+            lost = rng.choices((0, 1, 2, 6), weights=(84, 10, 4, 2))[0]
+            step = timedelta(minutes=(lost + 1) * rng.uniform(4.5, 5.0))
+            t += step
+            temp += trend[action] * step.total_seconds() / 60.0 + rng.gauss(0.0, 0.03)
+            if rng.random() < 0.2:
+                action = rng.choice([a for a in trend if a != action])
+            buffer, _ = append_sample(buffer, now=t, temp=round(temp, 2), action=action)
+            live = estimate_slopes(buffer, now=t)
+            planned = carry_over_recovery_slopes(live, buffer, now=t)
+            expected = live
+            for act, field in fields.items():
+                value = getattr(planned, field)
+                if value == getattr(live, field):
+                    continue
+                carried += 1
+                assert getattr(live, field) is None
+                assert getattr(live, f"method_{field}") == "none"
+                assert getattr(live, f"sample_count_{field}") < SLOPE_MIN_SAMPLES
+                assert getattr(planned, f"method_{field}") == "previous"
+                assert value is not None
+                assert (value > 0) == (act == ACTION_HEAT)
+                expected = replace(expected, **{field: value, f"method_{field}": "previous"})
+            assert planned == expected
+    # Not vacuous: young cycles with an earlier one to carry over from are common.
+    assert carried > 500

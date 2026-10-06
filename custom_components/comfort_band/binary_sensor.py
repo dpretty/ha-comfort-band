@@ -38,6 +38,19 @@ class MpcReadyBinarySensor(ComfortBandZoneEntity, BinarySensorEntity):
     window. Without it, "I flipped mpc_enabled but the room behaviour
     didn't change" would be hidden in debug logs.
 
+    Until v0.21.0 it also went off on the refresh after a heat or cool cycle
+    began, unless the other recovery slope kept it on, for as long as that
+    cycle was too short for a recovery slope of its own: the slope came from
+    the latest run alone. A young cycle now carries over the previous cycle's
+    slope, so starting a cycle turns this off only when the cycle before it
+    has no slope to lend -- too short to fit (MPC can end a cycle after a
+    sample or two), or its fit discarded by the sign guard -- when there is
+    none left in the buffer, or when the cycle resumes after a gap in
+    sampling. And it can still go off once the young cycle can be fitted: at
+    about a sample a minute that is three minutes in, and a unit that has not
+    yet moved the room by then fits the wrong way round, which the sign guard
+    discards, leaving the cycle with no slope.
+
     The per-refresh safety bail-out (room outside band on a side whose
     recovery slope is missing) does NOT flip this sensor — `mpc_ready`
     means "MPC is equipped to consider acting," not "MPC is acting this

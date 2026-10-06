@@ -2755,6 +2755,105 @@ async def test_cached_idle_of_zero_is_substituted(
     assert state.mpc_ready is True
 
 
+# ----- v0.21.0: a young cycle carries over the last recovery slope (MPC only) -----
+
+
+async def test_a_carried_recovery_slope_does_not_reach_the_reactive_predictor(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The carried-over recovery slope is MPC's, like the cached idle slope:
+    the predictor's anticipatory shutoff must not fire on it, or a zone not on
+    MPC would change behaviour at the start of every cycle. Engineered so that
+    it would: fifteen minutes' lookahead at the carried 2.4 °C/h puts a room
+    0.4 °C above the band back inside it, which releases the cycle. On the
+    live slopes -- nothing yet for a cycle one sample old -- hysteresis holds
+    the cooling, as before."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    now = dt_util.utcnow()
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        lookahead_minutes=15,
+        last_action=ACTION_COOL,
+        last_action_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+    earlier = [
+        Sample(t=now - timedelta(minutes=40 - 2 * i), temp=23.4 - 0.08 * i, action=ACTION_COOL)
+        for i in range(8)
+    ]
+    idle = [
+        Sample(t=now - timedelta(minutes=20 - 4 * i), temp=22.8 + 0.02 * i, action=ACTION_IDLE)
+        for i in range(5)
+    ]
+    coordinator._samples_cache = [
+        *earlier,
+        *idle,
+        Sample(t=now - timedelta(minutes=1), temp=22.9, action=ACTION_COOL),
+    ]
+    hass.states.async_set(TEMP_ENTITY, "22.9", {})
+
+    state = await coordinator._async_update_data()
+
+    # MPC's view has the carried slope...
+    assert state.thermal_slopes.method_recovery_cool == "previous"
+    assert state.thermal_slopes.recovery_cool == pytest.approx(-2.4 / 60)
+    # ...the predictor's does not, so it holds the cooling above the band.
+    assert state.effective_high == 22.5
+    assert state.predicted_decision.action == ACTION_COOL
+
+
+async def test_the_carry_over_reads_the_buffer_the_estimate_read(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The idle-slope write between the estimate and the carry-over awaits the
+    store, and an apply task can append a sample meanwhile. A young run that
+    gained its fourth sample in between would get neither its own slope (the
+    estimate saw three) nor the previous cycle's (the carry-over saw four):
+    the very drop this release removes. So both read the buffer once."""
+    from unittest.mock import patch
+
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    now = dt_util.utcnow()
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        last_action=ACTION_COOL,
+        last_action_at=(now - timedelta(minutes=3)).isoformat(),
+    )
+    earlier = [
+        Sample(t=now - timedelta(minutes=40 - 2 * i), temp=23.4 - 0.08 * i, action=ACTION_COOL)
+        for i in range(8)
+    ]
+    idle = [
+        Sample(t=now - timedelta(minutes=20 - 4 * i), temp=22.8 + 0.02 * i, action=ACTION_IDLE)
+        for i in range(4)
+    ]
+    young = [
+        Sample(t=now - timedelta(minutes=3 - i), temp=22.9 - 0.04 * i, action=ACTION_COOL)
+        for i in range(3)
+    ]
+    coordinator._samples_cache = [*earlier, *idle, *young]
+    hass.states.async_set(TEMP_ENTITY, "22.8", {})
+    resolve = coordinator._resolve_idle_slope
+
+    async def appending(*args: Any, **kwargs: Any) -> Any:
+        # An apply lands the young run's fourth sample during the write.
+        fourth = Sample(t=now, temp=22.78, action=ACTION_COOL)
+        coordinator._samples_cache = [*coordinator._samples_cache, fourth]
+        return await resolve(*args, **kwargs)
+
+    with patch.object(coordinator, "_resolve_idle_slope", appending):
+        state = await coordinator._async_update_data()
+
+    assert state.thermal_slopes.sample_count_recovery_cool == 3
+    assert state.thermal_slopes.method_recovery_cool == "previous"
+    assert len(coordinator._samples_cache) == len(earlier) + len(idle) + len(young) + 1
+
+
 # ----- v0.13.0: deterministic fan-boost -----
 
 
