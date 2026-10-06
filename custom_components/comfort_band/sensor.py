@@ -143,26 +143,30 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
     bookkeeping are exposed via attributes for the card / debugging.
 
     Returns None (HA "unknown") when the relevant segment has fewer than
-    SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the
-    first few samples of a heat or cool run have no slope of their own. Since
-    v0.21.0, while the latest heat or cool run is that short -- a cycle just
-    started, or one MPC ended after a sample or two -- the slope shown is the
-    one MPC plans with, the previous cycle's, with `method_recovery_*` reading
-    "previous". It is unknown when that cycle was too short to fit (or its
-    fit was discarded), when there is none in the buffer, and once a run
-    that resumed after a gap in sampling has its first sample after the gap.
-    The
+    SLOPE_MIN_SAMPLES samples or the WLS denominator is singular -- the first
+    few samples of a heat or cool run have no slope of their own -- and for a
+    heat or cool slope fitted the wrong way round, which the v0.15.0 sign
+    guard discards (`method_recovery_*` reads "rejected"). Since v0.22.1 that
+    includes a run whose readings never change, which fits exactly 0, so a
+    zone whose reading sits still while it heats or cools is unknown at every
+    refresh rather than now and then. Since v0.21.0, while the latest heat or
+    cool run is too short for a slope of its own -- a cycle just started, or
+    one MPC ended after a sample or two -- the slope shown is the one MPC
+    plans with, the previous cycle's, with `method_recovery_*` reading
+    "previous". It is unknown when that cycle was too short to fit (or its fit
+    was discarded), when there is none in the buffer, and once a run that
+    resumed after a gap in sampling has its first sample after the gap. The
     live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
     idle stretch plus four samples more (v0.19.0): about 35 minutes with a
-    sensor reporting every minute, 50 with one reporting every five.
-    Meanwhile the cached idle slope is shown, if the zone has one. A run also
-    stops at a gap in sampling longer than SAMPLE_MAX_GAP_MINUTES (v0.20.0):
-    after an outage a resumed heat or cool run is unknown for its first few
-    samples, and a resumed idle stretch until four samples from after the
-    outage are past its settle window. A zone whose readings -- the room's,
-    and the humidity sensor's if it has one -- change less often than that,
-    with nothing else prompting a refresh in between, never gives a slope at
-    all, heat and cool included: each of its samples is a run of its own.
+    sensor reporting every minute, 50 with one reporting every five. Meanwhile
+    the cached idle slope is shown, if the zone has one. A run also stops at a
+    gap in sampling longer than SAMPLE_MAX_GAP_MINUTES (v0.20.0): after an
+    outage a resumed heat or cool run is unknown for its first few samples,
+    and a resumed idle stretch until four samples from after the outage are
+    past its settle window. A zone whose readings -- the room's, and the
+    humidity sensor's if it has one -- change less often than that, with
+    nothing else prompting a refresh in between, never gives a slope at all,
+    heat and cool included: each of its samples is a run of its own.
     """
 
     # HA has no constant for °C/h (no device class covers rate quantities);
@@ -222,7 +226,9 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
             # unreliable, regardless of sample count). `method_*` records
             # which estimator produced the slope: "wls", "none", "cached"
             # (idle only — the v0.12 persisted-slope fallback), "rejected"
-            # (recovery only — v0.15 sign guard discarded a wrong-sign fit),
+            # (recovery only — v0.15 sign guard discarded a wrong-sign fit, or
+            # since v0.22.1 the exactly-flat fit of a run whose readings
+            # never changed),
             # or "previous" (recovery only — v0.21 carried the previous cycle's
             # slope over a cycle too young for its own; the per-segment count
             # and spread still describe that young run, as they do the live
