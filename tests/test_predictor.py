@@ -1992,7 +1992,7 @@ def test_at_a_sample_a_minute_only_young_runs_borrow() -> None:
     assert replaced_a_fit > 100
 
 
-# ----- v0.22.1: a run of one reading fits exactly flat -----
+# ----- v0.22.1: a run whose readings never change fits exactly flat -----
 
 
 def _flat_times(rng: random.Random) -> list[datetime]:
@@ -2004,7 +2004,7 @@ def _flat_times(rng: random.Random) -> list[datetime]:
     return [start + timedelta(seconds=every * i + rng.uniform(0.0, 3.0)) for i in range(count)]
 
 
-def test_a_run_of_one_reading_fits_exactly_flat_at_every_refresh() -> None:
+def test_a_run_whose_readings_never_change_fits_exactly_flat_at_every_refresh() -> None:
     """A recovery run whose readings are all the same -- a sensor reporting
     unchanged values, or refreshes on humidity with apparent temperature off
     -- fits 0 in exact arithmetic. In floating point it fitted the rounding
@@ -2029,7 +2029,7 @@ def test_a_run_of_one_reading_fits_exactly_flat_at_every_refresh() -> None:
                 assert getattr(slopes, f"sample_count_{field}") == len(run)
 
 
-def test_an_idle_run_of_one_reading_reads_exactly_flat() -> None:
+def test_an_idle_run_whose_readings_never_change_reads_exactly_flat() -> None:
     """Idle keeps both signs, so a flat idle run is not discarded: it is
     measured as what it is, a room holding still, rather than as +/-1e-15."""
     samples = _settled_idle(120, 8, start_temp=20.37, slope_per_h=0.0)
@@ -2103,10 +2103,10 @@ def test_a_change_of_reading_too_small_for_the_predictor_is_still_a_slope() -> N
 
 def test_a_flat_cycle_lends_nothing_to_the_next() -> None:
     """v0.21.0 carries the previous cycle's slope over a cycle too young for
-    its own, through the sign guard. A previous cycle of one reading lent its
-    rounding at the refreshes where that came out the right way round, and
-    MPC planned the new cycle as one that holds the room where it is. It now
-    lends nothing at any refresh."""
+    its own, through the sign guard. A previous cycle whose readings never
+    changed lent its rounding at the refreshes where that came out the right
+    way round, and MPC planned the new cycle as one that holds the room where
+    it is. It now lends nothing at any refresh."""
     flat = _run(ACTION_HEAT, _T0, [18.9] * 5)
     idle = _run(ACTION_IDLE, flat[-1].t + timedelta(minutes=5), [18.9] * 3)
     new = _run(ACTION_HEAT, idle[-1].t + timedelta(minutes=5), [18.9])
@@ -2132,11 +2132,11 @@ def test_a_flat_cycle_lends_nothing_to_the_next() -> None:
 def test_mpc_does_not_leave_a_room_below_its_band_on_a_flat_heat_run(
     current: str, room: float, latest: list[float]
 ) -> None:
-    """The finding's room: 19.2-21.0 °C, a heat run of one reading, and an idle
-    drift upwards. Planned as a unit that holds the room where it is, heating
-    scores no time in band, and nor does an hour of idling -- but idling ends
-    nearer the band, so MPC idled below it whenever the rounding came out
-    positive. Now heating has no slope, MPC is not ready, and the predictor
+    """The finding's room: 19.2-21.0 °C, a heat run whose readings never
+    change, and an idle drift upwards. Planned as a unit that holds the room
+    where it is, heating scores no time in band, and nor does an hour of
+    idling -- but idling ends nearer the band, so MPC idled below it whenever
+    the rounding came out positive. Now heating has no slope, MPC is not ready, and the predictor
     heats at every refresh."""
     flat = _run(ACTION_HEAT, _T0, [18.9] * 5)
     idle = _run(ACTION_IDLE, flat[-1].t + timedelta(minutes=5), [18.9] * 3)

@@ -438,18 +438,19 @@ def _wls_slope(segment: list[Sample], *, now: datetime) -> float | None:
     magnitude.
 
     Temperatures are fitted relative to the oldest one (v0.22.1). That leaves
-    the slope as it was, but a run whose readings are all the same now fits
-    exactly 0. Fitted as they came, such a run's numerator was the difference
-    of two products equal but for rounding, so its slope was that rounding --
-    under 1e-12 °C/h either way, with the sign set by the weights and so by
-    `now`. The sign guard then discarded a flat recovery run at one refresh
-    and passed it at the next, and passed, it had MPC plan heating as holding
-    the room where it is, which below the band loses to any idle drift
-    upwards: MPC idled there. A run of one reading comes from refreshes that
-    leave the reading alone -- on a humidity update with apparent temperature
-    off, or from a sensor that reports unchanged values. A run whose reading
-    changed at all fits well clear of the rounding: the smallest recovery fit
-    in ten days of five zones' history was 0.005 °C/h.
+    the slope as it was, to within rounding, but a run whose readings are all
+    the same now fits exactly 0. Fitted as they came, such a run's numerator
+    was the difference of two products equal but for rounding, so its slope
+    was that rounding -- about 1e-12 °C/h at most, either way, with the sign
+    set by the weights and so by `now`. The sign guard then discarded a flat
+    recovery run at one refresh and passed it at the next, and passed, it had
+    MPC plan heating as holding the room where it is, which below the band
+    loses to any idle drift upwards: MPC idled there. A run whose readings
+    never change comes from refreshes that leave the reading alone -- on a
+    humidity update with apparent temperature off, or from a sensor that
+    reports unchanged values. A run whose reading changed at all fits well
+    clear of the rounding: the smallest recovery fit in ten days of five
+    zones' history was 0.005 °C/h.
     """
     if len(segment) < SLOPE_MIN_SAMPLES:
         return None
@@ -535,19 +536,20 @@ def _reject_wrong_sign(
     reactive predictor / MPC bail-out, which heats when below band. Idle drift is
     legitimately ±, so this guard applies only to the recovery slopes.
 
-    A flat run is discarded too: since v0.22.1 a run of one reading fits
-    exactly 0 (`_wls_slope`), so the verdict on it no longer turns on rounding.
-    There is no margin beyond that. The predictor's flatness threshold,
-    SLOPE_EPSILON_PER_HOUR, was measured as one and not taken. Replayed over
-    ten days of five zones' history, it found no flat run to discard. What it
-    did discard was 20 fits from 14 runs that had moved the room by 0.2-1.8
-    °C: long cycles whose latest samples had levelled off, or caught a unit
-    cycling its compressor between rises. That took MPC's readiness at 13
-    refreshes and changed 3 decisions. Twice it released a cool cycle MPC was
-    keeping on at the top of the band. Once it idled a room 0.56 °C below
-    its band for a refresh, where v0.22.0 heated at once. A slope under 0.05
-    °C/h is flat over the predictor's five-minute lookahead, but it is still a
-    measurement.
+    A flat run is discarded too: since v0.22.1 a run whose readings never
+    change fits exactly 0 (`_wls_slope`), so the verdict on it no longer turns
+    on rounding. There is no margin beyond that. The predictor's flatness
+    threshold, SLOPE_EPSILON_PER_HOUR, was measured as one and not taken.
+    Replayed over ten days of five zones' history, it found no flat run to
+    discard. What it did discard was 14 fits that v0.22.0 kept, from 7 cycles
+    of 4-21 samples whose readings had moved 0.007-0.85 °C by then: long
+    cycles whose latest samples had levelled off, one unit cycling its
+    compressor, and two runs of only four samples. That took MPC's readiness
+    at 13 refreshes and changed 3 decisions. Twice it released a cool cycle
+    MPC was keeping on near the top of the band. Once it idled a room 0.56 °C
+    below its band for a refresh, where v0.22.0 heated at once. A slope under
+    0.05 °C/h is flat over the predictor's five-minute lookahead, but it is
+    still a measurement.
     """
     if slope is None:
         return None, method

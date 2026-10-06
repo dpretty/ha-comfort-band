@@ -2755,6 +2755,37 @@ async def test_cached_idle_of_zero_is_substituted(
     assert state.mpc_ready is True
 
 
+async def test_a_live_idle_slope_of_zero_is_used_and_persisted(
+    hass: HomeAssistant,
+    coordinator: ZoneCoordinator,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Since v0.22.1 an idle run whose readings never change fits exactly 0.0
+    rather than +/-1e-15, so a room holding still now gives this value every
+    time. It is a live measurement like any other: used ahead of an older
+    cached slope, and written over it. Both steps key off `is None`; a
+    truthiness test at either would let a stale 0.3 °C/h stand in for a room
+    that is not moving."""
+    freezer.move_to("2026-05-19 12:00:00+00:00")
+    await coordinator._store.async_update_zone(
+        "office",
+        learning_enabled=True,
+        persisted_idle_slope=0.3 / 60,
+        persisted_idle_slope_at=(dt_util.utcnow() - timedelta(minutes=60)).isoformat(),
+    )
+    seed_end = dt_util.utcnow() - timedelta(seconds=90)
+    _seed_idle_drift(coordinator, start_temp=20.37, slope_per_h=0.0, now=seed_end)
+    hass.states.async_set(TEMP_ENTITY, "20.37", {})
+
+    state = await coordinator._async_update_data()
+
+    assert state.idle_slope_source == "live"
+    assert state.thermal_slopes.idle == 0.0
+    zone = coordinator._store.get_zone("office")
+    assert zone["persisted_idle_slope"] == 0.0
+    assert zone["persisted_idle_slope_at"] == seed_end.isoformat()
+
+
 # ----- v0.21.0: a young cycle carries over the last recovery slope (MPC only) -----
 
 

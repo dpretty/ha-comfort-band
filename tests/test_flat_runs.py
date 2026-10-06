@@ -10,11 +10,11 @@ heat run at one refresh and let it through at the next, and MPC then planned
 with heating as something that holds the room where it is: below the band
 that loses to any idle drift upwards, and MPC idled there.
 
-A run of one reading needs refreshes that leave the reading alone. Here the
-room's temperature never changes -- a sensor that reports only on a change
-bigger than the room makes, on a night the unit can only just hold it -- and
-the zone refreshes either on its humidity sensor, which it watches with
-apparent temperature off as well as on, or on a temperature sensor with
+A run whose readings never change needs refreshes that leave the reading
+alone. Here the room's temperature never changes -- a sensor that reports only
+on a change bigger than the room makes, on a night the unit can only just hold
+it -- and the zone refreshes either on its humidity sensor, which it watches
+with apparent temperature off as well as on, or on a temperature sensor with
 `force_update`, which reports the same value every time.
 
 Every test drives an enabled zone through the real listeners. v0.22.0's
