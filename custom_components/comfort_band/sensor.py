@@ -149,8 +149,9 @@ class ThermalSlopeSensor(ComfortBandZoneEntity, SensorEntity):
     started, or one MPC ended after a sample or two -- the slope shown is the
     one MPC plans with, the previous cycle's, with `method_recovery_*` reading
     "previous". It is unknown when that cycle was too short to fit (or its
-    fit was discarded), when there is none in the buffer, and when the run
-    resumed after a gap in sampling. The
+    fit was discarded), when there is none in the buffer, and once a run
+    that resumed after a gap in sampling has its first sample after the gap.
+    The
     live idle slope is also missing for the first IDLE_SETTLE_MINUTES of an
     idle stretch plus four samples more (v0.19.0): about 35 minutes with a
     sensor reporting every minute, 50 with one reporting every five.

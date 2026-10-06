@@ -1590,6 +1590,19 @@ def test_a_cycle_resumed_after_a_gap_carries_nothing_over() -> None:
     assert planned.recovery_cool is not None
     assert planned.recovery_cool * 60.0 == pytest.approx(-2.4, abs=0.01)
 
+    # A gap inside the previous cycle splits it, and only the part after the
+    # gap can lend: too short to fit here, so nothing -- though the part
+    # before the gap could have been fitted, and the unit kept cooling at the
+    # same rate through the gap, so a fit across it would look plausible.
+    tail = _run(ACTION_COOL, resumed_at, [22.1, 22.0])
+    idle = _run(ACTION_IDLE, tail[-1].t + timedelta(minutes=5), [22.05, 22.1])
+    new = _run(ACTION_COOL, idle[-1].t + timedelta(minutes=5), [22.15])
+    buffer = _buffer(before, tail, idle, new)
+    assert len(buffer) == len(before) + len(tail) + len(idle) + len(new)
+    planned = _planned(buffer, buffer[-1].t)
+    assert planned.recovery_cool is None
+    assert planned.method_recovery_cool == "none"
+
     # However short the cycle before the outage was: the run after the gap is
     # its continuation, not a new cycle, so the cycle before *that* lends
     # nothing either.
