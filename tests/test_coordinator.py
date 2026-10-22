@@ -6155,6 +6155,8 @@ async def test_next_change_reports_the_schedule_under_an_override(
     assert state.override_active is True
     assert state.scheduled is True
     assert state.next_change == datetime.fromisoformat("2026-05-19 09:00:00+00:00")
+    # The schedule's band from then, not the override's.
+    assert (state.next_low, state.next_high) == (17.0, 24.0)
 
 
 async def test_next_change_none_and_unscheduled_without_a_schedule(
@@ -6298,7 +6300,7 @@ async def test_next_change_is_the_transition_not_the_start_of_its_ramp(
     "current",
     [
         [{"at": "07:00", "low": 22.0, "high": 20.0}],  # ValueError: low above high
-        [{"at": 700, "low": 18.0, "high": 22.0}],  # not a time
+        [{"at": 700, "low": 18.0, "high": 22.0}],  # TypeError: `at` isn't a string
         [{"at": "07:00", "high": 22.0}],  # KeyError: no low
     ],
 )
@@ -6307,28 +6309,6 @@ async def test_next_change_unscheduled_for_corrupt_data(
 ) -> None:
     await coordinator._store.async_update_zone(
         "office", schedules={"home": {"baseline": current, "current": current}}
-    )
-    hass.states.async_set(TEMP_ENTITY, "20.0", {})
-    state = await coordinator._async_update_data()
-    assert (state.sched_low, state.sched_high) == (19.5, 22.5)  # the manual band
-    assert state.scheduled is False
-    assert state.next_change is None
-
-
-async def test_next_change_unscheduled_for_a_corrupt_schedule(
-    hass: HomeAssistant, coordinator: ZoneCoordinator
-) -> None:
-    """A schedule that won't parse falls back to the manual band, so it sets
-    nothing: unscheduled, and the refresh still completes."""
-    # Bypasses the validating setter, as a hand-edited store would.
-    await coordinator._store.async_update_zone(
-        "office",
-        schedules={
-            "home": {
-                "baseline": [{"at": "07:00", "low": 22.0, "high": 20.0}],
-                "current": [{"at": "07:00", "low": 22.0, "high": 20.0}],
-            }
-        },
     )
     hass.states.async_set(TEMP_ENTITY, "20.0", {})
     state = await coordinator._async_update_data()
