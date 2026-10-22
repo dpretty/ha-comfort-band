@@ -27,6 +27,9 @@ CONF_HUMIDITY_SENSOR: Final = "humidity_sensor"
 CONF_FALLBACK_TEMP_SENSOR: Final = "fallback_temp_sensor"
 CONF_FALLBACK_TO_CLIMATE: Final = "fallback_to_climate"
 DEFAULT_FALLBACK_TO_CLIMATE: Final = True
+# v0.24.0 peak saving. OptionsFlow-only, like the fallback sensor: the entity
+# whose `on` state means a peak period is in progress (None = none configured).
+CONF_PEAK_ENTITY: Final = "peak_entity"
 CONF_DEADBAND_BELOW: Final = "deadband_below"
 CONF_DEADBAND_ABOVE: Final = "deadband_above"
 CONF_MIN_CYCLE_MINUTES: Final = "min_cycle_minutes"
@@ -238,6 +241,53 @@ DEFAULT_BAND_RAMP_MINUTES: Final = 0
 BAND_RAMP_MINUTES_MIN: Final = 0
 BAND_RAMP_MINUTES_MAX: Final = 120
 BAND_RAMP_MINUTES_STEP: Final = 5
+
+# Peak saving (v0.24.0). Opt-in per zone via `switch.{zone}_peak_saving_enabled`
+# plus a peak entity chosen in the zone's OptionsFlow, whose `on` state means a
+# peak period is in progress: a demand-charge window, a time-of-use peak, a
+# price spike, a demand-response event. While one is on the band relaxes --
+# the floor drops by `peak_heat_offset` and the ceiling rises by
+# `peak_cool_offset` -- and the zone runs plain hysteresis on the relaxed band,
+# so a cycle starts only once the room is past a relaxed edge by the deadband.
+# Before a peak whose start the entity announces (its `next_event` attribute,
+# which a schedule helper sets), the band steps toward the side the room will
+# drift away from, `peak_precondition_minutes` ahead of the start: the floor
+# rises by the heating offset, or the ceiling falls by the cooling offset, so
+# the room banks no more than the peak will borrow. 0 minutes turns that off.
+DEFAULT_PEAK_HEAT_OFFSET_C: Final = 1.0
+DEFAULT_PEAK_COOL_OFFSET_C: Final = 1.0
+PEAK_OFFSET_MIN: Final = 0.0
+PEAK_OFFSET_MAX: Final = 5.0
+PEAK_OFFSET_STEP: Final = 0.5
+DEFAULT_PEAK_PRECONDITION_MINUTES: Final = 60
+PEAK_PRECONDITION_MINUTES_MIN: Final = 0
+PEAK_PRECONDITION_MINUTES_MAX: Final = 180
+PEAK_PRECONDITION_MINUTES_STEP: Final = 15
+# Pre-conditioning stops this far inside the band's far edge, so it never
+# narrows the band below the width the defensive clamp in the coordinator
+# falls back to.
+PEAK_PRECONDITION_GAP_C: Final = 0.5
+# Pre-conditioning follows the zone's most recent heat or cool, but only if the
+# zone was heating or cooling within this long. A zone that has needed neither
+# for a day is in weather where the room holds the band unaided, and starting a
+# cycle just to pre-condition would add a run the peak never needed.
+PEAK_RECENT_ACTIVE_HOURS: Final = 24
+
+# States of `sensor.{zone}_peak_saving`.
+PEAK_STATE_OFF: Final = "off"
+PEAK_STATE_NO_SIGNAL: Final = "no_signal"
+PEAK_STATE_WAITING: Final = "waiting"
+PEAK_STATE_PRECONDITIONING: Final = "preconditioning"
+PEAK_STATE_ACTIVE: Final = "active"
+PEAK_STATE_OVERRIDE: Final = "override"
+PEAK_STATES: Final = (
+    PEAK_STATE_OFF,
+    PEAK_STATE_NO_SIGNAL,
+    PEAK_STATE_WAITING,
+    PEAK_STATE_PRECONDITIONING,
+    PEAK_STATE_ACTIVE,
+    PEAK_STATE_OVERRIDE,
+)
 
 # Number entity bounds (matches the legacy input_number ranges).
 TEMP_MIN: Final = 16.0

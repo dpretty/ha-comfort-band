@@ -43,6 +43,11 @@ class FeedbackEntry(TypedDict):
     # v0.18.0: ROOM_SOURCE_* the room_temp came from; absent on entries
     # written before v0.18.0, so readers must .get() it.
     room_source: NotRequired[str]
+    # v0.24.0: PEAK_STATE_* at record time. `low` / `high` are the band in
+    # force, which peak saving relaxes in a peak (`active`) and narrows ahead
+    # of one (`preconditioning`) -- so feedback given then is about a band the
+    # user did not set. Absent on entries written before v0.24.0.
+    peak_state: NotRequired[str]
 
 
 class FeedbackData(TypedDict):

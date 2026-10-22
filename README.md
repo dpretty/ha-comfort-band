@@ -10,6 +10,10 @@ Each zone gets its own band, override, and per-profile schedule. A **profile** (
 
 ## Status
 
+**v0.24.0** adds peak saving: a way to keep a zone's heating and cooling out of times when power costs far more than usual, such as a demand-charge window, a time-of-use peak, a price spike or a demand-response event. You give a zone an entity that is `on` during a peak (a Schedule helper, a Threshold helper on a price sensor, or anything an automation switches) and turn on `switch.{zone}_peak_saving_enabled`. While the entity is on, the band relaxes by `peak_heat_offset` below and `peak_cool_offset` above (1 °C each by default), and the zone runs plain hysteresis on it. A cycle then starts only once the room is past a relaxed edge by the deadband, and it stops at that edge. Nothing starts early, a cycle running when the peak starts is released once the room is inside the relaxed band, and no fan boost is commanded. When the entity announces the next start in a `next_event` attribute, as a schedule helper does, the band steps toward the edge the room will drift away from `peak_precondition_minutes` before the start (60 by default). The floor rises by the heating offset, or the ceiling falls by the cooling offset, so the room banks what the peak will let it lose without leaving its band. An override suspends all of it. `sensor.{zone}_peak_saving` says what the zone is doing. See [Peak periods](#peak-periods-v0240).
+
+**Upgrading.** Nothing to do. Peak saving is off on every zone until a peak entity is chosen in **Configure** and the switch is turned on; until then every zone controls exactly as before. A zone pre-conditions only after it has heated or cooled on this version, because the stamp that says when it last did is new.
+
 **v0.23.0** says when a zone's band next changes, for the card's Now tab ("Comfortable · 18–23° until 9 pm"). A new `sensor.{zone}_next_band_change` gives the time the schedule next moves the band, with the band from then in its `low` and `high` attributes. Its `scheduled` attribute says whether a schedule sets the zone's band at all; when none does, the manual band is the zone's band, so an override's band stays in force after the override ends. A transition that sets the same band again isn't a change. Control is unchanged.
 
 **v0.22.1** makes a flat run's slope exactly flat. A slope is a weighted least-squares fit over the latest run of an action, and when every reading in the run is the same that fit is 0. In floating point it came out as the rounding left between two equal products instead: about ±1e-15 °C/min, with its sign set by the weights, which move with the clock. The v0.15.0 sign guard compares a recovery slope against exactly zero. So a flat heat or cool run was discarded at one refresh and kept at the next, and since v0.21.0 a flat previous cycle could lend its rounding to a young one.
@@ -236,6 +240,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
    - **Room-temperature sensor**: a `sensor.*` of `device_class: temperature` to watch.
    - **Humidity sensor (optional)**: a `sensor.*` of `device_class: humidity`. When set, enables apparent temperature ("feels like"). Can be added / changed / cleared later via **Configure** on the zone entry.
    - **Fallback (v0.18.0, via Configure only)**: an optional second temperature sensor to read from while the main one is unavailable, and whether the climate entity's own reading may be used as the last resort (on by default). Either kicks in after the main sensor has been dark for five minutes.
+   - **Peak period entity (v0.24.0, via Configure only)**: an optional entity that is `on` while a peak period is in progress, for peak saving. See [Peak periods](#peak-periods-v0240).
 3. Repeat for every room.
 
 ## Entities created per zone
@@ -244,11 +249,13 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 |---|---|---|
 | `number` | `manual_low`, `manual_high` | UI writes start an override |
 | `number` | `override_hours`, `deadband_below`, `deadband_above`, `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`, `passive_tolerance`, `mpc_horizon_minutes`, `band_ramp_minutes` | Tunables |
-| `sensor` | `effective_low`, `effective_high` | Active band (override or schedule) |
+| `number` | `peak_heat_offset`, `peak_cool_offset`, `peak_precondition_minutes` | (v0.24.0) Peak saving: how far a peak relaxes the floor and the ceiling (0–5 °C, default 1.0 each), and how long before an announced peak the band steps toward the useful edge (0–180 min, default 60; 0 turns pre-conditioning off). |
+| `sensor` | `effective_low`, `effective_high` | Active band (override or schedule). Since v0.24.0 also shaped by peak saving: relaxed during a peak, stepped ahead of one. |
 | `sensor` | `room_temperature` | Diagnostic mirror of the reading driving control — the configured sensor, or (v0.18.0) the stand-in named by its `source` attribute (`primary` / `fallback_sensor` / `climate` / `none`). Also carries `humidity_sensor`, `fallback_temp_sensor` (configured entity_ids, or null) and `fallback_to_climate` as state attributes. |
 | `sensor` | `apparent_temperature` | Steadman 1994 "feels like". Equals room temp when no humidity sensor is configured. |
 | `sensor` | `override_ends` | Timestamp; null when no override |
 | `sensor` | `next_band_change` | (v0.23.0) Timestamp: when the schedule next changes the zone's band. The schedule's times are read in HA's time zone; the state is published in UTC like every timestamp. Attributes `low` / `high` give the band from then, in °C (a band ramp eases into it either side of that time). `scheduled` is true when a schedule sets the zone's band; false means the manual band is the zone's band, so an override's band stays in force after the override ends. Unknown when nothing is scheduled or the band never changes. Reports the schedule under an override too. |
+| `sensor` | `peak_saving` | (v0.24.0) What peak saving is doing: `off` (switched off, or no peak entity), `no_signal` (the peak entity is missing, unavailable or unknown, which counts as no peak), `waiting`, `preconditioning`, `active` (a peak is on and the band is relaxed) or `override` (an override is in force during a peak or its lead time, so peak saving stands aside). Attributes: `peak_entity`; `next_start` (the announced start of the next peak, while none is on); `ends` (the peak entity's next boundary while one is on); `low_adjustment` / `high_adjustment` (how far peak saving moved each edge of the band, signed °C: the effective band minus these is the band without it); `precondition` (`heating` / `cooling` while pre-conditioning, otherwise null). |
 | `sensor` | `current_action` | `heating` / `cooling` / `idle` / `unknown` |
 | `sensor` | `thermal_slope` | Current learned slope (°C/h). Attributes: `idle_slope`, `recovery_slope_heat`, `recovery_slope_cool`, `sample_count`, `window_minutes`, `last_updated`. v0.9.1 added per-segment diagnostics: `sample_count_idle / recovery_heat / recovery_cool`, `std_dev_idle / recovery_heat / recovery_cool` (°C), `method_idle / recovery_heat / recovery_cool` (`"wls"` or `"none"`). Each slope is None until its segment has enough samples. v0.15.0: a recovery slope fitted the wrong way round (heating that cools, cooling that warms) is discarded — None, with `method_recovery_*` reading `rejected`; since v0.22.1 that includes a run whose readings never change, which fits exactly 0, so a zone whose reading sits still while it heats or cools shows `rejected` at every refresh. v0.19.0: the idle slope additionally leaves out the first 30 min of the idle stretch (the cached value is shown meanwhile, if the zone has one), `sample_count_idle` / `std_dev_idle` describe only the samples behind the idle estimate, and `idle_slope_cached_age_min` counts from the newest of them. v0.20.0: a run stops at a gap of more than 17 min between samples, so after an outage the segment counts restart and the run that resumes is fitted on its own — for idle, once it is past the settle window of the stretch, which is still measured from where the stretch began. v0.21.0: while the latest heat or cool run is too short for a recovery slope of its own (a cycle just started, or one MPC ended after a sample or two), the slope shown is the one MPC plans with, the previous cycle's (if that cycle could be fitted), and `method_recovery_*` reads `previous`; the counts and spreads still describe the short run. Nothing is carried over to a cycle that resumes after a gap, from its first sample after the gap. v0.22.0: a run still running also reads `previous` until it has been watched for 10 min, so at a fast cadence `sample_count_recovery_*` can show 4–10 beside it; and a running run that has had no sample for more than 17 min borrows nothing, so `method_recovery_*` stops reading `previous`. |
 | `sensor` | `predicted_action` | What the predictor would issue right now. Always populated; flip `learning_enabled` ON to forward to climate. |
@@ -262,6 +269,7 @@ A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https
 | `switch` | `mpc_enabled` | Gates the v0.8 model-predictive controller. Layered on `learning_enabled`: both must be ON, **and** `mpc_ready` must be True, for MPC's decision to reach climate. Default OFF. |
 | `switch` | `use_apparent_temperature` | When ON, hysteresis decisions use the apparent value instead of the raw room reading. Falls back to room temp automatically if humidity is unavailable. Default OFF. |
 | `switch` | `fan_control_enabled` | Gates the v0.13.0 deterministic fan-boost. When ON, the climate's fan mode is commanded by action (see the two selects below). Default OFF; a no-op until fan modes are picked. |
+| `switch` | `peak_saving_enabled` | (v0.24.0) Gates peak saving. Default OFF, and a no-op until a peak entity is chosen in **Configure**. |
 | `select` | `active_fan_mode` | Fan mode commanded while heating/cooling. Options come live from the climate's `fan_modes`, plus a leading `(none)` (= don't command this side). Unset by default. |
 | `select` | `idle_fan_mode` | Fan mode commanded while idle (`fan_only`). Same options as `active_fan_mode`; pick a quiet level to stop full-speed air-cycling. Unset by default. |
 | `select` | `schedule_assignment` | v0.14.0. Points the zone at a named shared schedule. Options: `Own schedule` (default) + every shared schedule's name. Exposes `schedule_id` and a `shared_schedules` summary (`id` / `name` / member rooms) as attributes for the card. |
@@ -321,6 +329,47 @@ Existing gates still apply on top: MPC-anticipated heat is still subject to `min
 - `descriptions` — a `{profile_name: description}` map; each profile's optional description as set via `create_profile` / `clone_profile`.
 
 The card uses presence of `default_profile` as a feature flag — if it's missing, the card knows it's talking to a pre-v0.3.0 install and hides the CRUD affordances.
+
+## Peak periods (v0.24.0)
+
+Some tariffs make power expensive at particular times: a demand charge on the month's highest draw inside a set window, a time-of-use peak, a wholesale price spike, a utility's demand-response event. Peak saving keeps a zone's heating and cooling out of those times as far as comfort allows. It is off by default, and does nothing until a zone has both a peak entity and its switch on.
+
+**Setting it up.**
+
+1. Make an entity that is `on` while a peak is in progress:
+   - a **Schedule** helper (**Settings → Devices & services → Helpers → Schedule**) for fixed windows, say weekdays 16:00–20:00. It also announces each start in its `next_event` attribute, which pre-conditioning needs;
+   - a **Threshold** helper on a price sensor, for price spikes;
+   - an `input_boolean` or `switch` that an automation turns on for a demand-response event, or a template `binary_sensor`. A template can announce a start too, with a `next_event` attribute holding a datetime or an ISO 8601 string (read as local time when it carries no offset).
+2. In the zone's **Configure** dialog, choose it as **Peak period entity**.
+3. Turn on `switch.{zone}_peak_saving_enabled`.
+4. Tune `number.{zone}_peak_heat_offset` and `peak_cool_offset` (1 °C each by default), and `peak_precondition_minutes` (60 by default; 0 turns pre-conditioning off).
+
+**During a peak** the band relaxes: the floor drops by `peak_heat_offset` and the ceiling rises by `peak_cool_offset`, never past the climate entity's `min_temp` / `max_temp` (moved inward to a whole setpoint step). Home Assistant refuses a setpoint outside those, and the unit would then keep the one it had. The zone runs plain hysteresis on the relaxed band, whatever its learning and MPC switches say, as it does on a stand-in reading:
+
+- Heating starts only once the room is below the relaxed floor by `deadband_below` (0.5 °C further on a stand-in reading) and stops at the relaxed floor, which is also the setpoint sent. Cooling likewise, at the relaxed ceiling.
+- Nothing starts early. The predictor's and MPC's anticipatory starts, MPC's hold on a cycle young enough to be planned on a borrowed slope, and its heating toward the top of the band are all suspended for the peak. A cycle running when the peak starts is released once the room is inside the relaxed band, which is at once unless the room is still past a relaxed edge. The predictor and MPC go on running in shadow, so `mpc_action` still shows what MPC would do.
+- The fan boost (`active_fan_mode`) isn't commanded during a peak, so a cycle that starts in one runs on whatever fan the unit has. A cycle already boosted when the peak starts keeps that fan. The idle fan mode is still commanded.
+- Offsets of 0 leave the band as it is, but the zone still runs plain hysteresis for the peak.
+
+With a 20–23 °C band, offsets of 1 °C and the default deadbands, heating in a peak waits until the room is below 18.7 °C and stops at 19 °C; cooling waits until it is above 24.5 °C and stops at 24 °C.
+
+**Before a peak** whose start the entity announces, `peak_precondition_minutes` ahead of it, the band steps toward the edge the room will drift away from during the peak. Pre-heating raises the floor by `peak_heat_offset`; pre-cooling lowers the ceiling by `peak_cool_offset`. Neither comes closer than 0.5 °C to the far edge, and the room never leaves its band: it banks no more than the peak will let it lose. With the same band and a peak at 17:00, the floor is 21 °C from 16:00, and from 17:00 the band is 19–24 °C.
+
+- **Which way.** The way the zone last ran, heating or cooling, provided it did so in the last 24 hours. A zone that has needed neither for a day is in weather its room holds unaided, and isn't started just to pre-condition. Not if the room is clearly drifting the other way on its own right now, by the idle slope MPC plans with (beyond 0.05 °C/h): a room the afternoon sun is already warming needs no pre-heating, even if the zone heated that morning, and a room already cooling on its own needs no pre-cooling.
+- **How.** Hysteresis and the predictor simply heat to the raised floor, or cool to the lowered ceiling. MPC sees the step coming in its lookahead and, as with a scheduled rise, may start up to `mpc_horizon_minutes` before the lead time. The relaxation is not shown to MPC ahead of time, since a wider band in the lookahead would make idling look fine and take heat out of the run-up.
+- **When.** A timer wakes the zone when the lead time begins, so a quiet room steps on time. The stepped band holds until the announced start, when the peak entity turning on relaxes it. An entity that turns on late finds the band back to normal from the first refresh after the announced start until it does; one whose announced start moves takes the step with it.
+
+**Overrides, profiles and shared schedules.** An override suspends peak saving. Someone asking for a band now gets it, during a peak or its lead time as at any other (state `override`); when the override ends, peak saving resumes. Peak settings are per zone and apply on top of whatever band the zone's schedule resolves, under any profile, band ramp included. Give zones that share a schedule the same settings, or they will drift apart in a peak.
+
+**Limits.**
+
+- A dead signal (the entity missing, `unavailable` or `unknown`) counts as no peak, so the zone returns to its normal band at once (`no_signal`). A signal that flaps is followed as it flaps.
+- When a peak ends, every zone that drifted toward its relaxed edge starts recovering at once.
+- After a long peak, a zone on MPC may have no recovery slope left in its 90-minute sample window, so the reactive predictor drives the recovery until a cycle has run long enough to fit.
+- A cycle already heating or cooling when a peak starts or ends keeps its setpoint until `min_cycle_minutes` have passed since it was last commanded. That is the same-mode gate, as for any re-issue.
+- Only `next_event` announces a start; a `calendar` entity's start time is not read.
+- If Home Assistant restarts during a peak and the peak entity is set up after the zone, the zone's first refresh sees no entity and uses its normal band until the entity appears, a few seconds later. A room below its normal floor can get a short heat call then.
+- A zone in shadow mode commits no cycles, so its record of when it last heated or cooled stops moving: a day after its last real cycle it stops showing pre-conditioning, and its sensor reads `waiting` ahead of a peak. It does show `active` during one.
 
 ## Importing a legacy schedule
 

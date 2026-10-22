@@ -139,6 +139,32 @@ class FanControlEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
         await self.coordinator.async_set_fan_control_enabled(False)
 
 
+class PeakSavingEnabledSwitch(ComfortBandZoneEntity, SwitchEntity):
+    """v0.24.0 peak-saving opt-in. When ON and the zone has a peak entity
+    (chosen in its Configure dialog), the band relaxes while that entity is on
+    and the zone runs plain hysteresis on it; ahead of a peak the entity
+    announces, the band steps toward the useful edge for
+    `number.{zone}_peak_precondition_minutes`. Default OFF, and a no-op until a
+    peak entity is set, so existing zones are unaffected.
+    `sensor.{zone}_peak_saving` shows what it is doing.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "peak_saving_enabled")
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.zone["peak_saving_enabled"]
+
+    async def async_turn_on(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_peak_saving_enabled(True)
+
+    async def async_turn_off(self, **_kwargs: Any) -> None:
+        await self.coordinator.async_set_peak_saving_enabled(False)
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -150,5 +176,6 @@ async def async_setup_entry(
             MpcEnabledSwitch(coordinator),
             UseApparentTemperatureSwitch(coordinator),
             FanControlEnabledSwitch(coordinator),
+            PeakSavingEnabledSwitch(coordinator),
         ]
     )

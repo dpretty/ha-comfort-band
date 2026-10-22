@@ -1,12 +1,13 @@
 """Per-zone number entities.
 
-Eleven tunables are exposed as `number.{zone}_<key>`. Two of them
+Fourteen tunables are exposed as `number.{zone}_<key>`. Two of them
 (`manual_low`, `manual_high`) trigger an override on every UI write,
 matching the legacy automation's "context.user_id is not none" semantics.
-The other nine (`override_hours`, `deadband_below`, `deadband_above`,
+The other twelve (`override_hours`, `deadband_below`, `deadband_above`,
 `min_cycle_minutes`, `cross_mode_min_minutes`, `lookahead_minutes`,
-`passive_tolerance`, `mpc_horizon_minutes`, `band_ramp_minutes`) are
-simple persisted tunables.
+`passive_tolerance`, `mpc_horizon_minutes`, `band_ramp_minutes`, and
+v0.24.0's `peak_heat_offset`, `peak_cool_offset`,
+`peak_precondition_minutes`) are simple persisted tunables.
 """
 
 from __future__ import annotations
@@ -30,6 +31,12 @@ from .const import (
     MPC_HORIZON_MIN,
     PASSIVE_TOLERANCE_MAX,
     PASSIVE_TOLERANCE_MIN,
+    PEAK_OFFSET_MAX,
+    PEAK_OFFSET_MIN,
+    PEAK_OFFSET_STEP,
+    PEAK_PRECONDITION_MINUTES_MAX,
+    PEAK_PRECONDITION_MINUTES_MIN,
+    PEAK_PRECONDITION_MINUTES_STEP,
     TEMP_MAX,
     TEMP_MIN,
     TEMP_STEP,
@@ -141,6 +148,33 @@ _SPECS: tuple[_NumberSpec, ...] = (
         min_value=BAND_RAMP_MINUTES_MIN,
         max_value=BAND_RAMP_MINUTES_MAX,
         step=BAND_RAMP_MINUTES_STEP,
+        unit=UnitOfTime.MINUTES,
+    ),
+    # v0.24.0 peak saving: how far a peak relaxes each edge of the band, and
+    # how long before an announced peak the band steps toward the useful edge
+    # (0 = no pre-conditioning). The offsets also bound how far it steps.
+    _NumberSpec(
+        key="peak_heat_offset",
+        field="peak_heat_offset",
+        min_value=PEAK_OFFSET_MIN,
+        max_value=PEAK_OFFSET_MAX,
+        step=PEAK_OFFSET_STEP,
+        unit=UnitOfTemperature.CELSIUS,
+    ),
+    _NumberSpec(
+        key="peak_cool_offset",
+        field="peak_cool_offset",
+        min_value=PEAK_OFFSET_MIN,
+        max_value=PEAK_OFFSET_MAX,
+        step=PEAK_OFFSET_STEP,
+        unit=UnitOfTemperature.CELSIUS,
+    ),
+    _NumberSpec(
+        key="peak_precondition_minutes",
+        field="peak_precondition_minutes",
+        min_value=PEAK_PRECONDITION_MINUTES_MIN,
+        max_value=PEAK_PRECONDITION_MINUTES_MAX,
+        step=PEAK_PRECONDITION_MINUTES_STEP,
         unit=UnitOfTime.MINUTES,
     ),
 )

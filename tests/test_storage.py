@@ -62,6 +62,13 @@ async def test_default_zone_has_sane_initial_values(
     assert zone["fan_control_enabled"] is False
     assert zone["active_fan_mode"] is None
     assert zone["idle_fan_mode"] is None
+    # v0.24.0 peak saving: off, with the documented defaults, and no record
+    # yet of the zone heating or cooling.
+    assert zone["peak_saving_enabled"] is False
+    assert zone["peak_heat_offset"] == 1.0
+    assert zone["peak_cool_offset"] == 1.0
+    assert zone["peak_precondition_minutes"] == 60
+    assert zone["last_active_at"] is None
 
 
 # ----- round-trip persistence -----
@@ -1038,3 +1045,88 @@ async def test_set_zone_schedule_fires_signal(
     assert schedule is not None
     assert schedule["baseline"] == baseline
     assert schedule["current"] == baseline
+
+
+_PEAK_FIELDS = (
+    "peak_saving_enabled",
+    "peak_heat_offset",
+    "peak_cool_offset",
+    "peak_precondition_minutes",
+    "last_active_at",
+)
+
+
+async def test_load_v0_23_zone_backfills_peak_saving_off(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A zone stored before v0.24.0 loads with peak saving off and the
+    defaults, each key on its own, and the backfill is written back."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone("office", peak_heat_offset=2.5)
+    stored = hass_storage["comfort_band.data"]["data"]["zones"]["office"]
+    for key in _PEAK_FIELDS:
+        if key != "peak_heat_offset":
+            del stored[key]
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["peak_saving_enabled"] is False
+    assert zone["peak_heat_offset"] == 2.5  # an explicit value survives
+    assert zone["peak_cool_offset"] == 1.0
+    assert zone["peak_precondition_minutes"] == 60
+    assert zone["last_active_at"] is None
+    persisted = hass_storage["comfort_band.data"]["data"]["zones"]["office"]
+    assert all(key in persisted for key in _PEAK_FIELDS)
+
+
+@pytest.mark.parametrize("missing", _PEAK_FIELDS)
+async def test_each_peak_field_is_backfilled_on_its_own(
+    hass: HomeAssistant, hass_storage: dict[str, Any], missing: str
+) -> None:
+    """Every key has its own presence check: a zone missing any one of them
+    loads with that key's default, and the coordinator's subscript of it can't
+    raise."""
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    del hass_storage["comfort_band.data"]["data"]["zones"]["office"][missing]
+
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    defaults = {
+        "peak_saving_enabled": False,
+        "peak_heat_offset": 1.0,
+        "peak_cool_offset": 1.0,
+        "peak_precondition_minutes": 60,
+        "last_active_at": None,
+    }
+    assert second.get_zone("office")[missing] == defaults[missing]  # type: ignore[literal-required]
+    # And written back, so the repair survives the next load.
+    assert missing in hass_storage["comfort_band.data"]["data"]["zones"]["office"]
+
+
+async def test_peak_fields_round_trip_across_store_instances(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    first = ComfortBandStore(hass)
+    await first.async_load()
+    await first.async_add_zone("office")
+    await first.async_update_zone(
+        "office",
+        peak_saving_enabled=True,
+        peak_heat_offset=1.5,
+        peak_cool_offset=2.0,
+        peak_precondition_minutes=90,
+        last_active_at="2026-06-15T15:00:00+00:00",
+    )
+    second = ComfortBandStore(hass)
+    await second.async_load()
+    zone = second.get_zone("office")
+    assert zone["peak_saving_enabled"] is True
+    assert zone["peak_heat_offset"] == 1.5
+    assert zone["peak_cool_offset"] == 2.0
+    assert zone["peak_precondition_minutes"] == 90
+    assert zone["last_active_at"] == "2026-06-15T15:00:00+00:00"

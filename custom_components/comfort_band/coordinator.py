@@ -9,6 +9,9 @@ Event-driven (`update_interval=None`); refreshes fire from:
     period: the fallback-grace timer, and changes to the stand-in reading
     (the fallback sensor's state, or the climate entity's
     `current_temperature`)
+  - v0.24.0, when a peak entity is configured: changes to its state or its
+    `next_event` attribute (debounced like the room sensor), and a one-shot
+    timer at the start of the pre-conditioning lead time
 
 Each refresh re-reads the store + sensor, runs the hysteresis decider against
 the resolved effective band, and (in a follow-up task) applies the decision
@@ -23,7 +26,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import (
     CALLBACK_TYPE,
     CoreState,
@@ -38,7 +41,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from . import apparent_temp, hysteresis, mpc, predictor, schedule
+from . import apparent_temp, hysteresis, mpc, peak, predictor, schedule
 from .const import (
     ACTION_COOL,
     ACTION_HEAT,
@@ -51,6 +54,7 @@ from .const import (
     FALLBACK_GRACE_S,
     LOGGER,
     MPC_SIMULATION_STEP_MINUTES,
+    PEAK_STATE_OFF,
     PERSISTED_IDLE_SLOPE_MAX_AGE_MINUTES,
     ROOM_SOURCE_CLIMATE,
     ROOM_SOURCE_FALLBACK_SENSOR,
@@ -79,6 +83,35 @@ _MAX_NEXT_TRANSITION_SECS = 3600.0  # cap re-scheduling at 1 h
 # coerced by the climate platform and our control intent diverges from what
 # the HVAC actually pursues.
 _DEFAULT_TEMP_STEP = 0.5
+
+
+def _step_inside(limit: float, step: float, *, upward: bool) -> float:
+    """The setpoint nearest `limit` on its inner side that `_round_to_step`
+    sends unchanged: the next multiple of `step` up from a minimum
+    (`upward`), or down from a maximum.
+
+    Checked against what is actually sent rather than taken from the
+    arithmetic alone: `k * step` in floating point can land a hair outside
+    `limit` even when the limit is itself a multiple of the step -- 302 * 0.1
+    is 30.200000000000003 -- and Home Assistant refuses a setpoint even that
+    far over. The quotient is rounded first so that a limit on the step, which
+    the division can leave a hair off a whole number, is not moved a whole
+    step. Returned to six places so the band shows no float noise; it rounds
+    back to the same multiple. A step that is not positive, or so small or
+    large that the arithmetic overflows, leaves the limit as it is.
+    """
+    if step <= 0:
+        return limit
+    try:
+        k = round(limit / step, 6)
+        n = math.ceil(k) if upward else math.floor(k)
+        if upward and n * step < limit:
+            n += 1
+        elif not upward and n * step > limit:
+            n -= 1
+    except (OverflowError, ValueError):
+        return limit
+    return round(n * step, 6)
 
 
 def _round_to_step(value: float, step: float) -> float:
@@ -173,6 +206,20 @@ class ZoneState:
     next_change: datetime | None = None
     next_low: float | None = None
     next_high: float | None = None
+    # v0.24.0 peak saving, for `sensor.{zone}_peak_saving`. `peak_state` is one
+    # of the PEAK_STATE_* constants (`peak.resolve`). The adjustments are how
+    # far peak saving moved each edge of the band this refresh (signed °C,
+    # effective minus the band before shaping), so `effective_low/high` minus
+    # them is the band without it. `peak_precondition` is the direction being
+    # pre-conditioned toward, only while that is happening. `peak_next_start`
+    # is the announced start of the next peak while none is on, and
+    # `peak_ends` the signal's next boundary while one is.
+    peak_state: str = PEAK_STATE_OFF
+    peak_next_start: datetime | None = None
+    peak_ends: datetime | None = None
+    peak_low_adjustment: float = 0.0
+    peak_high_adjustment: float = 0.0
+    peak_precondition: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -201,6 +248,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         *,
         fallback_temp_entity_id: str | None = None,
         fallback_to_climate: bool = DEFAULT_FALLBACK_TO_CLIMATE,
+        peak_entity_id: str | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -232,6 +280,15 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             fallback_temp_entity_id = None
         self.fallback_temp_entity_id = fallback_temp_entity_id
         self.fallback_to_climate = fallback_to_climate
+        # v0.24.0: the entity whose `on` state means a peak period is in
+        # progress, or None. Peak saving does nothing without one, whatever the
+        # zone's switch says.
+        self.peak_entity_id = peak_entity_id
+        self._unsub_peak: CALLBACK_TYPE | None = None
+        # One-shot timer for the start of the pre-conditioning lead time: the
+        # band steps then, and a quiet room would otherwise not refresh to see
+        # it until the room sensor next reported.
+        self._unsub_peak_timer: CALLBACK_TYPE | None = None
         # When the configured sensor was first seen dark by a refresh; None
         # while it reports. The grace period is measured from here.
         self._primary_unavailable_since: datetime | None = None
@@ -355,6 +412,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._unsub_climate = async_track_state_change_event(
             self.hass, [self.climate_entity_id], self._on_climate_state_change
         )
+        # v0.24.0: a peak starting or ending, or its announced start moving,
+        # must reach the zone without waiting for the room sensor.
+        if self.peak_entity_id is not None:
+            self._unsub_peak = async_track_state_change_event(
+                self.hass, [self.peak_entity_id], self._on_peak_change
+            )
 
     async def async_unload(self) -> None:
         """Cancel every active subscription. Safe to call repeatedly."""
@@ -366,10 +429,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             self._unsub_transition_timer,
             self._unsub_climate,
             self._unsub_fallback_timer,
+            self._unsub_peak,
+            self._unsub_peak_timer,
         ):
             if unsub is not None:
                 unsub()
         self._unsub_fallback_timer = None
+        self._unsub_peak = None
+        self._unsub_peak_timer = None
         self._primary_unavailable_since = None
         self._standin_logged_engaged = False
         self._standin_logged_source = ROOM_SOURCE_NONE
@@ -473,6 +540,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         )
         await self.async_refresh()
 
+    async def async_set_peak_saving_enabled(self, peak_saving_enabled: bool) -> None:
+        """Flip the v0.24.0 peak-saving opt-in."""
+        await self._store.async_update_zone(self.zone_name, peak_saving_enabled=peak_saving_enabled)
+        await self.async_refresh()
+
     async def async_set_fan_control_enabled(self, fan_control_enabled: bool) -> None:
         """Flip the v0.13.0 deterministic fan-boost opt-in."""
         await self._store.async_update_zone(self.zone_name, fan_control_enabled=fan_control_enabled)
@@ -533,6 +605,30 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
     def _on_debounce_fire(self, _now: datetime) -> None:
         self._unsub_debounce = None
         self.hass.async_create_task(self.async_request_refresh())
+
+    @callback
+    def _on_peak_change(self, event: Event[EventStateChangedData]) -> None:
+        """Refresh when the peak entity changes in a way that matters: its
+        state (a peak starting or ending, or the entity going dark) or its
+        `next_event` (the announced start moving). Other attribute updates --
+        a schedule helper's custom data, a template sensor's own extras -- say
+        nothing about the peak, and a refresh appends a sample. Nor does any
+        change while the zone's peak saving is switched off: turning it on
+        refreshes the zone, and until then it controls as if no entity were
+        configured.
+        """
+        if not self._store.get_zone(self.zone_name)["peak_saving_enabled"]:
+            return
+        old_state = event.data["old_state"]
+        new_state = event.data["new_state"]
+        if (
+            old_state is not None
+            and new_state is not None
+            and old_state.state == new_state.state
+            and old_state.attributes.get("next_event") == new_state.attributes.get("next_event")
+        ):
+            return
+        self._schedule_debounced_refresh()
 
     @callback
     def _on_profile_change(self, _new_active: str) -> None:
@@ -759,54 +855,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                     next_change_at = next_change_at.replace(fold=1)
                 next_low, next_high = change.low, change.high
 
-        if override_active:
-            eff_low, eff_high = zone["manual_low"], zone["manual_high"]
-        else:
-            eff_low, eff_high = sched_low, sched_high
-
-        # Defensive clamp -- should never fire, since UI inputs validate
-        # low < high, but a corrupt store or future profile-manager bug
-        # would otherwise make hysteresis flap.
-        if eff_low >= eff_high:
-            LOGGER.warning(
-                "%s: effective_low (%s) >= effective_high (%s); clamping",
-                self.zone_name,
-                eff_low,
-                eff_high,
-            )
-            eff_low = eff_high - 0.5
-
-        # Per-zone choice: feed apparent temperature (humidity-adjusted
-        # "feels like") into the decider instead of the raw room reading.
-        # Defaults to raw room. Apparent equals room when humidity is None,
-        # so this is safe to leave ON even if the humidity sensor flakes.
-        use_apparent = zone["use_apparent_temperature"]
-        decision_room = apparent_temperature if use_apparent else room
-        LOGGER.debug(
-            "%s: decision room=%s (use_apparent=%s, room=%s, apparent=%s)",
-            self.zone_name,
-            decision_room,
-            use_apparent,
-            room,
-            apparent_temperature,
-        )
-
-        # A stand-in reading gets wider deadbands: the climate entity's own
-        # sensor sits at the indoor unit and usually reports whole degrees, so
-        # deadbands tuned for a room sensor would short-cycle on it.
-        deadband_extra = FALLBACK_DEADBAND_EXTRA if fallback_active else 0.0
-        hyst_inputs = HysteresisInputs(
-            room=decision_room,
-            low=eff_low,
-            high=eff_high,
-            deadband_below=zone["deadband_below"] + deadband_extra,
-            deadband_above=zone["deadband_above"] + deadband_extra,
-            current_action=zone["last_action"] or ACTION_UNKNOWN,
-        )
-        hyst_decision = hysteresis.decide(hyst_inputs)
         # Predictor runs every refresh (shadow mode). Slopes are computed once
         # and fed into both `decide()` (anticipation logic) and the
-        # thermal_slope sensor's attributes (via ZoneState).
+        # thermal_slope sensor's attributes (via ZoneState) -- and, since
+        # v0.24.0, ahead of the band: peak saving's pre-conditioning direction
+        # reads the idle slope MPC plans with.
         #
         # One reading of the buffer for the whole refresh. The idle-slope write
         # below can yield to an apply task that appends to it, and the
@@ -850,6 +903,87 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         effective_slopes = predictor.carry_over_recovery_slopes(
             effective_slopes, samples, now=now_utc
         )
+
+        if override_active:
+            eff_low, eff_high = zone["manual_low"], zone["manual_high"]
+        else:
+            eff_low, eff_high = sched_low, sched_high
+
+        # v0.24.0 peak saving: relax the band while a peak is on, or step it
+        # toward the useful edge ahead of an announced one (see `peak.py`).
+        # With the switch off or no peak entity, `peak.resolve` hands the band
+        # back untouched and nothing below changes.
+        climate_min_temp, climate_max_temp = (
+            self._climate_temp_limits()
+            if zone["peak_saving_enabled"] and self.peak_entity_id is not None
+            else (None, None)
+        )
+        peak_shaping = peak.resolve(
+            configured=self.peak_entity_id is not None,
+            enabled=zone["peak_saving_enabled"],
+            # Read only when the switch is on: a switched-off zone takes
+            # nothing from the peak entity.
+            signal=(self._read_peak_signal(now_utc) if zone["peak_saving_enabled"] else None),
+            override_active=override_active,
+            low=eff_low,
+            high=eff_high,
+            heat_offset=zone["peak_heat_offset"],
+            cool_offset=zone["peak_cool_offset"],
+            lead_minutes=zone["peak_precondition_minutes"],
+            direction=peak.precondition_direction(
+                zone["last_action"],
+                zone["previous_action"],
+                _parse_iso(zone["last_active_at"]),
+                now_utc,
+                effective_slopes.idle,
+            ),
+            now=now_utc,
+            min_temp=climate_min_temp,
+            max_temp=climate_max_temp,
+        )
+        unshaped_low, unshaped_high = eff_low, eff_high
+        eff_low, eff_high = peak_shaping.low, peak_shaping.high
+
+        # Defensive clamp -- should never fire, since UI inputs validate
+        # low < high, but a corrupt store or future profile-manager bug
+        # would otherwise make hysteresis flap.
+        if eff_low >= eff_high:
+            LOGGER.warning(
+                "%s: effective_low (%s) >= effective_high (%s); clamping",
+                self.zone_name,
+                eff_low,
+                eff_high,
+            )
+            eff_low = eff_high - 0.5
+
+        # Per-zone choice: feed apparent temperature (humidity-adjusted
+        # "feels like") into the decider instead of the raw room reading.
+        # Defaults to raw room. Apparent equals room when humidity is None,
+        # so this is safe to leave ON even if the humidity sensor flakes.
+        use_apparent = zone["use_apparent_temperature"]
+        decision_room = apparent_temperature if use_apparent else room
+        LOGGER.debug(
+            "%s: decision room=%s (use_apparent=%s, room=%s, apparent=%s)",
+            self.zone_name,
+            decision_room,
+            use_apparent,
+            room,
+            apparent_temperature,
+        )
+
+        # A stand-in reading gets wider deadbands: the climate entity's own
+        # sensor sits at the indoor unit and usually reports whole degrees, so
+        # deadbands tuned for a room sensor would short-cycle on it.
+        deadband_extra = FALLBACK_DEADBAND_EXTRA if fallback_active else 0.0
+        hyst_inputs = HysteresisInputs(
+            room=decision_room,
+            low=eff_low,
+            high=eff_high,
+            deadband_below=zone["deadband_below"] + deadband_extra,
+            deadband_above=zone["deadband_above"] + deadband_extra,
+            current_action=zone["last_action"] or ACTION_UNKNOWN,
+        )
+        hyst_decision = hysteresis.decide(hyst_inputs)
         predicted_decision = predictor.decide(
             thermal_slopes,
             hyst_inputs,
@@ -890,6 +1024,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 ramp_minutes=zone["band_ramp_minutes"],
             )
         )
+        # v0.24.0: and the same peak shaping, step by step -- so MPC sees the
+        # pre-conditioned band coming, as it sees a scheduled rise.
+        bands_per_step = self._shape_bands_per_step(
+            bands_per_step,
+            peak_shaping,
+            zone,
+            now_utc,
+            unshaped=(unshaped_low, unshaped_high),
+            limits=(climate_min_temp, climate_max_temp),
+        )
         mpc_decision = mpc.plan(
             effective_slopes,
             hyst_inputs,
@@ -907,7 +1051,16 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # resolution, and the predictor's anticipation and MPC's plan both
         # extrapolate from the current reading -- a reading from a sensor with
         # a different offset. The shadow sensors still show what they would do.
-        if fallback_active:
+        #
+        # v0.24.0: and so it does while a peak relaxes the band. Hysteresis
+        # starts a cycle only once the room is past a relaxed edge by the
+        # deadband, releases at that edge, and sends it as the setpoint. The
+        # predictor and MPC would start ahead of that by design; MPC would heat
+        # toward the relaxed top edge, could hold a cycle that began before the
+        # peak well into it while its slope is borrowed, and does not know the
+        # peak ends -- all of which is load in the window the user asked to
+        # keep clear. They go on running in shadow.
+        if fallback_active or peak_shaping.relaxing:
             final_decision = hyst_decision
         elif zone["learning_enabled"] and zone["mpc_enabled"] and mpc_ready:
             final_decision = mpc_decision
@@ -924,6 +1077,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         self._schedule_next_transition(schedule_data, ramp_minutes=zone["band_ramp_minutes"])
         if override_until is not None and override_active:
             self._schedule_override_expiry(override_until - now_utc)
+        self._schedule_peak_timer(peak_shaping.lead_start, now_utc)
 
         state = ZoneState(
             zone=zone,
@@ -950,6 +1104,14 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             next_change=next_change_at,
             next_low=next_low,
             next_high=next_high,
+            peak_state=peak_shaping.state,
+            peak_next_start=peak_shaping.next_start,
+            peak_ends=peak_shaping.ends,
+            peak_low_adjustment=round(peak_shaping.low - unshaped_low, 3),
+            peak_high_adjustment=round(peak_shaping.high - unshaped_high, 3),
+            peak_precondition=(
+                peak_shaping.precondition if peak_shaping.preconditioning_now else None
+            ),
         )
 
         # Apply in a follow-up task so this refresh returns immediately --
@@ -960,6 +1122,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 zone["enabled"],
                 decision_room=decision_room,
                 record_samples=not fallback_active,
+                fan_boost=not peak_shaping.relaxing,
             )
         )
 
@@ -1533,10 +1696,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             return []
         return [str(mode) for mode in raw]
 
-    async def _maybe_command_fan(self, zone: StoredZone, action: str) -> None:
+    async def _maybe_command_fan(
+        self, zone: StoredZone, action: str, *, boost: bool = True
+    ) -> None:
         """v0.13.0 deterministic fan-boost: command the climate's fan mode by
         action — `active_fan_mode` while heating/cooling, `idle_fan_mode` while
-        idle. Opt-in via `fan_control_enabled`.
+        idle. Opt-in via `fan_control_enabled`. `boost=False` (v0.24.0, during
+        a peak) skips the heating/cooling side only.
 
         Only ever changes the climate's `fan_mode` attribute, which the
         manual-edit detector deliberately ignores (v0.10.1), so this can never
@@ -1549,6 +1715,8 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         if not zone["fan_control_enabled"]:
             return
         if action in (ACTION_HEAT, ACTION_COOL):
+            if not boost:
+                return
             desired = zone["active_fan_mode"]
         elif action == ACTION_IDLE:
             desired = zone["idle_fan_mode"]
@@ -1705,6 +1873,160 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         seconds = max(delta.total_seconds(), 1.0)
         self._unsub_override_timer = async_call_later(self.hass, seconds, self._on_timer_fire)
 
+    def _read_peak_signal(self, now_utc: datetime) -> peak.PeakSignal | None:
+        """What the peak entity says, or None when none is configured.
+
+        Missing, `unavailable` and `unknown` all read as unavailable, which
+        `peak.resolve` treats as no peak: a dead signal fails toward the
+        normal band, and `sensor.{zone}_peak_saving` says `no_signal`. Any
+        other state but `on` is off.
+        """
+        if self.peak_entity_id is None:
+            return None
+        state = self.hass.states.get(self.peak_entity_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, ""):
+            return peak.PeakSignal(available=False, active=False)
+        return peak.PeakSignal(
+            available=True,
+            active=state.state == STATE_ON,
+            next_event=peak.parse_next_event(
+                state.attributes.get("next_event"),
+                now=now_utc,
+                local_tz=dt_util.get_default_time_zone(),
+            ),
+        )
+
+    def _climate_temp_limits(self) -> tuple[float | None, float | None]:
+        """The climate entity's `min_temp` / `max_temp`, each None when it is
+        missing, non-numeric or non-finite.
+
+        Capability attributes, so an unavailable unit still publishes them.
+        They bound peak relaxation (`peak.relax`): Home Assistant refuses a
+        setpoint outside them, and during a peak the setpoint is the relaxed
+        edge. That setpoint is rounded to the unit's `target_temp_step` before
+        it is sent, so each limit is moved inward to a setpoint the unit takes
+        (`_step_inside`) -- a minimum of 16.2 with a 0.5 step is 16.5 here --
+        or rounding could put the setpoint just outside it again. Read only
+        while peak saving is on, so a zone without it reads nothing it did not
+        before.
+        """
+        state = self.hass.states.get(self.climate_entity_id)
+        if state is None:
+            return None, None
+        try:
+            step = self._target_temp_step()
+        except OverflowError:
+            # An integer too large for a float: no step to align to.
+            step = 0.0
+        limits: list[float | None] = []
+        for key, upward in (("min_temp", True), ("max_temp", False)):
+            raw = state.attributes.get(key)
+            try:
+                value = float(raw) if raw is not None else None
+            except (TypeError, ValueError, OverflowError):
+                value = None
+            if value is None or not math.isfinite(value):
+                limits.append(None)
+                continue
+            limits.append(_step_inside(value, step, upward=upward))
+        return limits[0], limits[1]
+
+    def _shape_bands_per_step(
+        self,
+        bands_per_step: list[tuple[float, float]] | None,
+        shaping: peak.PeakShaping,
+        zone: StoredZone,
+        now_utc: datetime,
+        *,
+        unshaped: tuple[float, float],
+        limits: tuple[float | None, float | None],
+    ) -> list[tuple[float, float]] | None:
+        """Apply this refresh's peak shaping to MPC's per-step bands.
+
+        While a peak relaxes the band every step is relaxed: MPC is in shadow
+        then, and the end of the peak is not known in advance anyway. With a
+        pre-conditioning step planned, every step from the lead start on is
+        shaped -- including steps past the announced start, so MPC keeps the
+        room up through it -- and MPC sees the step coming as it sees a
+        scheduled rise. The relaxation is never shown ahead of a peak: a
+        wider band in the lookahead makes idling look fine and would take
+        heat out of the run-up.
+
+        A zone with no schedule has no per-step list; one is built from the
+        band before shaping, but only when there is shaping to show. With
+        nothing to shape the list is returned as it came, None included.
+        """
+        if shaping.relaxing:
+            min_temp, max_temp = limits
+
+            def shape(low: float, high: float) -> tuple[float, float]:
+                return peak.relax(
+                    low,
+                    high,
+                    zone["peak_heat_offset"],
+                    zone["peak_cool_offset"],
+                    min_temp=min_temp,
+                    max_temp=max_temp,
+                )
+
+            from_time: datetime | None = None
+        elif shaping.precondition is not None and shaping.lead_start is not None:
+            direction = shaping.precondition
+
+            def shape(low: float, high: float) -> tuple[float, float]:
+                return peak.precondition_band(
+                    low,
+                    high,
+                    direction,
+                    heat_offset=zone["peak_heat_offset"],
+                    cool_offset=zone["peak_cool_offset"],
+                )
+
+            from_time = shaping.lead_start
+        else:
+            return bands_per_step
+        if bands_per_step is None:
+            steps = round(zone["mpc_horizon_minutes"] / MPC_SIMULATION_STEP_MINUTES)
+            bands_per_step = [unshaped] * steps
+        return peak.shape_steps(
+            bands_per_step,
+            now=now_utc,
+            step_minutes=MPC_SIMULATION_STEP_MINUTES,
+            shape=shape,
+            from_time=from_time,
+        )
+
+    def _schedule_peak_timer(self, lead_start: datetime | None, now_utc: datetime) -> None:
+        """Wake the zone at the start of a planned pre-conditioning lead time.
+
+        Re-armed on every refresh, like the transition timer, and capped at an
+        hour the same way: the wake at the cap re-plans from fresh state. So
+        while a step is planned more than an hour ahead -- and a schedule
+        helper announces the next peak as soon as one ends -- a zone that
+        nothing else wakes refreshes, and samples, once an hour; a scheduled
+        zone's transition timer already does, and the two wakes coincide. A
+        second past the boundary, so the refresh it triggers is inside the
+        window rather than a hair before it. Nothing is armed once the window
+        has begun: the band holds its step until the announced start, and the
+        peak entity turning on then is an event of its own.
+        """
+        if self._unsub_peak_timer is not None:
+            self._unsub_peak_timer()
+            self._unsub_peak_timer = None
+        if lead_start is None:
+            return
+        secs = (lead_start - now_utc).total_seconds()
+        if secs <= 0:
+            return
+        self._unsub_peak_timer = async_call_later(
+            self.hass, min(secs + 1.0, _MAX_NEXT_TRANSITION_SECS), self._on_peak_timer_fire
+        )
+
+    @callback
+    def _on_peak_timer_fire(self, _now: datetime) -> None:
+        self._unsub_peak_timer = None
+        self.hass.async_create_task(self.async_request_refresh())
+
     async def _maybe_apply_action(
         self,
         decision: HysteresisDecision,
@@ -1712,6 +2034,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         *,
         decision_room: float | None,
         record_samples: bool = True,
+        fan_boost: bool = True,
     ) -> None:
         """Translate the decision into climate.set_hvac_mode + set_temperature.
 
@@ -1748,6 +2071,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         the buffer on a sensor swap. Implemented by blanking the room value
         the sampler sees, so every append site below skips as it does for an
         unavailable sensor.
+
+        v0.24.0: `fan_boost=False` while a peak relaxes the band. A heat or
+        cool cycle then leaves the fan where it is rather than taking
+        `active_fan_mode` -- a boost spends power on recovering fast, which is
+        not what a cycle in a peak is for. The idle fan mode is still
+        commanded.
         """
         now_utc = dt_util.utcnow()
         sample_room = decision_room if record_samples else None
@@ -2063,12 +2392,23 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         new_previous_action = (
             last_action if last_action != decision.action else zone["previous_action"]
         )
-        await self._store.async_update_zone(
-            self.zone_name,
-            last_action=decision.action,
-            last_action_at=now_utc.isoformat(),
-            previous_action=new_previous_action,
-        )
+        commit: dict[str, Any] = {
+            "last_action": decision.action,
+            "last_action_at": now_utc.isoformat(),
+            "previous_action": new_previous_action,
+        }
+        # v0.24.0: when the zone was last seen heating or cooling -- this
+        # commit is one. `last_action_at` can't say it: every committed idle
+        # re-stamps it, so it stays fresh through days of idling. Peak saving
+        # pre-conditions only after recent heating or cooling. Not the idle
+        # that releases a cycle: a running cycle is re-committed every
+        # min-cycle, so its last commit is when it was last seen running, and a
+        # release can come long after that -- a zone switched to shadow
+        # mid-cycle and back days later, or a unit unreachable meanwhile, would
+        # otherwise stamp a cycle days old as just run.
+        if decision.action in (ACTION_HEAT, ACTION_COOL):
+            commit["last_active_at"] = now_utc.isoformat()
+        await self._store.async_update_zone(self.zone_name, **commit)
 
         # Both budgets, and only here: a clean return is not proof of delivery,
         # so clearing the mode budget on it let a command dropped at dispatch
@@ -2089,7 +2429,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # cloud unit's timeout would otherwise escape into the fire-and-forget
         # apply task.
         try:
-            await self._maybe_command_fan(zone, decision.action)
+            await self._maybe_command_fan(zone, decision.action, boost=fan_boost)
         except Exception as err:
             if self._may_log_command_warning("fan"):
                 LOGGER.warning(

@@ -24,6 +24,7 @@ from .const import (
     CONF_FALLBACK_TO_CLIMATE,
     CONF_HUMIDITY_SENSOR,
     CONF_KIND,
+    CONF_PEAK_ENTITY,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
     DEFAULT_FALLBACK_TO_CLIMATE,
@@ -41,6 +42,12 @@ _TEMP_SELECTOR = selector.EntitySelector(
 )
 _HUMIDITY_SELECTOR = selector.EntitySelector(
     selector.EntitySelectorConfig(domain=["sensor"], device_class=["humidity"])
+)
+# v0.24.0 peak entity: anything with an on/off state. A schedule helper also
+# announces the next start in its `next_event` attribute, which is what
+# pre-conditioning needs.
+_PEAK_SELECTOR = selector.EntitySelector(
+    selector.EntitySelectorConfig(domain=["binary_sensor", "input_boolean", "schedule", "switch"])
 )
 
 _ZONE_SCHEMA = vol.Schema(
@@ -130,6 +137,10 @@ class ZoneOptionsFlow(OptionsFlow):
     Changing either fallback field does not flush the sample buffer: nothing
     is ever sampled from a stand-in reading, so there is no mixing to avoid.
 
+    v0.24.0 adds the optional peak entity -- `on` means a peak period is in
+    progress -- for peak saving. Changing it does not flush either: it changes
+    which band the zone aims for, not the sensor the samples come from.
+
     Resolution order at read time is `entry.options[KEY]` falling back to
     `entry.data[KEY]` — so existing zones that set sensors at first-setup
     keep working, and an OptionsFlow edit wins thereafter. The same
@@ -162,6 +173,7 @@ class ZoneOptionsFlow(OptionsFlow):
         current_fallback_to_climate = entry.options.get(
             CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
         )
+        current_peak = entry.options.get(CONF_PEAK_ENTITY)
         errors: dict[str, str] = {}
         if user_input is not None:
             new_temp = user_input[CONF_TEMP_SENSOR]
@@ -225,6 +237,8 @@ class ZoneOptionsFlow(OptionsFlow):
                         CONF_FALLBACK_TO_CLIMATE: user_input.get(
                             CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
                         ),
+                        # And again: an emptied peak selector is None.
+                        CONF_PEAK_ENTITY: user_input.get(CONF_PEAK_ENTITY),
                     },
                 )
         schema = vol.Schema(
@@ -241,6 +255,10 @@ class ZoneOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_FALLBACK_TO_CLIMATE, default=current_fallback_to_climate
                 ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_PEAK_ENTITY,
+                    description={"suggested_value": current_peak},
+                ): _PEAK_SELECTOR,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
