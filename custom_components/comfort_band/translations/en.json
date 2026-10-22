@@ -36,12 +36,13 @@
     "step": {
       "init": {
         "title": "Configure zone sensors",
-        "description": "Change the room-temperature sensor or attach / clear the humidity sensor. Swapping the temperature sensor clears this zone's sample buffer and triggers an MPC warm-up period. The fallback fields say what may stand in when the room sensor stops reporting for more than five minutes: an optional second sensor, then the climate entity's own temperature reading unless you switch that off.",
+        "description": "Change the room-temperature sensor or attach / clear the humidity sensor. Swapping the temperature sensor clears this zone's sample buffer and triggers an MPC warm-up period. The fallback fields say what may stand in when the room sensor stops reporting for more than five minutes: an optional second sensor, then the climate entity's own temperature reading unless you switch that off. The peak period entity is for peak saving: while it is on, the band relaxes and the zone only heats or cools past the relaxed edges. A schedule helper also announces each start, which lets the zone pre-condition ahead of it. Peak saving does nothing until you also turn on the zone's Peak saving enabled switch.",
         "data": {
           "temp_sensor": "Room-temperature sensor",
           "humidity_sensor": "Humidity sensor (optional, enables apparent temperature)",
           "fallback_temp_sensor": "Fallback temperature sensor (optional, used while the room sensor is unavailable)",
-          "fallback_to_climate": "Fall back to the climate entity's own temperature reading as a last resort"
+          "fallback_to_climate": "Fall back to the climate entity's own temperature reading as a last resort",
+          "peak_entity": "Peak period entity (optional; on means a peak is in progress)"
         }
       }
     },
@@ -99,6 +100,15 @@
       },
       "band_ramp_minutes": {
         "name": "Band ramp minutes"
+      },
+      "peak_heat_offset": {
+        "name": "Peak heat offset"
+      },
+      "peak_cool_offset": {
+        "name": "Peak cool offset"
+      },
+      "peak_precondition_minutes": {
+        "name": "Peak precondition minutes"
       }
     },
     "select": {
@@ -133,6 +143,17 @@
       },
       "next_band_change": {
         "name": "Next band change"
+      },
+      "peak_saving": {
+        "name": "Peak saving",
+        "state": {
+          "off": "Off",
+          "no_signal": "No signal",
+          "waiting": "Waiting",
+          "preconditioning": "Pre-conditioning",
+          "active": "Active",
+          "override": "Paused by override"
+        }
       },
       "current_action": {
         "name": "Current action",
@@ -180,6 +201,9 @@
       },
       "fan_control_enabled": {
         "name": "Fan control enabled"
+      },
+      "peak_saving_enabled": {
+        "name": "Peak saving enabled"
       }
     }
   }

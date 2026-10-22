@@ -23,12 +23,16 @@ _EXPECTED_ZONE_ENTITIES = (
     "number.office_lookahead_minutes",
     "number.office_passive_tolerance",
     "number.office_mpc_horizon_minutes",  # v0.8
+    "number.office_peak_heat_offset",  # v0.24
+    "number.office_peak_cool_offset",  # v0.24
+    "number.office_peak_precondition_minutes",  # v0.24
     "sensor.office_effective_low",
     "sensor.office_effective_high",
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror
     "sensor.office_apparent_temperature",
     "sensor.office_override_ends",
     "sensor.office_next_band_change",  # v0.23
+    "sensor.office_peak_saving",  # v0.24
     "sensor.office_current_action",
     "sensor.office_thermal_slope",
     "sensor.office_predicted_action",
@@ -42,6 +46,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "switch.office_mpc_enabled",  # v0.8
     "switch.office_use_apparent_temperature",
     "switch.office_fan_control_enabled",  # v0.13
+    "switch.office_peak_saving_enabled",  # v0.24
     "select.office_active_fan_mode",  # v0.13 (unavailable until climate has fan_modes)
     "select.office_idle_fan_mode",  # v0.13
     "select.office_schedule_assignment",  # v0.14

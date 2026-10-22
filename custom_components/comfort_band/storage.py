@@ -45,6 +45,9 @@ from .const import (
     DEFAULT_MPC_HORIZON_MINUTES,
     DEFAULT_OVERRIDE_HOURS,
     DEFAULT_PASSIVE_TOLERANCE_C,
+    DEFAULT_PEAK_COOL_OFFSET_C,
+    DEFAULT_PEAK_HEAT_OFFSET_C,
+    DEFAULT_PEAK_PRECONDITION_MINUTES,
     DEFAULT_PROFILE,
     MAX_PROFILES,
     MAX_SHARED_SCHEDULES,
@@ -207,6 +210,21 @@ class StoredZone(TypedDict):
     # time. The zone's own `schedules` stays dormant while assigned and is
     # restored losslessly on unassign.
     schedule_id: str | None
+    # v0.24.0 peak saving (opt-in, per zone). While the zone's peak entity (an
+    # OptionsFlow choice) is on, the band relaxes by the two offsets (°C) and
+    # the zone runs plain hysteresis on it; `peak_precondition_minutes` before
+    # an announced start the band steps toward the side the room will drift
+    # away from (0 = no pre-conditioning). See `peak.py`.
+    peak_saving_enabled: bool
+    peak_heat_offset: float
+    peak_cool_offset: float
+    peak_precondition_minutes: int
+    # ISO-8601 UTC time the zone was last seen heating or cooling: written with
+    # every committed heat or cool, re-commits included. Unlike
+    # `last_action_at`, which every committed idle re-stamps, this goes stale
+    # while the zone idles. Pre-conditioning follows the zone's last cycle only
+    # while this is recent. None = not since v0.24.0.
+    last_active_at: str | None
 
 
 class StoredProfile(TypedDict):
@@ -279,6 +297,11 @@ def _default_zone(zone_name: str) -> StoredZone:
         "active_fan_mode": None,
         "idle_fan_mode": None,
         "schedule_id": None,
+        "peak_saving_enabled": False,
+        "peak_heat_offset": DEFAULT_PEAK_HEAT_OFFSET_C,
+        "peak_cool_offset": DEFAULT_PEAK_COOL_OFFSET_C,
+        "peak_precondition_minutes": DEFAULT_PEAK_PRECONDITION_MINUTES,
+        "last_active_at": None,
     }
 
 
@@ -433,6 +456,26 @@ class ComfortBandStore:
             # schedule") so existing zones keep resolving their own schedules.
             if "schedule_id" not in zone:
                 zone["schedule_id"] = None
+                migrated = True
+            # v0.23 → v0.24: peak saving. Off by default, so existing zones see
+            # no change until the user picks a peak entity and switches it on.
+            # `last_active_at` starts unknown: the zone pre-conditions only once
+            # it has run a heat or cool cycle since the upgrade. Each key on its
+            # own check, as above.
+            if "peak_saving_enabled" not in zone:
+                zone["peak_saving_enabled"] = False
+                migrated = True
+            if "peak_heat_offset" not in zone:
+                zone["peak_heat_offset"] = DEFAULT_PEAK_HEAT_OFFSET_C
+                migrated = True
+            if "peak_cool_offset" not in zone:
+                zone["peak_cool_offset"] = DEFAULT_PEAK_COOL_OFFSET_C
+                migrated = True
+            if "peak_precondition_minutes" not in zone:
+                zone["peak_precondition_minutes"] = DEFAULT_PEAK_PRECONDITION_MINUTES
+                migrated = True
+            if "last_active_at" not in zone:
+                zone["last_active_at"] = None
                 migrated = True
         if migrated:
             await self._store.async_save(self._data)

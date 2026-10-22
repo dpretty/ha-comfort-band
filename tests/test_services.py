@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.comfort_band.const import DOMAIN, ROOM_SOURCE_PRIMARY
+from custom_components.comfort_band.const import DOMAIN, PEAK_STATE_OFF, ROOM_SOURCE_PRIMARY
 from custom_components.comfort_band.services import _parse_time
 
 ZONE_TEMP_ENTITY = "sensor.office_temp"
@@ -489,6 +489,7 @@ async def test_record_feedback_persists_enriched_entry(
     assert entry["room_temp"] == state.room
     assert entry["room_source"] == state.room_source
     assert entry["room_source"] == ROOM_SOURCE_PRIMARY
+    assert entry["peak_state"] == state.peak_state == PEAK_STATE_OFF
     assert entry["low"] == state.effective_low
     assert entry["high"] == state.effective_high
     assert entry["action"] == state.decision.action

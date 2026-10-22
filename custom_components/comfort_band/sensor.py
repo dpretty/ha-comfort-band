@@ -20,6 +20,7 @@ from .const import (
     ACTION_IDLE,
     ACTION_UNKNOWN,
     DOMAIN,
+    PEAK_STATES,
 )
 from .coordinator import ZoneCoordinator
 from .entity import ComfortBandZoneEntity
@@ -140,6 +141,51 @@ class NextBandChangeSensor(ComfortBandZoneEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, float | bool | None]:
         data = self.coordinator.data
         return {"low": data.next_low, "high": data.next_high, "scheduled": data.scheduled}
+
+
+class PeakSavingSensor(ComfortBandZoneEntity, SensorEntity):
+    """v0.24.0: what peak saving is doing for the zone.
+
+    `off` -- switched off, or no peak entity chosen; `no_signal` -- the peak
+    entity is missing, unavailable or unknown, which counts as no peak;
+    `waiting` -- no peak on, and none announced within the lead time (or no
+    direction to pre-condition in); `preconditioning` -- the band has stepped
+    toward the useful edge ahead of an announced peak; `active` -- a peak is
+    on and the band is relaxed; `override` -- an override is in force, so peak
+    saving stands aside during a peak or its lead time.
+
+    Attributes: `peak_entity` (the entity_id, or null); `next_start`, the
+    announced start of the next peak while none is on; `ends`, the peak
+    entity's next boundary while one is (for a schedule helper, normally the
+    end of the peak); `low_adjustment` / `high_adjustment`, how far peak saving
+    moved each edge of the band now (signed °C: the effective band minus these
+    is the band without it); `precondition`, `heating` or `cooling` while
+    pre-conditioning, otherwise null.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "peak_saving")
+        self._attr_options = list(PEAK_STATES)
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.data.peak_state
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | float | None]:
+        data = self.coordinator.data
+        return {
+            "peak_entity": self.coordinator.peak_entity_id,
+            "next_start": None
+            if data.peak_next_start is None
+            else data.peak_next_start.isoformat(),
+            "ends": None if data.peak_ends is None else data.peak_ends.isoformat(),
+            "low_adjustment": data.peak_low_adjustment,
+            "high_adjustment": data.peak_high_adjustment,
+            "precondition": data.peak_precondition,
+        }
 
 
 class CurrentActionSensor(ComfortBandZoneEntity, SensorEntity):
@@ -327,6 +373,7 @@ async def async_setup_entry(
             ApparentTemperatureSensor(coordinator),
             OverrideEndsSensor(coordinator),
             NextBandChangeSensor(coordinator),
+            PeakSavingSensor(coordinator),
             CurrentActionSensor(coordinator),
             ThermalSlopeSensor(coordinator),
             PredictedActionSensor(coordinator),

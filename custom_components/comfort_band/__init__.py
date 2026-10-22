@@ -25,6 +25,7 @@ from .const import (
     CONF_FALLBACK_TO_CLIMATE,
     CONF_HUMIDITY_SENSOR,
     CONF_KIND,
+    CONF_PEAK_ENTITY,
     CONF_TEMP_SENSOR,
     CONF_ZONE_NAME,
     DEFAULT_FALLBACK_TO_CLIMATE,
@@ -114,6 +115,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         fallback_to_climate = entry.options.get(
             CONF_FALLBACK_TO_CLIMATE, DEFAULT_FALLBACK_TO_CLIMATE
         )
+        # v0.24.0 peak entity: OptionsFlow-only too, None = none chosen.
+        peak_entity_id = entry.options.get(CONF_PEAK_ENTITY)
         coordinator = ZoneCoordinator(
             hass,
             data.store,
@@ -123,6 +126,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             humidity_entity_id=humidity_entity_id,
             fallback_temp_entity_id=fallback_temp_entity_id,
             fallback_to_climate=fallback_to_climate,
+            peak_entity_id=peak_entity_id,
         )
         await coordinator.async_setup()
         data.zone_coordinators[entry.entry_id] = coordinator
