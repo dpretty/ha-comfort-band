@@ -439,6 +439,18 @@ def test_next_change_compares_with_the_band_in_force_not_the_last_step() -> None
     assert next_change(day, time(7, 30)) == day[2]
 
 
+def test_next_change_compares_with_the_stepped_band_not_a_ramp() -> None:
+    # Just after 09:00 a ramp would still be easing from A to B; the band in
+    # force for this purpose is B, so B again at 12:00 isn't a change.
+    day = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(9, 0), low=17.0, high=24.0),
+        Transition(at=time(12, 0), low=17.0, high=24.0),
+        Transition(at=time(21, 0), low=16.0, high=20.0),
+    ]
+    assert next_change(day, time(9, 5)) == day[3]
+
+
 def test_next_change_is_none_when_the_band_never_changes() -> None:
     assert next_change([Transition(at=time(6, 0), low=18.0, high=22.0)], time(7, 0)) is None
     same = [
@@ -454,6 +466,23 @@ def test_next_change_counts_a_change_in_either_limit() -> None:
         Transition(at=time(18, 0), low=18.0, high=23.0),
     ]
     assert next_change(day, time(7, 0)) == day[1]
+    # A heating setback that lowers only the bottom of the band.
+    setback = [
+        Transition(at=time(6, 0), low=19.0, high=24.0),
+        Transition(at=time(22, 0), low=16.0, high=24.0),
+    ]
+    assert next_change(setback, time(7, 0)) == setback[1]
+
+
+def test_next_change_at_a_transition_starts_from_that_transitions_band() -> None:
+    # At 09:00 the band is already B, so the next change is back to A at
+    # 21:00, not B again tomorrow.
+    day = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(9, 0), low=17.0, high=24.0),
+        Transition(at=time(21, 0), low=18.0, high=22.0),
+    ]
+    assert next_change(day, time(9, 0)) == day[2]
 
 
 def test_next_change_raises_on_empty_schedule() -> None:

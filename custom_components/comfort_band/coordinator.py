@@ -752,6 +752,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 if change.at <= now_local.time():
                     day += timedelta(days=1)
                 next_change_at = datetime.combine(day, change.at, tzinfo=now_local.tzinfo)
+                # When clocks go back an hour repeats. A change in it that its
+                # first pass has already reached comes round again on the
+                # second (fold=1); `combine` gives the first.
+                if next_change_at.astimezone(dt_util.UTC) <= now_local.astimezone(dt_util.UTC):
+                    next_change_at = next_change_at.replace(fold=1)
                 next_low, next_high = change.low, change.high
 
         if override_active:
@@ -1635,11 +1640,12 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         already warned for the same input in the same refresh cycle, so
         a second warning would just duplicate noise.
 
-        Parses the schedule a third time per refresh (after
-        ``_resolve_schedule`` and ``_schedule_next_transition``). The
-        re-parse cost is microseconds and the alternative — threading
-        a normalized list through five call sites — is more change
-        surface than it's worth for the integration's current scale.
+        Parses the schedule again: ``_resolve_schedule``,
+        ``_schedule_transitions`` (v0.23.0) and ``_schedule_next_transition``
+        each parse it too, four times per refresh in all. The re-parse cost
+        is microseconds and the alternative — threading a normalized list
+        through the call sites — is more change surface than it's worth for
+        the integration's current scale.
         """
         if schedule_data is None or not schedule_data.get("current"):
             return None
