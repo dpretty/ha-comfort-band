@@ -27,6 +27,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror
     "sensor.office_apparent_temperature",
     "sensor.office_override_ends",
+    "sensor.office_next_band_change",  # v0.23
     "sensor.office_current_action",
     "sensor.office_thermal_slope",
     "sensor.office_predicted_action",
@@ -263,3 +264,45 @@ async def test_zone_and_profile_selects_coexist(
     assert hass.states.get("select.comfort_band_profiles_active_profile") is not None
     assert hass.states.get("select.office_active_fan_mode") is not None
     assert hass.states.get("select.office_idle_fan_mode") is not None
+
+
+async def test_next_band_change_sensor_reports_the_schedule(
+    hass: HomeAssistant, hass_storage: dict[str, Any], make_zone_entry: Any
+) -> None:
+    """v0.23.0: the sensor carries the next change's time, the band from then,
+    and whether a schedule sets the zone's band."""
+    await hass.config.async_set_time_zone("UTC")
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    unscheduled = hass.states.get("sensor.office_next_band_change")
+    assert unscheduled is not None
+    assert unscheduled.state == "unknown"
+    assert unscheduled.attributes["scheduled"] is False
+
+    # Two all-day bands, so whatever the time there is a next change.
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {
+            "zone": "office",
+            "profile": "home",
+            "transitions": [
+                {"at": "00:00", "low": 18.0, "high": 22.0},
+                {"at": "12:00", "low": 19.0, "high": 23.0},
+            ],
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    scheduled = hass.states.get("sensor.office_next_band_change")
+    assert scheduled is not None
+    assert scheduled.state not in ("unknown", "unavailable", "")
+    assert scheduled.attributes["scheduled"] is True
+    assert (scheduled.attributes["low"], scheduled.attributes["high"]) in (
+        (18.0, 22.0),
+        (19.0, 23.0),
+    )

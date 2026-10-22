@@ -9,6 +9,7 @@ import pytest
 from custom_components.comfort_band.schedule import (
     Transition,
     import_legacy_hourly,
+    next_change,
     normalize_schedule,
     resolve,
     schedule_from_dict,
@@ -391,3 +392,70 @@ def test_resolve_ramp_close_transitions_stay_monotonic() -> None:
             assert results[i] == pytest.approx(expected), (
                 f"step {i}: expected {expected}, got {results[i]}"
             )
+
+
+# --- v0.23.0: next_change -------------------------------------------------
+
+_DAY = [
+    Transition(at=time(6, 0), low=18.0, high=22.0),
+    Transition(at=time(9, 0), low=17.0, high=24.0),
+    Transition(at=time(21, 0), low=16.0, high=20.0),
+]
+
+
+def test_next_change_is_the_next_transition_today() -> None:
+    assert next_change(_DAY, time(7, 30)) == _DAY[1]
+
+
+def test_next_change_wraps_past_midnight() -> None:
+    # After the last transition of the day, the next is tomorrow's first.
+    assert next_change(_DAY, time(22, 0)) == _DAY[0]
+    # Before the first transition, the band is yesterday's last; today's
+    # first transition is the next change.
+    assert next_change(_DAY, time(1, 0)) == _DAY[0]
+
+
+def test_next_change_treats_a_transition_at_now_as_past() -> None:
+    assert next_change(_DAY, time(9, 0)) == _DAY[2]
+
+
+def test_next_change_skips_a_transition_that_keeps_the_band() -> None:
+    day = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(12, 0), low=18.0, high=22.0),
+        Transition(at=time(18, 0), low=20.0, high=23.0),
+    ]
+    assert next_change(day, time(7, 0)) == day[2]
+
+
+def test_next_change_compares_with_the_band_in_force_not_the_last_step() -> None:
+    # A to B and back to A: from inside A, B is the change.
+    day = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(7, 0), low=19.0, high=23.0),
+        Transition(at=time(8, 0), low=18.0, high=22.0),
+    ]
+    assert next_change(day, time(6, 30)) == day[1]
+    assert next_change(day, time(7, 30)) == day[2]
+
+
+def test_next_change_is_none_when_the_band_never_changes() -> None:
+    assert next_change([Transition(at=time(6, 0), low=18.0, high=22.0)], time(7, 0)) is None
+    same = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(18, 0), low=18.0, high=22.0),
+    ]
+    assert next_change(same, time(7, 0)) is None
+
+
+def test_next_change_counts_a_change_in_either_limit() -> None:
+    day = [
+        Transition(at=time(6, 0), low=18.0, high=22.0),
+        Transition(at=time(18, 0), low=18.0, high=23.0),
+    ]
+    assert next_change(day, time(7, 0)) == day[1]
+
+
+def test_next_change_raises_on_empty_schedule() -> None:
+    with pytest.raises(ValueError):
+        next_change([], time(7, 0))

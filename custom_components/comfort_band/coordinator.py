@@ -162,6 +162,17 @@ class ZoneState:
     # then diverge. `mpc_ready` exposes the gate as a binary sensor.
     mpc_decision: HysteresisDecision
     mpc_ready: bool
+    # v0.23.0: `scheduled` is True when a schedule sets the zone's band, and
+    # False exactly when `sched_low`/`sched_high` fell back to the manual band
+    # -- then an override's band stays in force after the override ends,
+    # since `async_start_override` writes it to the manual band. `next_change`
+    # is when the schedule next moves the band (`schedule.next_change`), and
+    # `next_low`/`next_high` the band from then; all three are None while the
+    # band never changes or nothing is scheduled.
+    scheduled: bool = False
+    next_change: datetime | None = None
+    next_low: float | None = None
+    next_high: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -729,6 +740,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             fallback=(zone["manual_low"], zone["manual_high"]),
             ramp_minutes=zone["band_ramp_minutes"],
         )
+        transitions = self._schedule_transitions(schedule_data)
+        next_change_at: datetime | None = None
+        next_low: float | None = None
+        next_high: float | None = None
+        if transitions is not None:
+            now_local = dt_util.now()
+            change = schedule.next_change(transitions, now_local.time())
+            if change is not None:
+                day = now_local.date()
+                if change.at <= now_local.time():
+                    day += timedelta(days=1)
+                next_change_at = datetime.combine(day, change.at, tzinfo=now_local.tzinfo)
+                next_low, next_high = change.low, change.high
 
         if override_active:
             eff_low, eff_high = zone["manual_low"], zone["manual_high"]
@@ -917,6 +941,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             idle_slope_cached_age_min=idle_slope_cached_age_min,
             mpc_decision=mpc_decision,
             mpc_ready=mpc_ready,
+            scheduled=transitions is not None,
+            next_change=next_change_at,
+            next_low=next_low,
+            next_high=next_high,
         )
 
         # Apply in a follow-up task so this refresh returns immediately --
@@ -1559,6 +1587,19 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
                 )
         else:
             self._command_warn_logged_at.pop("fan", None)
+
+    def _schedule_transitions(
+        self, schedule_data: StoredProfileSchedule | None
+    ) -> list[Transition] | None:
+        """The schedule's transitions, or None when there is no schedule or it
+        is corrupt: exactly when `_resolve_schedule` falls back to the manual
+        band."""
+        if schedule_data is None or not schedule_data.get("current"):
+            return None
+        try:
+            return normalize_schedule(schedule_from_dict(schedule_data["current"]))
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _resolve_schedule(
         self,

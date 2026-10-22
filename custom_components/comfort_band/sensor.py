@@ -116,6 +116,32 @@ class OverrideEndsSensor(ComfortBandZoneEntity, SensorEntity):
         return self.coordinator.data.override_until
 
 
+class NextBandChangeSensor(ComfortBandZoneEntity, SensorEntity):
+    """v0.23.0: when the zone's schedule next changes its band, and to what.
+
+    Unknown when no schedule sets the zone's band, or its band never changes.
+    `low` and `high` are the band from then (a band ramp eases into it either
+    side of that time). `scheduled` says whether a schedule sets the zone's
+    band at all: when it doesn't, the manual band is the zone's band, so an
+    override's band stays in force after the override ends. The schedule
+    runs on under an override, so this reports its next change then too.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: ZoneCoordinator) -> None:
+        super().__init__(coordinator, "next_band_change")
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self.coordinator.data.next_change
+
+    @property
+    def extra_state_attributes(self) -> dict[str, float | bool | None]:
+        data = self.coordinator.data
+        return {"low": data.next_low, "high": data.next_high, "scheduled": data.scheduled}
+
+
 class CurrentActionSensor(ComfortBandZoneEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENUM
 
@@ -300,6 +326,7 @@ async def async_setup_entry(
             RoomTemperatureSensor(coordinator),
             ApparentTemperatureSensor(coordinator),
             OverrideEndsSensor(coordinator),
+            NextBandChangeSensor(coordinator),
             CurrentActionSensor(coordinator),
             ThermalSlopeSensor(coordinator),
             PredictedActionSensor(coordinator),
