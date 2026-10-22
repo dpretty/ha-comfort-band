@@ -6090,3 +6090,241 @@ async def test_the_commit_lands_before_the_setpoint_call(
     await hass.async_block_till_done()
 
     assert seen == [ACTION_HEAT], seen
+
+
+# --- v0.23.0: the schedule's next band change ------------------------------
+
+_NEXT_CHANGE_DAY = [
+    {"at": "06:00", "low": 18.0, "high": 22.0},
+    {"at": "09:00", "low": 17.0, "high": 24.0},
+    {"at": "21:00", "low": 16.0, "high": 20.0},
+]
+
+
+async def _zone_with_day_schedule(hass: HomeAssistant, coordinator: ZoneCoordinator) -> None:
+    await coordinator._store.async_set_zone_schedule("office", "home", baseline=_NEXT_CHANGE_DAY)
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+
+
+async def test_next_change_is_the_schedules_next_band_change(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 07:30:00+00:00")
+    await _zone_with_day_schedule(hass, coordinator)
+    state = await coordinator._async_update_data()
+    assert state.scheduled is True
+    assert state.next_change == datetime.fromisoformat("2026-05-19 09:00:00+00:00")
+    assert (state.next_low, state.next_high) == (17.0, 24.0)
+
+
+async def test_next_change_after_the_last_transition_is_tomorrow(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 22:15:00+00:00")
+    await _zone_with_day_schedule(hass, coordinator)
+    state = await coordinator._async_update_data()
+    assert state.next_change == datetime.fromisoformat("2026-05-20 06:00:00+00:00")
+    assert (state.next_low, state.next_high) == (18.0, 22.0)
+
+
+async def test_next_change_is_in_the_zones_local_time(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    """Transitions are wall-clock times in HA's time zone: 06:30 in Sydney
+    (UTC+10 in May) is 20:30 UTC the day before, and the 09:00 change is
+    23:00 UTC."""
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    freezer.move_to("2026-05-19 20:30:00+00:00")
+    await _zone_with_day_schedule(hass, coordinator)
+    state = await coordinator._async_update_data()
+    assert state.next_change is not None
+    assert state.next_change.utcoffset() == timedelta(hours=10)
+    assert state.next_change == datetime.fromisoformat("2026-05-19 23:00:00+00:00")
+
+
+async def test_next_change_reports_the_schedule_under_an_override(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 07:30:00+00:00")
+    await _zone_with_day_schedule(hass, coordinator)
+    await coordinator.async_start_override(low=20.0, high=23.0, hours=3)
+    state = await coordinator._async_update_data()
+    assert state.override_active is True
+    assert state.scheduled is True
+    assert state.next_change == datetime.fromisoformat("2026-05-19 09:00:00+00:00")
+    # The schedule's band from then, not the override's.
+    assert (state.next_low, state.next_high) == (17.0, 24.0)
+
+
+async def test_next_change_none_and_unscheduled_without_a_schedule(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """With no schedule the manual band is the zone's band: nothing to change,
+    and an override's band would stay after it ends."""
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    assert state.scheduled is False
+    assert (state.next_change, state.next_low, state.next_high) == (None, None, None)
+
+
+async def test_next_change_tomorrow_is_the_zones_tomorrow(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    """After the day's last transition the next is tomorrow's first, by the
+    zone's calendar: 06:30 on 20 May in Sydney is still 19 May in UTC."""
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    freezer.move_to("2026-05-19 20:30:00+00:00")
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "01:00", "low": 18.0, "high": 22.0},
+            {"at": "05:00", "low": 17.0, "high": 24.0},
+        ],
+    )
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    # 01:00 on 21 May in Sydney.
+    assert state.next_change == datetime.fromisoformat("2026-05-20 15:00:00+00:00")
+
+
+async def test_next_change_across_the_end_of_daylight_saving(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    """Sydney's clocks go back at 03:00 on 5 April 2026, so 06:00 that morning
+    is +10:00, not the +11:00 in force the evening before."""
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    freezer.move_to("2026-04-04 11:00:00+00:00")  # 22:00 AEDT
+    await _zone_with_day_schedule(hass, coordinator)
+    state = await coordinator._async_update_data()
+    assert state.next_change == datetime.fromisoformat("2026-04-04 20:00:00+00:00")
+
+
+async def test_next_change_in_the_repeated_hour_comes_round_again(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    """In the second pass through 02:00-03:00 on 5 April 2026 in Sydney, a
+    02:30 change is the second 02:30 (16:30Z), not the first, already past."""
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    await coordinator._store.async_set_zone_schedule(
+        "office",
+        "home",
+        baseline=[
+            {"at": "00:00", "low": 18.0, "high": 22.0},
+            {"at": "02:30", "low": 17.0, "high": 24.0},
+            {"at": "06:00", "low": 18.0, "high": 22.0},
+        ],
+    )
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    # Compared as instants: a time in a repeated hour never equals one in
+    # another zone (PEP 495).
+    freezer.move_to("2026-04-04 15:10:00+00:00")  # 02:10 AEDT, the first pass
+    state = await coordinator._async_update_data()
+    assert state.next_change is not None
+    assert state.next_change.timestamp() == datetime.fromisoformat("2026-04-04 15:30Z").timestamp()
+    freezer.move_to("2026-04-04 16:10:00+00:00")  # 02:10 AEST, the second pass
+    state = await coordinator._async_update_data()
+    assert state.next_change is not None
+    assert state.next_change.timestamp() == datetime.fromisoformat("2026-04-04 16:30Z").timestamp()
+
+
+async def test_next_change_follows_the_active_profile(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 07:30:00+00:00")
+    store = coordinator._store
+    await store.async_set_zone_schedule("office", "home", baseline=_NEXT_CHANGE_DAY)
+    await store.async_set_zone_schedule(
+        "office",
+        "away",
+        baseline=[
+            {"at": "00:00", "low": 15.0, "high": 27.0},
+            {"at": "08:00", "low": 14.0, "high": 28.0},
+        ],
+    )
+    await store.async_set_active_profile("away")
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    assert state.next_change == datetime.fromisoformat("2026-05-19 08:00:00+00:00")
+    assert (state.next_low, state.next_high) == (14.0, 28.0)
+    await coordinator.async_unload()
+
+
+async def test_next_change_from_a_shared_schedule_skips_a_repeated_band(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 07:00:00+00:00")
+    store = coordinator._store
+    sid = await store.async_add_shared_schedule("Bedrooms")
+    await store.async_set_shared_schedule(
+        sid,
+        "home",
+        [
+            {"at": "06:00", "low": 18.0, "high": 22.0},
+            {"at": "12:00", "low": 18.0, "high": 22.0},
+            {"at": "21:00", "low": 16.0, "high": 20.0},
+        ],
+    )
+    await store.async_set_zone_schedule_id("office", sid)
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    assert state.scheduled is True
+    assert state.next_change == datetime.fromisoformat("2026-05-19 21:00:00+00:00")
+    assert (state.next_low, state.next_high) == (16.0, 20.0)
+    await coordinator.async_unload()
+
+
+async def test_next_change_is_the_transition_not_the_start_of_its_ramp(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, freezer: FrozenDateTimeFactory
+) -> None:
+    """With a 30-minute ramp the band starts moving at 08:45, but the change
+    reported is the 09:00 transition; and once past it, inside the ramp, the
+    next change is the one after."""
+    await hass.config.async_set_time_zone("UTC")
+    await _zone_with_day_schedule(hass, coordinator)
+    await coordinator._store.async_update_zone("office", band_ramp_minutes=30)
+    freezer.move_to("2026-05-19 08:00:00+00:00")
+    state = await coordinator._async_update_data()
+    assert state.next_change == datetime.fromisoformat("2026-05-19 09:00:00+00:00")
+    freezer.move_to("2026-05-19 09:05:00+00:00")
+    state = await coordinator._async_update_data()
+    assert state.next_change == datetime.fromisoformat("2026-05-19 21:00:00+00:00")
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        [{"at": "07:00", "low": 22.0, "high": 20.0}],  # ValueError: low above high
+        [{"at": 700, "low": 18.0, "high": 22.0}],  # TypeError: `at` isn't a string
+        [{"at": "07:00", "high": 22.0}],  # KeyError: no low
+    ],
+)
+async def test_next_change_unscheduled_for_corrupt_data(
+    hass: HomeAssistant, coordinator: ZoneCoordinator, current: list[dict[str, Any]]
+) -> None:
+    await coordinator._store.async_update_zone(
+        "office", schedules={"home": {"baseline": current, "current": current}}
+    )
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    state = await coordinator._async_update_data()
+    assert (state.sched_low, state.sched_high) == (19.5, 22.5)  # the manual band
+    assert state.scheduled is False
+    assert state.next_change is None
+
+
+async def test_next_change_none_but_scheduled_when_the_band_never_changes(
+    hass: HomeAssistant, coordinator: ZoneCoordinator
+) -> None:
+    """A schedule with one all-day band still sets the zone's band, so an
+    override ends back on it -- there is just no change to report."""
+    await _assign_shared(coordinator, "Bedrooms", 21.0, 24.0)
+    hass.states.async_set(TEMP_ENTITY, "22.0", {})
+    state = await coordinator._async_update_data()
+    assert state.scheduled is True
+    assert state.next_change is None
+    await coordinator.async_unload()

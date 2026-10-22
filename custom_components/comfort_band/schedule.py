@@ -72,6 +72,27 @@ def resolve(
     return chosen.low, chosen.high
 
 
+def next_change(transitions: Sequence[Transition], now_local: time) -> Transition | None:
+    """Return the next transition after ``now_local`` that changes the band.
+
+    v0.23.0, for ``sensor.{zone}_next_band_change``. The band compared against
+    is the stepped one in force at ``now_local`` (``resolve`` without a ramp),
+    and a transition that sets that same band again is skipped, so the result
+    is when the schedule next actually moves the band. Wraps past midnight: a
+    transition earlier in the day than ``now_local`` comes round tomorrow. A
+    transition exactly at ``now_local`` has already happened. Returns None when
+    every transition sets the same band, so the band never changes.
+    ``transitions`` must be normalized (sorted, validated); empty raises.
+    """
+    current = resolve(transitions, now_local)
+    start = bisect_right([t.at for t in transitions], now_local)
+    for i in range(len(transitions)):
+        candidate = transitions[(start + i) % len(transitions)]
+        if (candidate.low, candidate.high) != current:
+            return candidate
+    return None
+
+
 def _ramp_interpolate(
     transitions: Sequence[Transition],
     now_local: time,

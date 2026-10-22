@@ -131,6 +131,9 @@
       "override_ends": {
         "name": "Override ends"
       },
+      "next_band_change": {
+        "name": "Next band change"
+      },
       "current_action": {
         "name": "Current action",
         "state": {

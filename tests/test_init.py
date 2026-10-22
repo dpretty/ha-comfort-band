@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -27,6 +28,7 @@ _EXPECTED_ZONE_ENTITIES = (
     "sensor.office_room_temperature",  # comfort_band's diagnostic mirror
     "sensor.office_apparent_temperature",
     "sensor.office_override_ends",
+    "sensor.office_next_band_change",  # v0.23
     "sensor.office_current_action",
     "sensor.office_thermal_slope",
     "sensor.office_predicted_action",
@@ -263,3 +265,99 @@ async def test_zone_and_profile_selects_coexist(
     assert hass.states.get("select.comfort_band_profiles_active_profile") is not None
     assert hass.states.get("select.office_active_fan_mode") is not None
     assert hass.states.get("select.office_idle_fan_mode") is not None
+
+
+async def _next_band_change_after_setting(
+    hass: HomeAssistant, transitions: list[dict[str, Any]]
+) -> Any:
+    await hass.services.async_call(
+        "comfort_band",
+        "set_schedule",
+        {"zone": "office", "profile": "home", "transitions": transitions},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    return hass.states.get("sensor.office_next_band_change")
+
+
+async def test_next_band_change_sensor_reports_the_schedule(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    make_zone_entry: Any,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.23.0: the sensor's state is the next change, as HA publishes every
+    timestamp, and its attributes the band from then and whether a schedule
+    sets the zone's band."""
+    await hass.config.async_set_time_zone("UTC")
+    freezer.move_to("2026-05-19 07:30:00+00:00")
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    unscheduled = hass.states.get("sensor.office_next_band_change")
+    assert unscheduled is not None
+    assert unscheduled.state == "unknown"
+    assert (
+        dict(unscheduled.attributes).items()
+        >= {
+            "low": None,
+            "high": None,
+            "scheduled": False,
+            "device_class": "timestamp",
+        }.items()
+    )
+
+    scheduled = await _next_band_change_after_setting(
+        hass,
+        [
+            {"at": "06:00", "low": 18.0, "high": 22.0},
+            {"at": "09:00", "low": 17.0, "high": 24.0},
+            {"at": "21:00", "low": 16.0, "high": 20.0},
+        ],
+    )
+    assert scheduled.state == "2026-05-19T09:00:00+00:00"
+    assert (scheduled.attributes["low"], scheduled.attributes["high"]) == (17.0, 24.0)
+    assert scheduled.attributes["scheduled"] is True
+
+    # One all-day band: scheduled, with nothing to change to.
+    all_day = await _next_band_change_after_setting(
+        hass, [{"at": "00:00", "low": 19.0, "high": 23.0}]
+    )
+    assert all_day.state == "unknown"
+    assert all_day.attributes["scheduled"] is True
+
+    # An empty schedule, which the service accepts, sets nothing: the zone
+    # falls back to its manual band and keeps running.
+    empty = await _next_band_change_after_setting(hass, [])
+    assert empty.state == "unknown"
+    assert empty.attributes["scheduled"] is False
+    assert hass.states.get("sensor.office_effective_low").state == "19.5"
+
+
+async def test_next_band_change_sensor_publishes_the_instant_outside_utc(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    make_zone_entry: Any,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """In Sydney at 22:30 on 19 May, after the day's last transition, the next
+    change is 06:00 on the 20th: published as that instant in UTC."""
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    freezer.move_to("2026-05-19 12:30:00+00:00")
+    entry = make_zone_entry(temp_sensor=ZONE_TEMP_ENTITY)
+    entry.add_to_hass(hass)
+    hass.states.async_set(ZONE_TEMP_ENTITY, "21.0", {})
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    state = await _next_band_change_after_setting(
+        hass,
+        [
+            {"at": "06:00", "low": 18.0, "high": 22.0},
+            {"at": "21:00", "low": 16.0, "high": 20.0},
+        ],
+    )
+    assert state.state == "2026-05-19T20:00:00+00:00"
+    assert (state.attributes["low"], state.attributes["high"]) == (18.0, 22.0)
