@@ -1,6 +1,7 @@
 {
   "domain": "comfort_band",
   "name": "Comfort Band",
+  "categories": ["helpers", "climate"],
   "codeowners": ["@dpretty"],
   "config_flow": true,
   "documentation": "https://github.com/dpretty/ha-comfort-band",
@@ -8,5 +9,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/dpretty/ha-comfort-band/issues",
   "requirements": [],
-  "version": "0.24.0"
+  "version": "0.24.1"
 }

@@ -19,6 +19,7 @@ consistent error class regardless of which layer rejected.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import time
 from typing import TYPE_CHECKING, Any
@@ -283,13 +284,13 @@ async def _target_set(
 def _parse_time(value: str) -> time:
     """Parse an HH:MM `at` value, surfacing a clean ServiceValidationError rather
     than a raw ValueError. The schema's `_TIME_RE` already rejects bad values;
-    this is defence-in-depth so any that slip through degrade gracefully."""
-    try:
-        return time.fromisoformat(value)
-    except ValueError as err:
-        raise ServiceValidationError(
-            f"Invalid time {value!r}; expected HH:MM (00:00-23:59)"
-        ) from err
+    this is defence-in-depth so any that slip through degrade gracefully.
+
+    `time.fromisoformat` alone can't be the check: from Python 3.14 it accepts
+    "24:00" as midnight. So the value is matched against `_TIME_RE` first."""
+    if re.match(_TIME_RE, value) is None:
+        raise ServiceValidationError(f"Invalid time {value!r}; expected HH:MM (00:00-23:59)")
+    return time.fromisoformat(value)
 
 
 def _to_transitions(raw: list[dict[str, Any]]) -> list[Transition]:

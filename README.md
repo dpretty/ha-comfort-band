@@ -222,9 +222,20 @@ Every zone still defaults to **shadow mode** (`switch.{zone}_enabled = off`): th
 
 ## Companion card
 
-A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https://github.com/dpretty/ha-comfort-band-card)**. Compact tile + expanded modal with Now / Schedule / Profiles / Insights tabs. Install it via HACS as a Dashboard Custom Repository — see that repo's README for steps.
+A Lovelace card lives in a separate repo: **[dpretty/ha-comfort-band-card](https://github.com/dpretty/ha-comfort-band-card)**. Compact tile + expanded modal with Now / Schedule / Profiles / Insights tabs. Install it from the Marketplace (or HACS before Home Assistant 2026.11) as a Dashboard repository — see that repo's README for steps.
 
 ## Installation
+
+[![Open your Home Assistant instance and open this repository in the Marketplace.](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=dpretty&repository=ha-comfort-band&category=integration)
+
+### Home Assistant 2026.11 and later: Marketplace
+
+1. Select the button above. Or go to **Settings → Marketplace → Add from link**, enter `dpretty/ha-comfort-band`, and select **Add**. Adding a repository from a link needs a GitHub connection; the Marketplace asks you to connect the first time.
+2. Open **Comfort Band** and select **Install**. Its setup opens straight away. If you close it, add it later under **Settings → Devices & Services → Add Integration → Comfort Band**.
+
+Updates show up under **Settings → Updates**. After an update, a repair asks you to restart Home Assistant.
+
+### Earlier versions: HACS
 
 1. In HACS: **Integrations → ⋮ → Custom repositories**.
 2. URL: `https://github.com/dpretty/ha-comfort-band`. Category: **Integration**.
