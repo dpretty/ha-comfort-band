@@ -186,7 +186,7 @@ start_override:
           unit_of_measurement: "°C"
     hours:
       name: Override hours
-      description: Duration of the override. Defaults to the zone's `override_hours` number entity.
+      description: Duration of the override. Defaults to the zone's `override_hours` number entity. Not with `until`.
       required: false
       selector:
         number:
@@ -194,16 +194,40 @@ start_override:
           max: 24
           step: 0.25
           unit_of_measurement: "h"
+    until:
+      name: Until
+      description: "When the override ends, instead of `hours`: in the future and within 7 days. A time without an offset is Home Assistant's local time."
+      required: false
+      selector:
+        datetime:
 
 cancel_override:
   name: Cancel override
-  description: Immediately end the active override for a zone.
+  description: Immediately end the active override for a zone. Optionally set the manual low/high band in the same step.
   fields:
     zone:
       name: Zone
       required: true
       selector:
         text:
+    low:
+      name: Manual low
+      required: false
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    high:
+      name: Manual high
+      required: false
+      selector:
+        number:
+          min: 10
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
 
 record_feedback:
   name: Record comfort feedback

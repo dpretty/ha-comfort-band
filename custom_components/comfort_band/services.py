@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import time
+from datetime import time, timedelta
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -110,16 +110,33 @@ _REMOVE_TRANSITION_SCHEMA = vol.Schema(
     }
 )
 
+# v0.25.0: an override ends after `hours`, or at `until` -- one or the other.
+# `until` is how a caller ends one at a time it already knows: the schedule's
+# next change (`sensor.{zone}_next_band_change`), or an earlier override's end
+# put back by an undo. It's bounded so that no far-off date reaches the expiry
+# timer or the date arithmetic downstream.
+_OVERRIDE_UNTIL_MAX = timedelta(days=7)
+
 _START_OVERRIDE_SCHEMA = vol.Schema(
     {
         vol.Required("zone"): cv.string,
         vol.Optional("low"): vol.Coerce(float),
         vol.Optional("high"): vol.Coerce(float),
-        vol.Optional("hours"): vol.Coerce(float),
+        vol.Exclusive("hours", "length"): vol.Coerce(float),
+        vol.Exclusive("until", "length"): cv.datetime,
     }
 )
 
-_CANCEL_OVERRIDE_SCHEMA = vol.Schema({vol.Required("zone"): cv.string})
+# v0.25.0: `low` / `high` put the manual band back as the override ends, in
+# the same write. In a zone with no schedule the manual band *is* its band, so
+# that's how an undo restores the band an override replaced.
+_CANCEL_OVERRIDE_SCHEMA = vol.Schema(
+    {
+        vol.Required("zone"): cv.string,
+        vol.Optional("low"): vol.Coerce(float),
+        vol.Optional("high"): vol.Coerce(float),
+    }
+)
 
 _RECORD_FEEDBACK_SCHEMA = vol.Schema(
     {
@@ -378,15 +395,30 @@ async def async_register_services(hass: HomeAssistant) -> None:
     async def _start_override(call: ServiceCall) -> None:
         zone_name = call.data["zone"]
         coordinator = _coordinator(hass, zone_name)
+        until = call.data.get("until")
+        if until is not None:
+            # Without an offset, a time is HA's local time.
+            until = dt_util.as_utc(until)
+            now = dt_util.utcnow()
+            if until <= now:
+                raise ServiceValidationError(f"`until` must be in the future: {until.isoformat()}")
+            if until > now + _OVERRIDE_UNTIL_MAX:
+                raise ServiceValidationError(
+                    f"`until` must be within {_OVERRIDE_UNTIL_MAX.days} days: {until.isoformat()}"
+                )
         await coordinator.async_start_override(
             low=call.data.get("low"),
             high=call.data.get("high"),
             hours=call.data.get("hours"),
+            until=until,
         )
 
     async def _cancel_override(call: ServiceCall) -> None:
         coordinator = _coordinator(hass, call.data["zone"])
-        await coordinator.async_cancel_override()
+        await coordinator.async_cancel_override(
+            low=call.data.get("low"),
+            high=call.data.get("high"),
+        )
 
     async def _record_feedback(call: ServiceCall) -> None:
         # Append a comfort-feedback data point enriched with the band/action

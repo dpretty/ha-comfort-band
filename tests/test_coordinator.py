@@ -444,6 +444,84 @@ async def test_override_starts_then_expires(
     await coordinator.async_unload()
 
 
+async def test_override_until_ends_at_that_time(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.0: `until` is the end itself, and the expiry timer fires then."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+
+    until = datetime(2026, 4, 25, 12, 30, tzinfo=dt_util.UTC)
+    await coordinator.async_start_override(low=22.0, high=24.0, until=until)
+    assert coordinator.data.override_until == until
+    assert coordinator.data.override_active
+
+    freezer.move_to("2026-04-25 12:29:00+00:00")
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+    assert coordinator.data.override_active
+
+    freezer.move_to("2026-04-25 12:30:01+00:00")
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+    assert not coordinator.data.override_active
+    await coordinator.async_unload()
+    # The timer's refresh goes through the coordinator's request debouncer,
+    # which only a config entry would otherwise stop.
+    await coordinator.async_shutdown()
+
+
+async def test_override_until_wins_over_hours(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The service keeps them apart; called directly, `until` is the end."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    until = datetime(2026, 4, 25, 11, 15, tzinfo=dt_util.UTC)
+    await coordinator.async_start_override(hours=5, until=until)
+    assert coordinator.data.override_until == until
+    await coordinator.async_unload()
+
+
+async def test_cancel_override_puts_the_manual_band_back(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.0: with no schedule the manual band is the zone's band, so
+    putting it back as the override ends restores the band in force."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    low_before = coordinator.data.effective_low
+    high_before = coordinator.data.effective_high
+
+    await coordinator.async_start_override(low=22.0, high=24.0, hours=1)
+    await coordinator.async_cancel_override(low=low_before, high=high_before)
+    assert not coordinator.data.override_active
+    assert coordinator.data.effective_low == low_before
+    assert coordinator.data.effective_high == high_before
+    await coordinator.async_unload()
+
+
 async def test_cross_mode_min_cycle_suppresses_heat_to_cool(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from datetime import time as dt_time
+from datetime import timedelta
 from typing import Any
 
 import pytest
 import voluptuous as vol
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.comfort_band.const import DOMAIN, PEAK_STATE_OFF, ROOM_SOURCE_PRIMARY
@@ -158,6 +160,133 @@ async def test_start_override_then_cancel(
     assert hass.states.get("binary_sensor.office_override_active").state == "on"
     await hass.services.async_call(DOMAIN, "cancel_override", {"zone": "office"}, blocking=True)
     assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+# v0.25.0: an override can end at a time given, rather than after hours.
+async def test_start_override_until_ends_it_then(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = (dt_util.utcnow() + timedelta(hours=2)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "until": until.isoformat()},
+        blocking=True,
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+    ends = hass.states.get("sensor.office_override_ends")
+    assert ends is not None
+    assert dt_util.parse_datetime(ends.state) == until
+
+
+async def test_start_override_until_without_an_offset_is_local_time(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.config.async_set_time_zone("Australia/Sydney")
+    local = (dt_util.now() + timedelta(hours=2)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "until": local.replace(tzinfo=None).isoformat()},
+        blocking=True,
+    )
+    ends = hass.states.get("sensor.office_override_ends")
+    assert ends is not None
+    assert dt_util.parse_datetime(ends.state) == dt_util.as_utc(local)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [timedelta(minutes=-5), timedelta(0), timedelta(days=7, minutes=1)],
+    ids=["past", "now", "beyond-7-days"],
+)
+async def test_start_override_refuses_an_until_out_of_range(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None, offset: timedelta
+) -> None:
+    low_before = hass.states.get("number.office_manual_low").state
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "low": 25.0, "until": (dt_util.utcnow() + offset).isoformat()},
+            blocking=True,
+        )
+    # Nothing changed: no override, and the manual band as it was.
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert hass.states.get("number.office_manual_low").state == low_before
+
+
+async def test_start_override_takes_an_until_just_inside_7_days(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = (dt_util.utcnow() + timedelta(days=7, minutes=-1)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN, "start_override", {"zone": "office", "until": until.isoformat()}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+
+
+async def test_start_override_refuses_hours_with_until(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = dt_util.utcnow() + timedelta(hours=2)
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "hours": 1, "until": until.isoformat()},
+            blocking=True,
+        )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+# v0.25.0: ending an override can put the manual band back in the same step.
+async def test_cancel_override_sets_the_manual_band(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "cancel_override", {"zone": "office", "low": 19.0, "high": 23.5}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert float(hass.states.get("number.office_manual_low").state) == 19.0
+    assert float(hass.states.get("number.office_manual_high").state) == 23.5
+
+
+async def test_cancel_override_sets_only_the_edge_given(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "cancel_override", {"zone": "office", "high": 23.0}, blocking=True
+    )
+    assert float(hass.states.get("number.office_manual_low").state) == 22.0
+    assert float(hass.states.get("number.office_manual_high").state) == 23.0
+
+
+async def test_cancel_override_keeps_the_manual_band_without_one(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(DOMAIN, "cancel_override", {"zone": "office"}, blocking=True)
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert float(hass.states.get("number.office_manual_low").state) == 22.0
+    assert float(hass.states.get("number.office_manual_high").state) == 24.0
 
 
 # ----- set_profile -----
