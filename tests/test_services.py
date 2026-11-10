@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import time as dt_time
+from datetime import timedelta
 from typing import Any
 
 import pytest
 import voluptuous as vol
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.comfort_band.const import DOMAIN, PEAK_STATE_OFF, ROOM_SOURCE_PRIMARY
@@ -158,6 +161,254 @@ async def test_start_override_then_cancel(
     assert hass.states.get("binary_sensor.office_override_active").state == "on"
     await hass.services.async_call(DOMAIN, "cancel_override", {"zone": "office"}, blocking=True)
     assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+# v0.25.0: an override can end at a time given, rather than after hours.
+async def test_start_override_until_ends_it_then(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = (dt_util.utcnow() + timedelta(hours=2)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "until": until.isoformat()},
+        blocking=True,
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+    ends = hass.states.get("sensor.office_override_ends")
+    assert ends is not None
+    assert dt_util.parse_datetime(ends.state) == until
+
+
+async def test_start_override_until_without_an_offset_is_local_time(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # Not the test host's zone, so HA's is told from the machine's.
+    await hass.config.async_set_time_zone("Asia/Kolkata")
+    local = (dt_util.now() + timedelta(hours=2)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "until": local.replace(tzinfo=None).isoformat()},
+        blocking=True,
+    )
+    ends = hass.states.get("sensor.office_override_ends")
+    assert ends is not None
+    assert dt_util.parse_datetime(ends.state) == dt_util.as_utc(local)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [timedelta(minutes=-5), timedelta(0), timedelta(days=7, minutes=1)],
+    ids=["past", "now", "beyond-7-days"],
+)
+async def test_start_override_refuses_an_until_out_of_range(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None, offset: timedelta
+) -> None:
+    low_before = hass.states.get("number.office_manual_low").state
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "low": 25.0, "until": (dt_util.utcnow() + offset).isoformat()},
+            blocking=True,
+        )
+    # Nothing changed: no override, and the manual band as it was.
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert hass.states.get("number.office_manual_low").state == low_before
+
+
+async def test_start_override_takes_an_until_just_inside_7_days(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = (dt_util.utcnow() + timedelta(days=7, minutes=-1)).replace(microsecond=0)
+    await hass.services.async_call(
+        DOMAIN, "start_override", {"zone": "office", "until": until.isoformat()}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+
+
+# With the clock held: now and a second past 168 hours are refused; a second
+# ahead and exactly 168 hours are taken.
+async def test_start_override_until_at_its_bounds(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_zone: None,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    freezer.move_to((dt_util.utcnow() + timedelta(minutes=1)).replace(microsecond=0))
+    now = dt_util.utcnow()
+
+    async def start(until: Any) -> None:
+        await hass.services.async_call(
+            DOMAIN, "start_override", {"zone": "office", "until": until.isoformat()}, blocking=True
+        )
+
+    for refused in (now, now + timedelta(hours=168, seconds=1)):
+        with pytest.raises(ServiceValidationError):
+            await start(refused)
+    for taken in (now + timedelta(seconds=1), now + timedelta(hours=168)):
+        await start(taken)
+        ends = hass.states.get("sensor.office_override_ends")
+        assert ends is not None
+        assert dt_util.parse_datetime(ends.state) == taken
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+
+
+# The band set with an `until` is how an undo puts back an earlier override.
+async def test_start_override_until_sets_the_band_too(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = dt_util.utcnow() + timedelta(hours=2)
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.5, "high": 24.5, "until": until.isoformat()},
+        blocking=True,
+    )
+    assert float(hass.states.get("number.office_manual_low").state) == 22.5
+    assert float(hass.states.get("number.office_manual_high").state) == 24.5
+
+
+async def test_start_override_refuses_an_until_beyond_dates(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    with pytest.raises(ServiceValidationError, match="out of range"):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "until": "9999-12-31T23:59:59-12:00"},
+            blocking=True,
+        )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+# Said as entered: in HA's time zone, not UTC.
+async def test_start_override_says_a_refused_until_in_local_time(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    # A zone without a change of the clocks, and not the test host's.
+    await hass.config.async_set_time_zone("Asia/Kolkata")
+    past = (dt_util.now() - timedelta(hours=1)).replace(microsecond=0)
+    with pytest.raises(ServiceValidationError, match=past.isoformat().replace("+", r"\+")):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "until": past.replace(tzinfo=None).isoformat()},
+            blocking=True,
+        )
+
+
+async def test_start_override_refuses_hours_with_until(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    until = dt_util.utcnow() + timedelta(hours=2)
+    with pytest.raises(vol.Invalid, match="not both"):
+        await hass.services.async_call(
+            DOMAIN,
+            "start_override",
+            {"zone": "office", "hours": 1, "until": until.isoformat()},
+            blocking=True,
+        )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+# v0.25.0: "nan" and "inf" coerced to floats, and a band edge of either left
+# the controller nothing to cross.
+@pytest.mark.parametrize(
+    ("service", "data"),
+    [
+        ("start_override", {"low": "nan"}),
+        ("start_override", {"high": "inf"}),
+        ("start_override", {"low": "-inf", "hours": 1}),
+        ("start_override", {"hours": "nan"}),
+        ("cancel_override", {"low": "nan"}),
+        ("cancel_override", {"high": "inf"}),
+    ],
+)
+async def test_override_services_refuse_a_number_that_isnt_finite(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_zone: None,
+    service: str,
+    data: dict[str, Any],
+) -> None:
+    low_before = hass.states.get("number.office_manual_low").state
+    high_before = hass.states.get("number.office_manual_high").state
+    with pytest.raises(vol.Invalid, match="finite"):
+        await hass.services.async_call(DOMAIN, service, {"zone": "office", **data}, blocking=True)
+    assert hass.states.get("number.office_manual_low").state == low_before
+    assert hass.states.get("number.office_manual_high").state == high_before
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+@pytest.mark.parametrize("hours", [0, -1, 168.01])
+async def test_start_override_refuses_hours_out_of_range(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None, hours: float
+) -> None:
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN, "start_override", {"zone": "office", "hours": hours}, blocking=True
+        )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+
+
+async def test_start_override_takes_168_hours(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN, "start_override", {"zone": "office", "hours": 168}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+
+
+# v0.25.0: ending an override can put the manual band back in the same step.
+async def test_cancel_override_sets_the_manual_band(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "cancel_override", {"zone": "office", "low": 19.0, "high": 23.5}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert float(hass.states.get("number.office_manual_low").state) == 19.0
+    assert float(hass.states.get("number.office_manual_high").state) == 23.5
+
+
+async def test_cancel_override_sets_only_the_edge_given(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN, "cancel_override", {"zone": "office", "high": 23.0}, blocking=True
+    )
+    assert float(hass.states.get("number.office_manual_low").state) == 22.0
+    assert float(hass.states.get("number.office_manual_high").state) == 23.0
+
+
+async def test_cancel_override_keeps_the_manual_band_without_one(
+    hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
+) -> None:
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "low": 22.0, "high": 24.0, "hours": 1},
+        blocking=True,
+    )
+    await hass.services.async_call(DOMAIN, "cancel_override", {"zone": "office"}, blocking=True)
+    assert hass.states.get("binary_sensor.office_override_active").state == "off"
+    assert float(hass.states.get("number.office_manual_low").state) == 22.0
+    assert float(hass.states.get("number.office_manual_high").state) == 24.0
 
 
 # ----- set_profile -----

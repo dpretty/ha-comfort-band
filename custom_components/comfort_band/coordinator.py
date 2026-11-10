@@ -499,13 +499,21 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         low: float | None = None,
         high: float | None = None,
         hours: float | None = None,
+        until: datetime | None = None,
     ) -> None:
-        """Bump override_until = now + hours. Optionally update the manual band."""
-        zone = self._store.get_zone(self.zone_name)
-        use_hours = hours if hours is not None else zone["override_hours"]
-        update: dict[str, Any] = {
-            "override_until": (dt_util.utcnow() + timedelta(hours=use_hours)).isoformat()
-        }
+        """Set override_until to `until` (v0.25.0), else now + hours (the
+        zone's `override_hours` by default). Optionally update the manual band.
+
+        `until` and `hours` are one or the other; the service schema keeps
+        them apart, and `until` wins here should both be passed.
+        """
+        if until is not None:
+            ends = dt_util.as_utc(until)
+        else:
+            zone = self._store.get_zone(self.zone_name)
+            use_hours = hours if hours is not None else zone["override_hours"]
+            ends = dt_util.utcnow() + timedelta(hours=use_hours)
+        update: dict[str, Any] = {"override_until": ends.isoformat()}
         if low is not None:
             update["manual_low"] = low
         if high is not None:
@@ -513,8 +521,17 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         await self._store.async_update_zone(self.zone_name, **update)
         await self.async_refresh()
 
-    async def async_cancel_override(self) -> None:
-        await self._store.async_update_zone(self.zone_name, override_until=None)
+    async def async_cancel_override(
+        self, *, low: float | None = None, high: float | None = None
+    ) -> None:
+        """End the override. `low` / `high` (v0.25.0) set the manual band in
+        the same write: how an undo puts back the band an override replaced."""
+        update: dict[str, Any] = {"override_until": None}
+        if low is not None:
+            update["manual_low"] = low
+        if high is not None:
+            update["manual_high"] = high
+        await self._store.async_update_zone(self.zone_name, **update)
         await self.async_refresh()
 
     async def async_set_enabled(self, enabled: bool) -> None:
