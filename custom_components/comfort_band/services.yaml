@@ -186,7 +186,7 @@ start_override:
           unit_of_measurement: "°C"
     hours:
       name: Override hours
-      description: Duration of the override. Defaults to the zone's `override_hours` number entity. Not with `until`.
+      description: Duration of the override, more than 0 and at most 168. Defaults to the zone's `override_hours` number entity. Not with `until`.
       required: false
       selector:
         number:
@@ -196,7 +196,7 @@ start_override:
           unit_of_measurement: "h"
     until:
       name: Until
-      description: "When the override ends, instead of `hours`: in the future and within 7 days. A time without an offset is Home Assistant's local time."
+      description: "When the override ends, instead of `hours`: in the future and within 168 hours. A time without an offset is Home Assistant's local time."
       required: false
       selector:
         datetime:

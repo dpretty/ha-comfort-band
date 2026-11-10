@@ -518,6 +518,55 @@ async def test_override_until_wins_over_hours(
     await coordinator.async_unload()
 
 
+async def test_override_until_sets_the_band_too(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An undo puts back an earlier override's band with its end."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    until = datetime(2026, 4, 25, 11, 0, tzinfo=dt_util.UTC)
+    await coordinator.async_start_override(low=22.5, high=24.5, until=until)
+    assert coordinator.data.effective_low == 22.5
+    assert coordinator.data.effective_high == 24.5
+    await coordinator.async_unload()
+
+
+async def test_cancel_override_writes_once(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Ending the override and setting the band are one write, so nothing
+    runs on the one without the other."""
+    freezer.move_to("2026-04-25 10:00:00+00:00")
+    store = ComfortBandStore(hass)
+    await store.async_load()
+    await store.async_add_zone("office")
+    coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
+    hass.states.async_set(TEMP_ENTITY, "21.0", {})
+    await coordinator.async_refresh()
+    await coordinator.async_start_override(low=22.0, high=24.0, hours=1)
+    writes: list[dict[str, Any]] = []
+    original = store.async_update_zone
+
+    async def spy(zone: str, **fields: Any) -> None:
+        writes.append(fields)
+        await original(zone, **fields)
+
+    store.async_update_zone = spy  # type: ignore[method-assign]
+    await coordinator.async_cancel_override(low=19.0, high=23.0)
+    assert writes[0] == {"override_until": None, "manual_low": 19.0, "manual_high": 23.0}
+    assert all("manual_low" not in w and "manual_high" not in w for w in writes[1:])
+    await coordinator.async_unload()
+
+
 async def test_cancel_override_puts_the_manual_band_back(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],

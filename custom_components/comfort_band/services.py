@@ -19,6 +19,7 @@ consistent error class regardless of which layer rejected.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import time, timedelta
@@ -113,17 +114,34 @@ _REMOVE_TRANSITION_SCHEMA = vol.Schema(
 # v0.25.0: an override ends after `hours`, or at `until` -- one or the other.
 # `until` is how a caller ends one at a time it already knows: the schedule's
 # next change (`sensor.{zone}_next_band_change`), or an earlier override's end
-# put back by an undo. It's bounded so that no far-off date reaches the expiry
-# timer or the date arithmetic downstream.
-_OVERRIDE_UNTIL_MAX = timedelta(days=7)
+# put back by an undo. Both are bounded to 168 hours, so that no far-off time
+# reaches the expiry timer or the date arithmetic downstream.
+_OVERRIDE_MAX = timedelta(hours=168)
+
+
+def _finite(value: float) -> float:
+    """`vol.Coerce(float)` takes "nan" and "inf", and a band edge of either
+    leaves the controller with no threshold it can cross (v0.25.0)."""
+    if not math.isfinite(value):
+        raise vol.Invalid("must be a finite number")
+    return value
+
+
+_BAND_EDGE = vol.All(vol.Coerce(float), _finite)
+_OVERRIDE_HOURS = vol.All(
+    vol.Coerce(float),
+    _finite,
+    vol.Range(min=0, min_included=False, max=_OVERRIDE_MAX.total_seconds() / 3600),
+)
+_ONE_LENGTH = "give `hours` or `until`, not both"
 
 _START_OVERRIDE_SCHEMA = vol.Schema(
     {
         vol.Required("zone"): cv.string,
-        vol.Optional("low"): vol.Coerce(float),
-        vol.Optional("high"): vol.Coerce(float),
-        vol.Exclusive("hours", "length"): vol.Coerce(float),
-        vol.Exclusive("until", "length"): cv.datetime,
+        vol.Optional("low"): _BAND_EDGE,
+        vol.Optional("high"): _BAND_EDGE,
+        vol.Exclusive("hours", "length", msg=_ONE_LENGTH): _OVERRIDE_HOURS,
+        vol.Exclusive("until", "length", msg=_ONE_LENGTH): cv.datetime,
     }
 )
 
@@ -133,8 +151,8 @@ _START_OVERRIDE_SCHEMA = vol.Schema(
 _CANCEL_OVERRIDE_SCHEMA = vol.Schema(
     {
         vol.Required("zone"): cv.string,
-        vol.Optional("low"): vol.Coerce(float),
-        vol.Optional("high"): vol.Coerce(float),
+        vol.Optional("low"): _BAND_EDGE,
+        vol.Optional("high"): _BAND_EDGE,
     }
 )
 
@@ -398,14 +416,17 @@ async def async_register_services(hass: HomeAssistant) -> None:
         until = call.data.get("until")
         if until is not None:
             # Without an offset, a time is HA's local time.
-            until = dt_util.as_utc(until)
+            try:
+                until = dt_util.as_utc(until)
+            except OverflowError as err:
+                raise ServiceValidationError(f"`until` is out of range: {until}") from err
             now = dt_util.utcnow()
+            # Said in HA's time zone, as the datetime selector entered it.
+            shown = dt_util.as_local(until).isoformat()
             if until <= now:
-                raise ServiceValidationError(f"`until` must be in the future: {until.isoformat()}")
-            if until > now + _OVERRIDE_UNTIL_MAX:
-                raise ServiceValidationError(
-                    f"`until` must be within {_OVERRIDE_UNTIL_MAX.days} days: {until.isoformat()}"
-                )
+                raise ServiceValidationError(f"`until` must be in the future: {shown}")
+            if until > now + _OVERRIDE_MAX:
+                raise ServiceValidationError(f"`until` must be within 168 hours: {shown}")
         await coordinator.async_start_override(
             low=call.data.get("low"),
             high=call.data.get("high"),
