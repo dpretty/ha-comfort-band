@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 import voluptuous as vol
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.util import dt as dt_util
@@ -222,6 +223,28 @@ async def test_start_override_takes_an_until_just_inside_7_days(
     until = (dt_util.utcnow() + timedelta(days=7, minutes=-1)).replace(microsecond=0)
     await hass.services.async_call(
         DOMAIN, "start_override", {"zone": "office", "until": until.isoformat()}, blocking=True
+    )
+    assert hass.states.get("binary_sensor.office_override_active").state == "on"
+
+
+# With the clock held: exactly now is refused, exactly 7 days ahead is taken.
+async def test_start_override_until_at_its_bounds(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    setup_zone: None,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    freezer.move_to((dt_util.utcnow() + timedelta(minutes=1)).replace(microsecond=0))
+    now = dt_util.utcnow()
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN, "start_override", {"zone": "office", "until": now.isoformat()}, blocking=True
+        )
+    await hass.services.async_call(
+        DOMAIN,
+        "start_override",
+        {"zone": "office", "until": (now + timedelta(days=7)).isoformat()},
+        blocking=True,
     )
     assert hass.states.get("binary_sensor.office_override_active").state == "on"
 
