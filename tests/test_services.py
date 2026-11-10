@@ -183,7 +183,8 @@ async def test_start_override_until_ends_it_then(
 async def test_start_override_until_without_an_offset_is_local_time(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
-    await hass.config.async_set_time_zone("Australia/Sydney")
+    # Not the test host's zone, so HA's is told from the machine's.
+    await hass.config.async_set_time_zone("Asia/Kolkata")
     local = (dt_util.now() + timedelta(hours=2)).replace(microsecond=0)
     await hass.services.async_call(
         DOMAIN,
@@ -227,7 +228,8 @@ async def test_start_override_takes_an_until_just_inside_7_days(
     assert hass.states.get("binary_sensor.office_override_active").state == "on"
 
 
-# With the clock held: exactly now is refused, exactly 7 days ahead is taken.
+# With the clock held: now and a second past 168 hours are refused; a second
+# ahead and exactly 168 hours are taken.
 async def test_start_override_until_at_its_bounds(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -236,16 +238,20 @@ async def test_start_override_until_at_its_bounds(
 ) -> None:
     freezer.move_to((dt_util.utcnow() + timedelta(minutes=1)).replace(microsecond=0))
     now = dt_util.utcnow()
-    with pytest.raises(ServiceValidationError):
+
+    async def start(until: Any) -> None:
         await hass.services.async_call(
-            DOMAIN, "start_override", {"zone": "office", "until": now.isoformat()}, blocking=True
+            DOMAIN, "start_override", {"zone": "office", "until": until.isoformat()}, blocking=True
         )
-    await hass.services.async_call(
-        DOMAIN,
-        "start_override",
-        {"zone": "office", "until": (now + timedelta(days=7)).isoformat()},
-        blocking=True,
-    )
+
+    for refused in (now, now + timedelta(hours=168, seconds=1)):
+        with pytest.raises(ServiceValidationError):
+            await start(refused)
+    for taken in (now + timedelta(seconds=1), now + timedelta(hours=168)):
+        await start(taken)
+        ends = hass.states.get("sensor.office_override_ends")
+        assert ends is not None
+        assert dt_util.parse_datetime(ends.state) == taken
     assert hass.states.get("binary_sensor.office_override_active").state == "on"
 
 
@@ -281,7 +287,8 @@ async def test_start_override_refuses_an_until_beyond_dates(
 async def test_start_override_says_a_refused_until_in_local_time(
     hass: HomeAssistant, hass_storage: dict[str, Any], setup_zone: None
 ) -> None:
-    await hass.config.async_set_time_zone("Australia/Sydney")
+    # A zone without a change of the clocks, and not the test host's.
+    await hass.config.async_set_time_zone("Asia/Kolkata")
     past = (dt_util.now() - timedelta(hours=1)).replace(microsecond=0)
     with pytest.raises(ServiceValidationError, match=past.isoformat().replace("+", r"\+")):
         await hass.services.async_call(

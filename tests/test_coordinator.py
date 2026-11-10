@@ -484,7 +484,8 @@ async def test_override_until_without_an_offset_is_local_time(
     freezer: FrozenDateTimeFactory,
 ) -> None:
     """Called directly with a naive time, it's HA's local time."""
-    await hass.config.async_set_time_zone("Australia/Sydney")
+    # Not the test host's zone, so HA's is told from the machine's.
+    await hass.config.async_set_time_zone("Asia/Kolkata")
     freezer.move_to("2026-04-25 10:00:00+00:00")
     store = ComfortBandStore(hass)
     await store.async_load()
@@ -492,9 +493,9 @@ async def test_override_until_without_an_offset_is_local_time(
     coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
     await coordinator.async_refresh()
-    # 22:30 in Sydney (AEST, +10) is 12:30 UTC.
+    # 22:30 in Kolkata (+05:30) is 17:00 UTC.
     await coordinator.async_start_override(until=datetime(2026, 4, 25, 22, 30))
-    assert coordinator.data.override_until == datetime(2026, 4, 25, 12, 30, tzinfo=dt_util.UTC)
+    assert coordinator.data.override_until == datetime(2026, 4, 25, 17, 0, tzinfo=dt_util.UTC)
     assert coordinator.data.override_active
     await coordinator.async_unload()
 
@@ -512,7 +513,8 @@ async def test_override_until_wins_over_hours(
     coordinator = ZoneCoordinator(hass, store, "office", CLIMATE_ENTITY, TEMP_ENTITY)
     hass.states.async_set(TEMP_ENTITY, "21.0", {})
     await coordinator.async_refresh()
-    until = datetime(2026, 4, 25, 11, 15, tzinfo=dt_util.UTC)
+    # To the microsecond: the end isn't rounded.
+    until = datetime(2026, 4, 25, 11, 15, 0, 250000, tzinfo=dt_util.UTC)
     await coordinator.async_start_override(hours=5, until=until)
     assert coordinator.data.override_until == until
     await coordinator.async_unload()
