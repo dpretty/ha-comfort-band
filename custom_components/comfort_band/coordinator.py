@@ -2575,8 +2575,10 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
 
         Skipped when `decision_room is None` (sensor unavailable -- no data
         point worth recording). Rate-limit + age-cap logic lives in
-        `predictor.append_sample`; this method just wires it to the store
-        and updates the in-memory cache.
+        `predictor.append_sample`; this method wires it to the store, updates
+        the in-memory cache, and keeps the buffer in time order: a sample
+        stamped behind the buffer's last is refused (v0.25.1), unless that
+        last sample is ahead of the wall clock.
 
         v0.8 also captures the climate entity's current `fan_mode` attribute
         and persists it with the sample. v0.8 doesn't *use* fan_mode (slope
@@ -2594,6 +2596,42 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         predictor recovers in well under the WLS window.
         """
         if decision_room is None:
+            return
+        # v0.25.1: keep the buffer in time order. Applies are dispatched
+        # fire-and-forget, so a unit that holds one up (a cloud bridge waiting
+        # on its confirming poll) lets the next refresh's apply finish first;
+        # the one that waited then arrives with the `now_utc` it took before
+        # waiting, behind a sample already here. `predictor` fits slopes over
+        # contiguous runs of one action, so a sample of another action landing
+        # mid-run splits the run: measured taking a six-sample idle run to one,
+        # and the idle slope from 0.0100 degC/min to None. Sorting it into
+        # place doesn't help (the run is still split); refusing it does.
+        #
+        # Not when the buffer's last sample is ahead of the wall clock: that's
+        # the clock stepping backwards (an RTC-less device correcting against
+        # NTP after boot), not a slow apply, and refusing then would stop
+        # learning for the length of the step, since nothing prunes a
+        # future-dated sample. The append goes ahead as it always has.
+        # Repairing the buffer instead (dropping the future-dated samples) was
+        # measured destroying six valid samples on a 4.5-minute step.
+        #
+        # Only the sample is refused. The overtaken apply's store write and
+        # `_commanded_state` still land: its command may be the one the unit
+        # acted on, and withholding that was measured making the unit's echo
+        # read as a hand edit, which flushes the learned model.
+        if (
+            self._samples_cache
+            and now_utc < self._samples_cache[-1].t
+            and dt_util.utcnow() >= self._samples_cache[-1].t
+        ):
+            LOGGER.debug(
+                "%s: dropping a %s sample stamped %s, behind the buffer's last at %s "
+                "-- an apply that was overtaken, not new data",
+                self.zone_name,
+                action,
+                now_utc.isoformat(),
+                self._samples_cache[-1].t.isoformat(),
+            )
             return
         # `prior_action` is captured BEFORE the append so it reflects the
         # buffer's last action, not the freshly-decided one. Used only to
@@ -2643,10 +2681,13 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         Only the dropped-command path calls this today, because the mode-raise
         path above deliberately touches nothing and so has nothing to own. That
         is not a claim the rest of the apply is covered: the success tail writes
-        the store, `_commanded_state` and a sample with no ownership check at
-        all, so a superseded apply still clobbers those three. It does that on
-        `main` too, which is why it is filed as its own work rather than widened
-        here on the way past.
+        the store and `_commanded_state` with no ownership check at all, so a
+        superseded apply still clobbers those two (deliberately: see
+        `_append_sample`). Its sample can no longer land out of order
+        (v0.25.1), which is narrower than not disturbing the run at all: if
+        the overtaking apply's own sample was refused by `predictor`'s
+        same-action rate limit, the stale one arrives in order and still
+        splits the run.
 
         Identity rather than equality, because ownership is the question:
         `self._last_command_at = now_utc` stores this very object. Two applies

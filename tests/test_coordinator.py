@@ -5758,6 +5758,246 @@ async def test_a_superseded_dropped_apply_revises_nothing_either(
     assert coordinator._store.get_zone("office")["persisted_idle_slope"] == -0.02
 
 
+async def _overtaken_apply(
+    hass: HomeAssistant,
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> tuple[ZoneCoordinator, asyncio.Event, list[dict[str, Any]]]:
+    """An apply that decides heat and hangs in its mode call, overtaken by
+    the next refresh's apply, which releases the unit to idle.
+
+    Returns with the first apply still parked; set the event to let it finish.
+    """
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    await coordinator._store.async_update_zone("office", min_cycle_minutes=0)
+
+    gate = asyncio.Event()
+    seen: list[dict[str, Any]] = []
+
+    async def _first_call_hangs(call: Any) -> None:
+        seen.append(dict(call.data))
+        climate_calls.append((call.service, dict(call.data)))
+        if len(seen) == 1:
+            await gate.wait()
+
+    hass.services.async_register("climate", "set_hvac_mode", _first_call_hangs)
+
+    # The overtaken apply decides heat on a cold room and parks in the call.
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_HEAT, {"temperature": 19.5})
+    hass.states.async_set(TEMP_ENTITY, "18.0", {})
+    await coordinator.async_refresh()
+    await _pump()
+    assert len(seen) == 1, seen
+
+    # The room reaches band and the next apply releases the unit to idle.
+    freezer.tick(timedelta(seconds=60))
+    hass.states.async_set(TEMP_ENTITY, "20.0", {})
+    await coordinator.async_refresh()
+    await _pump()
+    hass.states.async_set(CLIMATE_ENTITY, HVAC_MODE_FAN_ONLY, {"temperature": 19.5})
+    await _pump()
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+    return coordinator, gate, seen
+
+
+async def _pump() -> None:
+    for _ in range(200):
+        await asyncio.sleep(0)
+
+
+async def test_an_overtaken_apply_cannot_reorder_the_sample_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.1: a sample from an apply that waited doesn't land behind one
+    from the apply that overtook it.
+
+    Without the rule the waiting apply appended a `heating` sample a minute
+    behind the `idle` one already in the buffer, on a unit in `fan_only`
+    throughout, splitting the run the idle slope is fitted over.
+    """
+    coordinator, gate, seen = await _overtaken_apply(hass, climate_calls, freezer)
+
+    # The clock doesn't advance: a tick would release a due refresh, and a
+    # third apply's own sample couldn't be told from the overtaken one's.
+    gate.set()
+    await _pump()
+    assert len(seen) == 2, "no third apply should have run"
+
+    # The overtaken apply did reach its tail (it committed heat), so the
+    # buffer below shows a refusal, not an apply that never resumed.
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+
+    stamps = [smp.t for smp in coordinator._samples_cache]
+    assert stamps == sorted(stamps), [(smp.action, smp.t) for smp in coordinator._samples_cache]
+    # A one-sample buffer is sorted whatever happens; this is the assertion
+    # that carries the test.
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE], (
+        coordinator._samples_cache
+    )
+
+
+async def test_an_overtaken_apply_still_records_everything_else(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.1 refuses only the sample, deliberately.
+
+    The overtaken apply's command may be the one the unit acted on, so its
+    vouch (`_commanded_state`) stands, or the unit's echo would read as a hand
+    edit and flush the learned model; its store write errs the safe way. This
+    pins what is not guarded, so narrowing it has to break a test.
+    """
+    coordinator, gate, seen = await _overtaken_apply(hass, climate_calls, freezer)
+
+    climate_calls.clear()
+    gate.set()
+    await _pump()
+    assert len(seen) == 2, "no third apply should have run"
+
+    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}, (
+        coordinator._commanded_state
+    )
+    assert _calls_for(climate_calls, "set_temperature"), climate_calls
+
+
+async def test_a_sample_stamped_before_the_buffer_is_refused(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """v0.25.1: the rule itself, without the concurrency that provokes it."""
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    now = dt_util.utcnow()
+
+    await coordinator._append_sample(20.0, ACTION_IDLE, now)
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        await coordinator._append_sample(19.0, ACTION_HEAT, now - timedelta(seconds=60))
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+
+    # One DEBUG line naming the zone, the sample's action and both stamps,
+    # the dropped one first.
+    dropped = [rec for rec in caplog.records if "was overtaken" in rec.getMessage()]
+    assert len(dropped) == 1, [rec.getMessage() for rec in caplog.records]
+    assert dropped[0].levelno == logging.DEBUG, dropped[0].levelname
+    line = dropped[0].getMessage()
+    assert f"office: dropping a {ACTION_HEAT} sample stamped" in line, line
+    stale, held = (now - timedelta(seconds=60)).isoformat(), now.isoformat()
+    assert stale in line, line
+    assert held in line, line
+    assert line.index(stale) < line.index(held), line
+
+    # A second behind is still behind: no tolerance around the last stamp.
+    await coordinator._append_sample(19.0, ACTION_COOL, now - timedelta(seconds=1))
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+
+    # An equal stamp isn't out of order, so it's taken.
+    await coordinator._append_sample(19.0, ACTION_HEAT, now)
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE, ACTION_HEAT]
+
+    # Against the buffer's last sample, not its first: ahead of the first but
+    # behind the last is refused. The clock moves with it, as for any real
+    # caller (a stamp ahead of the clock is the exemption, tested below).
+    freezer.tick(timedelta(seconds=120))
+    await coordinator._append_sample(21.0, ACTION_COOL, dt_util.utcnow())
+    # A different action from the last, so `predictor`'s same-action rate
+    # limit can't be what refuses it; and another zone name, so the log's
+    # name is shown to be the zone's, not a fixed string.
+    coordinator.zone_name = "study"
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            await coordinator._append_sample(19.0, ACTION_HEAT, now + timedelta(seconds=60))
+        named = [rec.getMessage() for rec in caplog.records if "was overtaken" in rec.getMessage()]
+        assert named and named[0].startswith("study: "), named
+    finally:
+        coordinator.zone_name = "office"
+    assert [smp.action for smp in coordinator._samples_cache] == [
+        ACTION_IDLE,
+        ACTION_HEAT,
+        ACTION_COOL,
+    ], coordinator._samples_cache
+    stamps = [smp.t for smp in coordinator._samples_cache]
+    assert stamps == sorted(stamps), stamps
+
+
+async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.1: a clock that steps backwards isn't an overtaken apply.
+
+    After a backwards step the buffer holds stamps ahead of the clock, and
+    nothing prunes those: the age cap looks backwards and the count cap runs
+    only inside a successful append. Refusing behind them would stop learning
+    for the length of the step, so the append goes ahead, out of order, as
+    before v0.25.1.
+    """
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    for when, action in (
+        ("2026-09-07 11:00:00+00:00", ACTION_IDLE),
+        ("2026-09-07 12:00:00+00:00", ACTION_HEAT),
+        ("2026-09-07 12:01:00+00:00", ACTION_COOL),
+    ):
+        freezer.move_to(when)
+        await coordinator._append_sample(20.0, action, dt_util.utcnow())
+    assert len(coordinator._samples_cache) == 3, coordinator._samples_cache
+
+    # The clock steps back, behind two of the three.
+    freezer.move_to("2026-09-07 11:30:00+00:00")
+    await coordinator._append_sample(19.0, ACTION_IDLE, dt_util.utcnow())
+    assert [smp.t.isoformat() for smp in coordinator._samples_cache] == [
+        "2026-09-07T11:00:00+00:00",
+        "2026-09-07T12:00:00+00:00",
+        "2026-09-07T12:01:00+00:00",
+        "2026-09-07T11:30:00+00:00",
+    ], coordinator._samples_cache
+
+    # The exemption is judged against the last sample too. The clock has
+    # passed the last (11:30) but not the largest (12:01), so a sample behind
+    # the last is an overtaken apply and is refused; judged against the
+    # largest, it would be let through.
+    freezer.move_to("2026-09-07 11:45:00+00:00")
+    await coordinator._append_sample(
+        21.0, ACTION_COOL, dt_util.parse_datetime("2026-09-07 11:20:00+00:00")
+    )
+    assert [smp.t.isoformat() for smp in coordinator._samples_cache] == [
+        "2026-09-07T11:00:00+00:00",
+        "2026-09-07T12:00:00+00:00",
+        "2026-09-07T12:01:00+00:00",
+        "2026-09-07T11:30:00+00:00",
+    ], coordinator._samples_cache
+
+    # And it goes on taking samples: one after the last but before the
+    # largest is taken. Judged against the largest, it would be refused until
+    # the clock passed that, stopping learning for the length of the step.
+    freezer.move_to("2026-09-07 12:05:00+00:00")
+    await coordinator._append_sample(
+        19.5, ACTION_HEAT, dt_util.parse_datetime("2026-09-07 11:45:00+00:00")
+    )
+    assert [smp.t.isoformat() for smp in coordinator._samples_cache] == [
+        "2026-09-07T11:00:00+00:00",
+        "2026-09-07T12:00:00+00:00",
+        "2026-09-07T12:01:00+00:00",
+        "2026-09-07T11:30:00+00:00",
+        "2026-09-07T11:45:00+00:00",
+    ], coordinator._samples_cache
+
+
 async def test_a_unit_that_took_the_mode_anyway_is_not_a_manual_edit(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
