@@ -5964,6 +5964,7 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """v0.25.1: a clock that steps backwards isn't an overtaken apply.
 
@@ -6002,9 +6003,16 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
     # the last is an overtaken apply and is refused; judged against the
     # largest, it would be let through.
     freezer.move_to("2026-09-07 11:45:00+00:00")
-    await coordinator._append_sample(
-        21.0, ACTION_COOL, dt_util.parse_datetime("2026-09-07 11:20:00+00:00")
-    )
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        await coordinator._append_sample(
+            21.0, ACTION_COOL, dt_util.parse_datetime("2026-09-07 11:20:00+00:00")
+        )
+    # Its log names the last stamp, which here is neither the largest (12:01)
+    # nor the clock (11:45).
+    named = [rec.getMessage() for rec in caplog.records if "was overtaken" in rec.getMessage()]
+    assert len(named) == 1, named
+    assert "behind the buffer's last at 2026-09-07T11:30:00+00:00" in named[0], named[0]
     assert [smp.t.isoformat() for smp in coordinator._samples_cache] == [
         "2026-09-07T11:00:00+00:00",
         "2026-09-07T12:00:00+00:00",
