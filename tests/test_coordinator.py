@@ -5888,12 +5888,23 @@ async def test_a_sample_stamped_before_the_buffer_is_refused(
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
     stored = coordinator._store.get_zone("office")["samples"]
     persisted_at = coordinator._last_sample_persist_at
+    writes: list[dict[str, Any]] = []
+    write = coordinator._store.async_update_zone
 
-    caplog.clear()
-    with caplog.at_level(logging.DEBUG):
-        await coordinator._append_sample(19.0, ACTION_HEAT, now - timedelta(seconds=60))
+    async def _counted(name: str, **fields: Any) -> None:
+        writes.append(fields)
+        await write(name, **fields)
+
+    coordinator._store.async_update_zone = _counted  # type: ignore[method-assign]
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            await coordinator._append_sample(19.0, ACTION_HEAT, now - timedelta(seconds=60))
+    finally:
+        coordinator._store.async_update_zone = write  # type: ignore[method-assign]
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
     # Nothing written, and the persist throttle left as it was.
+    assert writes == []
     assert coordinator._store.get_zone("office")["samples"] == stored
     assert coordinator._last_sample_persist_at == persisted_at
 
@@ -5932,6 +5943,11 @@ async def test_a_sample_stamped_before_the_buffer_is_refused(
             await coordinator._append_sample(19.0, ACTION_HEAT, now + timedelta(seconds=60))
         named = [rec.getMessage() for rec in caplog.records if "was overtaken" in rec.getMessage()]
         assert named and named[0].startswith("study: "), named
+        # The stamp it was held behind is the buffer's last, not its first.
+        assert (
+            f"behind the buffer's last at {(now + timedelta(seconds=120)).isoformat()}"
+            in (named[0])
+        ), named[0]
     finally:
         coordinator.zone_name = "office"
     assert [smp.action for smp in coordinator._samples_cache] == [
@@ -5967,9 +5983,13 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
         await coordinator._append_sample(20.0, action, dt_util.utcnow())
     assert len(coordinator._samples_cache) == 3, coordinator._samples_cache
 
-    # The clock steps back, behind two of the three.
+    # The clock steps back, behind two of the three. The apply takes a few
+    # milliseconds between its stamp and its append, as a real one does, so
+    # the exemption is shown to go by the clock, not by the stamp.
     freezer.move_to("2026-09-07 11:30:00+00:00")
-    await coordinator._append_sample(19.0, ACTION_IDLE, dt_util.utcnow())
+    stamp = dt_util.utcnow()
+    freezer.tick(timedelta(milliseconds=5))
+    await coordinator._append_sample(19.0, ACTION_IDLE, stamp)
     assert [smp.t.isoformat() for smp in coordinator._samples_cache] == [
         "2026-09-07T11:00:00+00:00",
         "2026-09-07T12:00:00+00:00",
@@ -6009,20 +6029,20 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
     ], coordinator._samples_cache
 
 
-async def test_a_clock_set_back_a_second_is_a_step_too(
+async def test_a_clock_set_back_a_microsecond_is_a_step_too(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     climate_calls: list[tuple[str, dict[str, Any]]],
     freezer: FrozenDateTimeFactory,
 ) -> None:
-    """v0.25.1: the exemption has no margin. With the last sample just one
-    second ahead of the clock, a sample behind it is taken, as after any
+    """v0.25.1: the exemption has no margin. With the last sample just a
+    microsecond ahead of the clock, a sample behind it is taken, as after any
     backwards step; a margin would stop learning for any step shorter."""
     coordinator = await _setup_enabled_zone(hass, climate_calls)
     freezer.move_to("2026-09-07 12:00:00+00:00")
     await coordinator._append_sample(20.0, ACTION_IDLE, dt_util.utcnow())
 
-    freezer.move_to("2026-09-07 11:59:59+00:00")
+    freezer.move_to("2026-09-07 11:59:59.999999+00:00")
     await coordinator._append_sample(19.0, ACTION_HEAT, dt_util.utcnow())
 
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE, ACTION_HEAT]

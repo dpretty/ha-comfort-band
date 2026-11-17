@@ -2686,10 +2686,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         superseded apply still clobbers those two (deliberately: see
         `_append_sample`). Its sample can no longer land behind the buffer's
         last (v0.25.1, outside a backwards clock step), which is narrower than
-        not disturbing the run at all: if
-        the overtaking apply's own sample was refused by `predictor`'s
-        same-action rate limit, the stale one arrives in order and still
-        splits the run.
+        not disturbing the run at all: if the overtaking apply's own sample
+        was refused by `predictor`'s same-action rate limit, the stale one
+        arrives in order and still splits the run.
 
         Identity rather than equality, because ownership is the question:
         `self._last_command_at = now_utc` stores this very object. Two applies
