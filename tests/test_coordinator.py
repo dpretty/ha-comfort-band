@@ -5815,9 +5815,9 @@ async def test_an_overtaken_apply_cannot_reorder_the_sample_buffer(
     """v0.25.1: a sample from an apply that waited doesn't land behind one
     from the apply that overtook it.
 
-    Without the rule the waiting apply appended a `heating` sample a minute
-    behind the `idle` one already in the buffer, on a unit in `fan_only`
-    throughout, splitting the run the idle slope is fitted over.
+    Without the rule the waiting apply appended its `heating` sample a minute
+    behind the `idle` one already in the buffer. In a longer idle run, that
+    splits the run the idle slope is fitted over.
     """
     coordinator, gate, seen = await _overtaken_apply(hass, climate_calls, freezer)
 
@@ -5850,8 +5850,11 @@ async def test_an_overtaken_apply_still_records_everything_else(
 
     The overtaken apply's command may be the one the unit acted on, so its
     vouch (`_commanded_state`) stands, or the unit's echo would read as a hand
-    edit and flush the learned model; its store write errs the safe way. This
-    pins what is not guarded, so narrowing it has to break a test.
+    edit and flush the learned model. Its store write errs the safe way:
+    `last_action_at` goes back to its own, earlier stamp, so the dwell gates
+    hold the correcting command for less, not more. This pins the store
+    write, the vouch and the setpoint call, so narrowing any of them has to
+    break a test.
     """
     coordinator, gate, seen = await _overtaken_apply(hass, climate_calls, freezer)
 
@@ -5860,7 +5863,9 @@ async def test_an_overtaken_apply_still_records_everything_else(
     await _pump()
     assert len(seen) == 2, "no third apply should have run"
 
-    assert coordinator._store.get_zone("office")["last_action"] == ACTION_HEAT
+    zone = coordinator._store.get_zone("office")
+    assert zone["last_action"] == ACTION_HEAT
+    assert zone["last_action_at"] == "2026-09-07T12:00:00+00:00", zone["last_action_at"]
     assert coordinator._commanded_state == {"hvac_mode": HVAC_MODE_HEAT, "target_temp": 19.5}, (
         coordinator._commanded_state
     )
@@ -5881,11 +5886,16 @@ async def test_a_sample_stamped_before_the_buffer_is_refused(
 
     await coordinator._append_sample(20.0, ACTION_IDLE, now)
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+    stored = coordinator._store.get_zone("office")["samples"]
+    persisted_at = coordinator._last_sample_persist_at
 
     caplog.clear()
     with caplog.at_level(logging.DEBUG):
         await coordinator._append_sample(19.0, ACTION_HEAT, now - timedelta(seconds=60))
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
+    # Nothing written, and the persist throttle left as it was.
+    assert coordinator._store.get_zone("office")["samples"] == stored
+    assert coordinator._last_sample_persist_at == persisted_at
 
     # One DEBUG line naming the zone, the sample's action and both stamps,
     # the dropped one first.
@@ -5893,14 +5903,14 @@ async def test_a_sample_stamped_before_the_buffer_is_refused(
     assert len(dropped) == 1, [rec.getMessage() for rec in caplog.records]
     assert dropped[0].levelno == logging.DEBUG, dropped[0].levelname
     line = dropped[0].getMessage()
-    assert f"office: dropping a {ACTION_HEAT} sample stamped" in line, line
+    assert f"office: dropping a sample of {ACTION_HEAT} stamped" in line, line
     stale, held = (now - timedelta(seconds=60)).isoformat(), now.isoformat()
     assert stale in line, line
     assert held in line, line
     assert line.index(stale) < line.index(held), line
 
-    # A second behind is still behind: no tolerance around the last stamp.
-    await coordinator._append_sample(19.0, ACTION_COOL, now - timedelta(seconds=1))
+    # A microsecond behind is still behind: no tolerance around the last stamp.
+    await coordinator._append_sample(19.0, ACTION_COOL, now - timedelta(microseconds=1))
     assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE]
 
     # An equal stamp isn't out of order, so it's taken.
@@ -5982,9 +5992,10 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
         "2026-09-07T11:30:00+00:00",
     ], coordinator._samples_cache
 
-    # And it goes on taking samples: one after the last but before the
-    # largest is taken. Judged against the largest, it would be refused until
-    # the clock passed that, stopping learning for the length of the step.
+    # And it goes on taking samples: one after the last (11:30) but before
+    # the largest stamp (12:01) is taken. Judged against the largest, it
+    # would be refused, as would every sample stamped before 12:01, though
+    # each is after the last.
     freezer.move_to("2026-09-07 12:05:00+00:00")
     await coordinator._append_sample(
         19.5, ACTION_HEAT, dt_util.parse_datetime("2026-09-07 11:45:00+00:00")
@@ -5996,6 +6007,25 @@ async def test_a_clock_that_steps_back_does_not_strand_the_buffer(
         "2026-09-07T11:30:00+00:00",
         "2026-09-07T11:45:00+00:00",
     ], coordinator._samples_cache
+
+
+async def test_a_clock_set_back_a_second_is_a_step_too(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    climate_calls: list[tuple[str, dict[str, Any]]],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """v0.25.1: the exemption has no margin. With the last sample just one
+    second ahead of the clock, a sample behind it is taken, as after any
+    backwards step; a margin would stop learning for any step shorter."""
+    coordinator = await _setup_enabled_zone(hass, climate_calls)
+    freezer.move_to("2026-09-07 12:00:00+00:00")
+    await coordinator._append_sample(20.0, ACTION_IDLE, dt_util.utcnow())
+
+    freezer.move_to("2026-09-07 11:59:59+00:00")
+    await coordinator._append_sample(19.0, ACTION_HEAT, dt_util.utcnow())
+
+    assert [smp.action for smp in coordinator._samples_cache] == [ACTION_IDLE, ACTION_HEAT]
 
 
 async def test_a_unit_that_took_the_mode_anyway_is_not_a_manual_edit(

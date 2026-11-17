@@ -2608,10 +2608,11 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         # place doesn't help (the run is still split); refusing it does.
         #
         # Not when the buffer's last sample is ahead of the wall clock: that's
-        # the clock stepping backwards (an RTC-less device correcting against
-        # NTP after boot), not a slow apply, and refusing then would stop
-        # learning for the length of the step, since nothing prunes a
-        # future-dated sample. The append goes ahead as it always has.
+        # the clock having been set back (an NTP correction, say), not a slow
+        # apply, and refusing then would stop learning for the length of the
+        # step, since nothing prunes a future-dated sample. The append goes
+        # ahead as it always has (where `predictor`'s same-action rate limit
+        # still refuses a zone holding one action until the clock catches up).
         # Repairing the buffer instead (dropping the future-dated samples) was
         # measured destroying six valid samples on a 4.5-minute step.
         #
@@ -2625,7 +2626,7 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
             and dt_util.utcnow() >= self._samples_cache[-1].t
         ):
             LOGGER.debug(
-                "%s: dropping a %s sample stamped %s, behind the buffer's last at %s "
+                "%s: dropping a sample of %s stamped %s, behind the buffer's last at %s "
                 "-- an apply that was overtaken, not new data",
                 self.zone_name,
                 action,
@@ -2683,8 +2684,9 @@ class ZoneCoordinator(DataUpdateCoordinator[ZoneState]):
         is not a claim the rest of the apply is covered: the success tail writes
         the store and `_commanded_state` with no ownership check at all, so a
         superseded apply still clobbers those two (deliberately: see
-        `_append_sample`). Its sample can no longer land out of order
-        (v0.25.1), which is narrower than not disturbing the run at all: if
+        `_append_sample`). Its sample can no longer land behind the buffer's
+        last (v0.25.1, outside a backwards clock step), which is narrower than
+        not disturbing the run at all: if
         the overtaking apply's own sample was refused by `predictor`'s
         same-action rate limit, the stale one arrives in order and still
         splits the run.
